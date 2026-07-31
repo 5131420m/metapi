@@ -234,7 +234,10 @@ export function buildClaudeRuntimeHeaders(input: {
     'X-Stainless-Arch': getInputHeader(input.claudeHeaders, 'x-stainless-arch') || 'x64',
     'X-Stainless-Os': getInputHeader(input.claudeHeaders, 'x-stainless-os') || 'Windows',
     'X-Stainless-Timeout': getInputHeader(input.claudeHeaders, 'x-stainless-timeout') || '600',
-    'User-Agent': getInputHeader(input.claudeHeaders, 'user-agent') || input.defaultUserAgent || CLAUDE_DEFAULT_USER_AGENT,
+    'User-Agent': getInputHeader(input.claudeHeaders, 'user-agent')
+      || getInputHeader(input.baseHeaders, 'user-agent')
+      || input.defaultUserAgent
+      || CLAUDE_DEFAULT_USER_AGENT,
     Connection: 'keep-alive',
     Accept: input.stream ? 'text/event-stream' : 'application/json',
     'Accept-Encoding': 'gzip, deflate, br, zstd',

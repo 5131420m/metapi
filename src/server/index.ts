@@ -265,7 +265,9 @@ await startScheduler();
 await reloadBackupWebdavScheduler();
 startSiteAnnouncementPolling();
 startModelAvailabilityProbeScheduler();
-startChannelRecoveryProbeScheduler();
+if (process.env.CHANNEL_RECOVERY_PROBE_ENABLED !== 'false') {
+  startChannelRecoveryProbeScheduler();
+}
 startSub2ApiManagedRefreshScheduler();
 startUpdateCenterPolling();
 startUsageAggregationProjectorScheduler();
