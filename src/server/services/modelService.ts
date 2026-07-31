@@ -1383,11 +1383,14 @@ export async function rebuildTokenRoutesFromAvailability() {
     }
   }
 
-  const modelCandidates = new Map<string, Map<string, {
-    accountId: number;
-    tokenId: number | null;
-    oauthRouteUnitId: number | null;
-  }>>();
+  const modelCandidates = new Map<string, {
+    originalName: string;
+    candidates: Map<string, {
+      accountId: number;
+      tokenId: number | null;
+      oauthRouteUnitId: number | null;
+    }>;
+  }>();
   const buildCandidateKey = (input: {
     accountId: number;
     tokenId: number | null;
@@ -1409,14 +1412,17 @@ export async function rebuildTokenRoutesFromAvailability() {
     siteId: number,
     oauthRouteUnitId: number | null = null,
   ) => {
-    const modelName = (modelNameRaw || '').trim().toLowerCase();
-    if (!modelName) return;
+    const originalName = (modelNameRaw || '').trim();
+    if (!originalName) return;
+    const modelName = originalName.toLowerCase();
     if (!isModelAllowedByWhitelist(modelName)) return;
     if (isModelDisabledForSite(siteId, modelName)) return;
     if (blockedBrandRules.length > 0 && isModelBlockedByBrand(modelName, blockedBrandRules)) return;
-    if (!modelCandidates.has(modelName)) modelCandidates.set(modelName, new Map());
+    if (!modelCandidates.has(modelName)) {
+      modelCandidates.set(modelName, { originalName, candidates: new Map() });
+    }
     const candidate = { accountId, tokenId, oauthRouteUnitId };
-    modelCandidates.get(modelName)!.set(buildCandidateKey(candidate), candidate);
+    modelCandidates.get(modelName)!.candidates.set(buildCandidateKey(candidate), candidate);
   };
 
   for (const row of usableTokenRows) {
@@ -1447,16 +1453,18 @@ export async function rebuildTokenRoutesFromAvailability() {
   let removedChannels = 0;
   let removedRoutes = 0;
 
-  for (const [modelName, candidateMap] of modelCandidates.entries()) {
+  for (const [modelName, entry] of modelCandidates.entries()) {
+    const candidateMap = entry.candidates;
+    const originalName = entry.originalName;
     let route = routes.find((r) => (r.routeMode || 'pattern') !== 'explicit_group' && r.modelPattern.toLowerCase() === modelName);
-    if (route && route.modelPattern !== modelName) {
-      // Normalise existing route pattern to lowercase (e.g. "Deepseek-V4-pro" → "deepseek-v4-pro").
-      await db.update(schema.tokenRoutes).set({ modelPattern: modelName }).where(eq(schema.tokenRoutes.id, route.id)).run();
-      route = { ...route, modelPattern: modelName };
+    if (route && route.modelPattern !== originalName) {
+      // Normalise existing route pattern to the original case seen first (e.g. "deepseek-v4-pro" → "DeepSeek-V4-pro").
+      await db.update(schema.tokenRoutes).set({ modelPattern: originalName }).where(eq(schema.tokenRoutes.id, route.id)).run();
+      route = { ...route, modelPattern: originalName };
     }
     if (!route) {
       const inserted = await db.insert(schema.tokenRoutes).values({
-        modelPattern: modelName,
+        modelPattern: originalName,
         enabled: true,
       }).run();
       const insertedId = getInsertedRowId(inserted);
