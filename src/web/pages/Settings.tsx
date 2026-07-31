@@ -68,6 +68,7 @@ type RuntimeSettings = {
   logCleanupProgramLogsEnabled: boolean;
   logCleanupRetentionDays: number;
   modelAvailabilityProbeEnabled: boolean;
+  channelRecoveryProbeEnabled: boolean;
   codexUpstreamWebsocketEnabled: boolean;
   responsesCompactFallbackToResponsesEnabled: boolean;
   disableCrossProtocolFallback: boolean;
@@ -350,6 +351,7 @@ export default function Settings() {
     logCleanupProgramLogsEnabled: false,
     logCleanupRetentionDays: 30,
     modelAvailabilityProbeEnabled: false,
+    channelRecoveryProbeEnabled: false,
     codexUpstreamWebsocketEnabled: false,
     responsesCompactFallbackToResponsesEnabled: false,
     disableCrossProtocolFallback: false,
@@ -675,6 +677,7 @@ export default function Settings() {
           ? Math.trunc(Number(runtimeInfo.logCleanupRetentionDays))
           : 30,
         modelAvailabilityProbeEnabled: !!runtimeInfo.modelAvailabilityProbeEnabled,
+        channelRecoveryProbeEnabled: !!runtimeInfo.channelRecoveryProbeEnabled,
         codexUpstreamWebsocketEnabled: !!runtimeInfo.codexUpstreamWebsocketEnabled,
         responsesCompactFallbackToResponsesEnabled: !!runtimeInfo.responsesCompactFallbackToResponsesEnabled,
         disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
@@ -1059,6 +1062,7 @@ export default function Settings() {
           runtime.routeFailureCooldownMaxUnit,
         ),
         disableCrossProtocolFallback: runtime.disableCrossProtocolFallback,
+        channelRecoveryProbeEnabled: runtime.channelRecoveryProbeEnabled,
       });
       toast.success('Routing weights saved');
     } catch (err: any) {
@@ -2161,6 +2165,26 @@ export default function Settings() {
               </span>
               <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
                 仅影响 chat / messages / responses 之间的协议切换；不会关闭同协议兼容重试、OAuth 刷新或通道级重试。
+              </span>
+            </span>
+          </label>
+
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={runtime.channelRecoveryProbeEnabled}
+              onChange={(e) => setRuntime((prev) => ({
+                ...prev,
+                channelRecoveryProbeEnabled: e.target.checked,
+              }))}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                切换路由时对冷却通道发起恢复探测
+              </span>
+              <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
+                开启后，当通道进入冷却或被切换时，后台会定时向其发送最小化探测请求以判断是否恢复。默认关闭——如果你的上游不允许主动探测（如某些中转站），请保持关闭。
               </span>
             </span>
           </label>

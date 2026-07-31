@@ -69,6 +69,7 @@ type SiteRow = {
   totalBalance?: number;
   subscriptionSummary?: SiteSubscriptionSummary | null;
   createdAt?: string;
+  forcedEndpoint?: string | null;
   postRefreshProbeEnabled?: boolean;
   postRefreshProbeModel?: string | null;
   postRefreshProbeScope?: string | null;
@@ -768,6 +769,7 @@ export default function Sites() {
       apiEndpoints: serializedApiEndpoints.apiEndpoints,
       customHeaders: serializedCustomHeaders.customHeaders,
       globalWeight: Number(parsedGlobalWeight.toFixed(3)),
+      forcedEndpoint: form.forcedEndpoint || null,
       postRefreshProbeEnabled: probeEnabled,
       postRefreshProbeModel: probeModel.trim(),
       postRefreshProbeScope: probeScope,
@@ -1934,6 +1936,25 @@ export default function Sites() {
               </div>
             </div>
           </ResponsiveFormGrid>
+
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 12 }}>
+            <label style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+              固定上游协议
+            </label>
+            <select
+              value={form.forcedEndpoint}
+              onChange={(e) => setForm((prev) => ({ ...prev, forcedEndpoint: e.target.value }))}
+              style={formInputStyle}
+            >
+              <option value="">自动选择（默认）</option>
+              <option value="chat">chat /v1/chat/completions</option>
+              <option value="messages">messages /v1/messages</option>
+              <option value="responses">responses /v1/responses</option>
+            </select>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+              指定后，该站点的所有请求只走所选协议，不会自动切换或降级到其他协议。留空则按平台默认顺序自动选择。
+            </div>
+          </div>
         </CenteredModal>
       )}
 

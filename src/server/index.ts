@@ -265,7 +265,7 @@ await startScheduler();
 await reloadBackupWebdavScheduler();
 startSiteAnnouncementPolling();
 startModelAvailabilityProbeScheduler();
-if (process.env.CHANNEL_RECOVERY_PROBE_ENABLED !== 'false') {
+if (config.channelRecoveryProbeEnabled) {
   startChannelRecoveryProbeScheduler();
 }
 startSub2ApiManagedRefreshScheduler();

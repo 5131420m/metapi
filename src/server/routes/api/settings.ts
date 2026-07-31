@@ -44,6 +44,10 @@ import {
   startModelAvailabilityProbeScheduler,
   stopModelAvailabilityProbeScheduler,
 } from '../../services/modelAvailabilityProbeService.js';
+import {
+  startChannelRecoveryProbeScheduler,
+  stopChannelRecoveryProbeScheduler,
+} from '../../services/channelRecoveryProbeService.js';
 import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
 
 type RoutingWeights = typeof config.routingWeights;
@@ -53,6 +57,7 @@ interface RuntimeSettingsBody {
   systemProxyUrl?: string;
   payloadRules?: unknown;
   modelAvailabilityProbeEnabled?: boolean;
+  channelRecoveryProbeEnabled?: boolean;
   codexUpstreamWebsocketEnabled?: boolean;
   responsesCompactFallbackToResponsesEnabled?: boolean;
   disableCrossProtocolFallback?: boolean;
@@ -423,6 +428,16 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       }
       return;
     }
+    case 'channel_recovery_probe_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.channelRecoveryProbeEnabled = value;
+      if (value) {
+        startChannelRecoveryProbeScheduler();
+      } else {
+        stopChannelRecoveryProbeScheduler();
+      }
+      return;
+    }
     case 'codex_upstream_websocket_enabled': {
       if (typeof value !== 'boolean') return;
       config.codexUpstreamWebsocketEnabled = value;
@@ -722,6 +737,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     logCleanupProgramLogsEnabled: config.logCleanupProgramLogsEnabled,
     logCleanupRetentionDays: config.logCleanupRetentionDays,
     modelAvailabilityProbeEnabled: config.modelAvailabilityProbeEnabled,
+    channelRecoveryProbeEnabled: config.channelRecoveryProbeEnabled,
     codexUpstreamWebsocketEnabled: config.codexUpstreamWebsocketEnabled,
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
     disableCrossProtocolFallback: config.disableCrossProtocolFallback,
@@ -1177,6 +1193,29 @@ export async function settingsRoutes(app: FastifyInstance) {
         startModelAvailabilityProbeScheduler();
       } else {
         stopModelAvailabilityProbeScheduler();
+      }
+    }
+
+    if (body.channelRecoveryProbeEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.channelRecoveryProbeEnabled, '渠道恢复探针开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '渠道恢复探针开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.channelRecoveryProbeEnabled) {
+        changedLabels.push(nextValue ? '开启渠道恢复探针' : '关闭渠道恢复探针');
+      }
+      await upsertSetting('channel_recovery_probe_enabled', nextValue);
+      config.channelRecoveryProbeEnabled = nextValue;
+      if (nextValue) {
+        startChannelRecoveryProbeScheduler();
+      } else {
+        stopChannelRecoveryProbeScheduler();
       }
     }
 

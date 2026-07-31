@@ -53,6 +53,11 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
     config.modelAvailabilityProbeEnabled = modelAvailabilityProbeEnabled;
   }
 
+  const channelRecoveryProbeEnabled = parseSettingFromMap<boolean>(settingsMap, 'channel_recovery_probe_enabled');
+  if (typeof channelRecoveryProbeEnabled === 'boolean') {
+    config.channelRecoveryProbeEnabled = channelRecoveryProbeEnabled;
+  }
+
   const codexUpstreamWebsocketEnabled = parseSettingFromMap<boolean>(settingsMap, 'codex_upstream_websocket_enabled');
   if (typeof codexUpstreamWebsocketEnabled === 'boolean') {
     config.codexUpstreamWebsocketEnabled = codexUpstreamWebsocketEnabled;

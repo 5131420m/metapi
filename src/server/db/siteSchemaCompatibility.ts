@@ -70,6 +70,14 @@ export const SITE_COLUMN_COMPATIBILITY_SPECS: SiteColumnCompatibilitySpec[] = [
       postgres: 'UPDATE "sites" SET "global_weight" = 1 WHERE "global_weight" IS NULL OR "global_weight" <= 0',
     },
   },
+  {
+    column: 'forced_endpoint',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN forced_endpoint text;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `forced_endpoint` TEXT NULL',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "forced_endpoint" TEXT',
+    },
+  },
 ];
 
 export const SITE_TABLE_COMPATIBILITY_SPECS: SiteTableCompatibilitySpec[] = [

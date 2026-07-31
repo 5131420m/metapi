@@ -55,6 +55,15 @@ function normalizeSortOrder(input: unknown): number | null {
   return Math.max(0, parsed);
 }
 
+function normalizeForcedEndpoint(input: unknown): string | null {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'string') return null;
+  const trimmed = input.trim().toLowerCase();
+  if (!trimmed) return null;
+  if (trimmed === 'chat' || trimmed === 'messages' || trimmed === 'responses') return trimmed;
+  return null;
+}
+
 function normalizeGlobalWeight(input: unknown): number | null {
   if (input === undefined || input === null || input === '') return null;
   const parsed = Number(input);
@@ -477,6 +486,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       isPinned,
       sortOrder,
       globalWeight,
+      forcedEndpoint,
       apiEndpoints,
     } = createBody;
     const normalizedStatus = normalizeSiteStatus(status);
@@ -520,6 +530,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     const normalizedApiEndpoints = normalizeSiteApiEndpointsInput(apiEndpoints);
     if (!normalizedApiEndpoints.valid) {
       return reply.code(400).send({ error: normalizedApiEndpoints.error || 'Invalid apiEndpoints.' });
+    }
+    const normalizedForcedEndpoint = normalizeForcedEndpoint(forcedEndpoint);
+    if (forcedEndpoint !== undefined && normalizedForcedEndpoint === null) {
+      return reply.code(400).send({ error: 'Invalid forcedEndpoint. Expected "chat", "messages", "responses", or null.' });
     }
 
     const existingSites = await db.select().from(schema.sites).all();
@@ -565,6 +579,7 @@ export async function sitesRoutes(app: FastifyInstance) {
           isPinned: normalizedPinned ?? false,
           sortOrder: normalizedSortOrder ?? (maxSortOrder + 1),
           globalWeight: normalizedGlobalWeight ?? 1,
+          forcedEndpoint: normalizedForcedEndpoint ?? null,
         }).run();
         const siteId = getInsertedRowId(siteInsert);
         if (siteId && normalizedApiEndpoints.present && normalizedApiEndpoints.apiEndpoints.length > 0) {
@@ -695,6 +710,13 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (anyBody.postRefreshProbeLatencyThresholdMs !== undefined) {
       const ms = Number(anyBody.postRefreshProbeLatencyThresholdMs);
       updates.postRefreshProbeLatencyThresholdMs = Number.isFinite(ms) && ms >= 0 ? Math.trunc(ms) : 0;
+    }
+    if (anyBody.forcedEndpoint !== undefined) {
+      const normalized = normalizeForcedEndpoint(anyBody.forcedEndpoint);
+      if (normalized === null && anyBody.forcedEndpoint !== null) {
+        return reply.code(400).send({ error: 'Invalid forcedEndpoint. Expected "chat", "messages", "responses", or null.' });
+      }
+      updates.forcedEndpoint = normalized;
     }
     updates.updatedAt = new Date().toISOString();
     try {

@@ -762,6 +762,7 @@ function buildAllApiHubV2AccountsSection(data: RawBackupData): {
       postRefreshProbeModel: '',
       postRefreshProbeScope: 'single',
       postRefreshProbeLatencyThresholdMs: 0,
+      forcedEndpoint: null,
       createdAt: input.createdAt,
       updatedAt: input.updatedAt,
     });
@@ -1009,6 +1010,7 @@ function buildAccountsSectionFromRefBackup(data: RawBackupData): AccountsBackupS
         postRefreshProbeModel: '',
         postRefreshProbeScope: 'single',
         postRefreshProbeLatencyThresholdMs: 0,
+        forcedEndpoint: null,
         createdAt: toIsoString(item.created_at),
         updatedAt: toIsoString(item.updated_at),
       });

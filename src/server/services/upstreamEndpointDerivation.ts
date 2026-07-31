@@ -23,6 +23,7 @@ type ChannelContext = {
     url: string;
     platform: string;
     apiKey?: string | null;
+    forcedEndpoint?: string | null;
   };
   account: {
     id: number;
@@ -151,6 +152,10 @@ export async function resolveUpstreamEndpointCandidates(
   hints?: EndpointDerivationHints,
 ): Promise<UpstreamEndpoint[]> {
   const sitePlatform = normalizePlatformName(context.site.platform);
+  const forcedEndpoint = asTrimmedString(context.site.forcedEndpoint).toLowerCase();
+  if (forcedEndpoint === 'chat' || forcedEndpoint === 'messages' || forcedEndpoint === 'responses') {
+    return [forcedEndpoint as UpstreamEndpoint];
+  }
   if (hints?.requestKind === 'responses-compact') {
     return ['responses'];
   }
