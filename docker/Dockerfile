@@ -39,9 +39,9 @@ RUN apt-get update \
       fi ;; \
     *) echo "Unsupported TARGETARCH/TARGETVARIANT: $TARGETARCH/${TARGETVARIANT:-}" >&2; exit 1 ;; \
   esac \
-  && curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
+  && curl --retry 5 --retry-delay 3 --http1.1 -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
   && chmod +x /usr/local/bin/kubectl \
-  && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/helm.tgz \
+  && curl --retry 5 --retry-delay 3 --http1.1 -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/helm.tgz \
   && tar -xzf /tmp/helm.tgz -C /tmp \
   && mv "/tmp/linux-${ARCH}/helm" /usr/local/bin/helm \
   && chmod +x /usr/local/bin/helm \
