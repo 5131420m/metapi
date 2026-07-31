@@ -1501,6 +1501,12 @@ function resolveActualModelForSelectedChannel(
   channelSourceModel: string | null | undefined,
 ): string {
   const sourceModel = normalizeChannelSourceModel(channelSourceModel);
+  // Prefer the channel's own source model (original case from the upstream) so that
+  // e.g. client-visible "deepseek-v4-pro" maps back to "DeepSeek-V4-pro" on upstream A
+  // and "deepseek-v4-pro" on upstream B.
+  if (sourceModel) {
+    return sourceModel;
+  }
   if (isRouteDisplayNameMatch(requestedModel, route.displayName) && sourceModel) {
     return sourceModel;
   }
