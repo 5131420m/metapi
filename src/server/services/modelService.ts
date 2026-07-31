@@ -1409,7 +1409,7 @@ export async function rebuildTokenRoutesFromAvailability() {
     siteId: number,
     oauthRouteUnitId: number | null = null,
   ) => {
-    const modelName = (modelNameRaw || '').trim();
+    const modelName = (modelNameRaw || '').trim().toLowerCase();
     if (!modelName) return;
     if (!isModelAllowedByWhitelist(modelName)) return;
     if (isModelDisabledForSite(siteId, modelName)) return;
@@ -1448,7 +1448,12 @@ export async function rebuildTokenRoutesFromAvailability() {
   let removedRoutes = 0;
 
   for (const [modelName, candidateMap] of modelCandidates.entries()) {
-    let route = routes.find((r) => (r.routeMode || 'pattern') !== 'explicit_group' && r.modelPattern === modelName);
+    let route = routes.find((r) => (r.routeMode || 'pattern') !== 'explicit_group' && r.modelPattern.toLowerCase() === modelName);
+    if (route && route.modelPattern !== modelName) {
+      // Normalise existing route pattern to lowercase (e.g. "Deepseek-V4-pro" → "deepseek-v4-pro").
+      await db.update(schema.tokenRoutes).set({ modelPattern: modelName }).where(eq(schema.tokenRoutes.id, route.id)).run();
+      route = { ...route, modelPattern: modelName };
+    }
     if (!route) {
       const inserted = await db.insert(schema.tokenRoutes).values({
         modelPattern: modelName,
@@ -1519,7 +1524,7 @@ export async function rebuildTokenRoutesFromAvailability() {
       continue;
     }
     const modelPattern = (route.modelPattern || '').trim();
-    if (!modelPattern || !isExactModelPattern(modelPattern) || latestModelNames.has(modelPattern)) {
+    if (!modelPattern || !isExactModelPattern(modelPattern) || latestModelNames.has(modelPattern.toLowerCase())) {
       continue;
     }
 

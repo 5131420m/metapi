@@ -1336,6 +1336,8 @@ export function parseRegexModelPattern(pattern: string): { test(value: string): 
 }
 
 export function matchesModelPattern(model: string, pattern: string): boolean {
+  // Exact match: case-insensitive so that e.g. "Deepseek-V4-pro" matches route "deepseek-v4-pro".
+  if (model.toLowerCase() === pattern.toLowerCase()) return true;
   return matchesTokenRouteModelPattern(model, pattern);
 }
 
