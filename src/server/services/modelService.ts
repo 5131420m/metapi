@@ -1479,8 +1479,18 @@ export async function rebuildTokenRoutesFromAvailability() {
     const desiredKeys = new Set(Array.from(candidateMap.keys()));
 
     for (const [candidateKey, candidate] of candidateMap.entries()) {
-      const exists = routeChannels.some((channel) => buildChannelKey(channel) === candidateKey);
-      if (exists) continue;
+      const existingChannel = routeChannels.find((channel) => buildChannelKey(channel) === candidateKey);
+      if (existingChannel) {
+        // Update sourceModel if it changed (e.g. upstream now reports a different case).
+        if (existingChannel.sourceModel !== candidate.originalName) {
+          await db.update(schema.routeChannels)
+            .set({ sourceModel: candidate.originalName })
+            .where(eq(schema.routeChannels.id, existingChannel.id))
+            .run();
+          existingChannel.sourceModel = candidate.originalName;
+        }
+        continue;
+      }
 
       const inserted = await db.insert(schema.routeChannels).values({
         routeId: route.id,
