@@ -711,6 +711,7 @@ export async function startOauthProviderFlow(input: {
   if (callbackServerState.attempted && !callbackServerState.ready) {
     throw new Error(`${input.provider} oauth callback listener is unavailable: ${callbackServerState.error || 'unknown error'}`);
   }
+  await ensureOauthSite(definition);
   const session = createOauthSession({
     provider: input.provider,
     redirectUri,

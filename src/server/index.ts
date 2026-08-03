@@ -33,7 +33,7 @@ import { repairStoredCreatedAtValues } from './services/storedTimestampRepairSer
 import { migrateSiteApiKeysToAccounts } from './services/siteApiKeyMigrationService.js';
 import { ensureDefaultSitesSeeded } from './services/defaultSiteSeedService.js';
 import { ensureOauthIdentityBackfill } from './services/oauth/oauthIdentityBackfill.js';
-import { ensureOauthProviderSitesExist } from './services/oauth/oauthSiteRegistry.js';
+
 import { startOAuthLoopbackCallbackServers, stopOAuthLoopbackCallbackServers } from './services/oauth/localCallbackServer.js';
 import { startSiteAnnouncementPolling, stopSiteAnnouncementPolling } from './services/siteAnnouncementPollingService.js';
 import {
@@ -196,8 +196,6 @@ try {
 } catch (error) {
   console.warn(`Failed to load runtime settings overrides: ${(error as Error)?.message || 'unknown error'}`);
 }
-
-await ensureOauthProviderSitesExist();
 
 const app = Fastify(buildFastifyOptions(config));
 
