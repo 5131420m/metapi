@@ -352,6 +352,22 @@ function sanitizeResponsesFallbackChatBody(
   body: Record<string, unknown>,
 ): Record<string, unknown> {
   const next: Record<string, unknown> = { ...body };
+
+  // Responses → Chat fallback: flatten reasoning.effort → reasoning_effort.
+  // Downstream Responses requests carry reasoning as a nested object
+  // ({reasoning:{effort:"high"}}), but OpenAI-compatible Chat upstreams
+  // (Sub2API, etc.) declare only the flat reasoning_effort field. A nested
+  // reasoning object is silently dropped by their JSON unmarshaler, causing
+  // the effort level to be lost. Flatten it here so the Chat body carries
+  // the standard reasoning_effort field.
+  if (isRecord(next.reasoning)) {
+    const effort = asTrimmedString(next.reasoning.effort);
+    if (effort) {
+      next.reasoning_effort = effort;
+    }
+    delete next.reasoning;
+  }
+
   const normalizedTools = Array.isArray(body.tools)
     ? body.tools
       .map((tool) => normalizeResponsesFallbackChatFunctionTool(tool))

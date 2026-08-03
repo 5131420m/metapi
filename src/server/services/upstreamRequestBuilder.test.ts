@@ -132,6 +132,47 @@ describe('upstreamRequestBuilder', () => {
     expect(request.headers['x-test-header']).toBeUndefined();
   });
 
+  it('flattens reasoning.effort to reasoning_effort on responses→chat fallback', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'upstream-gpt',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+        reasoning: { effort: 'high' },
+      },
+      downstreamFormat: 'responses',
+    });
+
+    expect(request.path).toBe('/v1/chat/completions');
+    expect(request.body.reasoning_effort).toBe('high');
+    expect(request.body.reasoning).toBeUndefined();
+  });
+
+  it('preserves reasoning_effort on native chat requests (no flatten)', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'upstream-gpt',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+        reasoning_effort: 'high',
+      },
+      downstreamFormat: 'openai',
+    });
+
+    expect(request.body.reasoning_effort).toBe('high');
+    expect(request.body.reasoning).toBeUndefined();
+  });
+
   it('drops responses-style continuation fields before proxying Claude count_tokens upstream', () => {
     const request = buildClaudeCountTokensUpstreamRequest({
       modelName: 'claude-opus-4-6',
