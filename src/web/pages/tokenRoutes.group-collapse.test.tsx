@@ -441,7 +441,6 @@ describe('TokenRoutes grouped source models', () => {
 
       expect(globalThis.confirm).toHaveBeenCalledWith(expect.stringContaining('claude-proxy-b'));
       expect(apiMock.batchUpdateChannels).toHaveBeenCalledWith([
-        { id: 101, priority: 0 },
         { id: 102, priority: 0 },
       ]);
     } finally {

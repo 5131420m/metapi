@@ -1181,7 +1181,7 @@ export default function TokenRoutes() {
 
     try {
       await api.batchUpdateChannels(
-        reordered.map((channel) => ({
+        changedChannels.map((channel) => ({
           id: channel.id,
           priority: channel.priority,
         })),

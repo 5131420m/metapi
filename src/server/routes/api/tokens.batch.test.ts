@@ -111,7 +111,7 @@ describe('PUT /api/channels/batch', () => {
     expect(invalidPriorityRes.json()).toMatchObject({ success: false });
   });
 
-  it('updates priorities in batch, sets manualOverride, and keeps weight unchanged', async () => {
+  it('updates priorities in batch without changing manualOverride, and keeps weight unchanged', async () => {
     const channelA = await seedChannel({ priority: 9, weight: 17, manualOverride: false });
     const channelB = await seedChannel({ priority: 8, weight: 23, manualOverride: false });
 
@@ -142,8 +142,8 @@ describe('PUT /api/channels/batch', () => {
     expect(returnedB?.priority).toBe(0);
     expect(returnedA?.weight).toBe(17);
     expect(returnedB?.weight).toBe(23);
-    expect(returnedA?.manualOverride).toBe(true);
-    expect(returnedB?.manualOverride).toBe(true);
+    expect(returnedA?.manualOverride).toBe(false);
+    expect(returnedB?.manualOverride).toBe(false);
 
     const dbA = await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channelA.id)).get();
     const dbB = await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channelB.id)).get();
@@ -151,8 +151,8 @@ describe('PUT /api/channels/batch', () => {
     expect(dbB?.priority).toBe(0);
     expect(dbA?.weight).toBe(17);
     expect(dbB?.weight).toBe(23);
-    expect(dbA?.manualOverride).toBe(true);
-    expect(dbB?.manualOverride).toBe(true);
+    expect(dbA?.manualOverride).toBe(false);
+    expect(dbB?.manualOverride).toBe(false);
   });
 
   it('reports the number of routes actually updated in route batch operations', async () => {

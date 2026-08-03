@@ -1380,7 +1380,6 @@ export async function tokensRoutes(app: FastifyInstance) {
     for (const update of parsed.updates) {
       await db.update(schema.routeChannels).set({
         priority: update.priority,
-        manualOverride: true,
       }).where(eq(schema.routeChannels.id, update.id)).run();
     }
 
