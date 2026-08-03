@@ -532,7 +532,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: normalizedApiEndpoints.error || 'Invalid apiEndpoints.' });
     }
     const normalizedForcedEndpoint = normalizeForcedEndpoint(forcedEndpoint);
-    if (forcedEndpoint !== undefined && normalizedForcedEndpoint === null) {
+    if (forcedEndpoint !== undefined && forcedEndpoint !== null && normalizedForcedEndpoint === null) {
       return reply.code(400).send({ error: 'Invalid forcedEndpoint. Expected "chat", "messages", "responses", or null.' });
     }
 
