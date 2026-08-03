@@ -1187,13 +1187,9 @@ export default function TokenRoutes() {
         })),
       );
 
-      if (route && isRouteExactModel(route)) {
+      if (route) {
         try {
-          const res = await api.getRouteDecision(route.modelPattern);
-          setDecisionByRoute((prev) => ({
-            ...prev,
-            [routeId]: (res?.decision || null) as RouteDecision | null,
-          }));
+          await loadRouteDecision(route);
         } catch {
           // ignore route decision refresh failures after reorder
         }
@@ -1296,6 +1292,28 @@ export default function TokenRoutes() {
     }
   };
 
+  const loadRouteDecision = async (route: RouteSummaryRow) => {
+    if (route.kind === 'zero_channel' || route.readOnly === true || route.isVirtual === true) return;
+
+    try {
+      if (isRouteExactModel(route)) {
+        const res = await api.getRouteDecision(route.modelPattern);
+        setDecisionByRoute((prev) => ({
+          ...prev,
+          [route.id]: (res?.decision || null) as RouteDecision | null,
+        }));
+      } else {
+        const res = await api.getRouteWideDecisionsBatch([route.id]);
+        setDecisionByRoute((prev) => ({
+          ...prev,
+          [route.id]: (res?.decisions?.[String(route.id)] || null) as RouteDecision | null,
+        }));
+      }
+    } finally {
+      setLoadingDecision(false);
+    }
+  };
+
   const toggleExpand = async (routeId: number) => {
     const isCurrentlyExpanded = expandedRouteIds.includes(routeId);
     if (isCurrentlyExpanded) {
@@ -1328,11 +1346,21 @@ export default function TokenRoutes() {
       // Load channels on demand
       const route = routeById.get(routeId) || null;
       const isReadOnlyRoute = route?.kind === 'zero_channel' || route?.readOnly === true || route?.isVirtual === true;
+      if (route && !isReadOnlyRoute) {
+        setLoadingDecision(true);
+      }
       if (!channelsByRouteId[routeId] && !isReadOnlyRoute) {
         try {
           await loadChannels(routeId);
         } catch {
           toast.error('加载通道失败');
+        }
+      }
+      if (route) {
+        try {
+          await loadRouteDecision(route);
+        } catch {
+          toast.error('加载路由选中概率失败');
         }
       }
     }
