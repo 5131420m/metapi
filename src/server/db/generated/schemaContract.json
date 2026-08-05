@@ -2113,6 +2113,12 @@
           "notNull": false,
           "defaultValue": "0",
           "primaryKey": false
+        },
+        "forced_endpoint": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
         }
       }
     },

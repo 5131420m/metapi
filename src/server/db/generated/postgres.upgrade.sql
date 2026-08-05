@@ -1,1 +1,1 @@
--- no schema changes detected for postgres
+ALTER TABLE "sites" ADD COLUMN "forced_endpoint" TEXT;

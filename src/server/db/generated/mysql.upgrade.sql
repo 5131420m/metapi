@@ -1,1 +1,1 @@
--- no schema changes detected for mysql
+ALTER TABLE `sites` ADD COLUMN `forced_endpoint` TEXT;
