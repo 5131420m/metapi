@@ -180,6 +180,7 @@ function extractCodexPassthroughHeaders(
     const shouldForward = (
       key === 'version'
       || key === 'x-responsesapi-include-timing-metrics'
+      || key.startsWith('x-codex-')
     );
     if (!shouldForward) continue;
 
@@ -733,7 +734,13 @@ export function buildUpstreamEndpointRequest(input: {
     };
   }
 
-  const headers = ensureStreamAcceptHeader(commonHeaders, input.stream);
+  const chatFallbackCodexHeaders = input.downstreamFormat === 'responses'
+    ? extractCodexPassthroughHeaders(input.downstreamHeaders)
+    : {};
+  const headers = ensureStreamAcceptHeader({
+    ...commonHeaders,
+    ...chatFallbackCodexHeaders,
+  }, input.stream);
   const chatBody = {
     ...openaiBody,
     model: input.modelName,

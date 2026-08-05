@@ -202,7 +202,7 @@ describe('upstreamRequestBuilder', () => {
     expect(request.headers['x-test-header']).toBeUndefined();
   });
 
-  it('does not forward x-codex-* headers on chat endpoint', () => {
+  it('forwards x-codex-* headers on responses→chat fallback', () => {
     const request = buildUpstreamEndpointRequest({
       endpoint: 'chat',
       modelName: 'gpt-5.2',
@@ -215,6 +215,31 @@ describe('upstreamRequestBuilder', () => {
         messages: [{ role: 'user', content: 'hello' }],
       },
       downstreamFormat: 'responses',
+      downstreamHeaders: {
+        'x-codex-window-id': 'window-abc',
+        'x-codex-turn-state': 'turn-state',
+        'x-client-request-id': 'req-123',
+      },
+    });
+
+    expect(request.headers['x-codex-window-id']).toBe('window-abc');
+    expect(request.headers['x-codex-turn-state']).toBe('turn-state');
+    expect(request.headers['x-client-request-id']).toBeUndefined();
+  });
+
+  it('does not forward x-codex-* headers on native chat requests', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'gpt-5.2',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'new-api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+      downstreamFormat: 'openai',
       downstreamHeaders: {
         'x-codex-window-id': 'window-abc',
         'x-client-request-id': 'req-123',
