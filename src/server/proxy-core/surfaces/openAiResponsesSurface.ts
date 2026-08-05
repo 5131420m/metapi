@@ -354,6 +354,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
     };
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    let streamStarted = false;
+    const isResponseCommitted = () => (
+      streamStarted
+      || reply.sent
+      || reply.raw.headersSent
+      || reply.raw.writableEnded
+    );
 
     while (retryCount <= maxRetries) {
       const stickyPreferredChannelId = retryCount === 0
@@ -894,18 +901,24 @@ export async function handleOpenAiResponsesSurfaceRequest(
           } catch (error) {
             console.error('[responses] post-stream success logging failed:', error);
           }
-          await finalizeDebugSuccess(
-            200,
-            successfulUpstreamPath,
-            buildSurfaceProxyDebugResponseHeaders(upstream),
-            streamDebugBody,
-          );
+          try {
+            await finalizeDebugSuccess(
+              200,
+              successfulUpstreamPath,
+              buildSurfaceProxyDebugResponseHeaders(upstream),
+              streamDebugBody,
+            );
+          } catch (error) {
+            console.error('[responses] post-stream debug finalization failed:', error);
+          }
         };
 
         if (isStream) {
           const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
           const startSseResponse = () => {
+            if (streamStarted || reply.raw.headersSent || reply.raw.writableEnded) return;
             reply.hijack();
+            streamStarted = true;
             reply.raw.statusCode = 200;
             reply.raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
             reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1361,6 +1374,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
 	          stickySessionKey,
 	          selected,
 	        });
+          if (isResponseCommitted()) {
+            console.error('[responses] post-commit stream failure:', err);
+            if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+              reply.raw.end();
+            }
+            return;
+          }
           const endpointFailureStatus = typeof err?.status === 'number' ? err.status : null;
           const isSiteApiEndpointFailure = (
             err instanceof SiteApiEndpointRequestError

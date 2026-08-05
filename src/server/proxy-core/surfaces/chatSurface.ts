@@ -235,6 +235,13 @@ export async function handleChatSurfaceRequest(
 
   const excludeChannelIds: number[] = [];
   let retryCount = 0;
+  let responseCommitted = false;
+  const isResponseCommitted = () => (
+    responseCommitted
+    || reply.sent
+    || reply.raw.headersSent
+    || reply.raw.writableEnded
+  );
 
   while (retryCount <= maxRetries) {
     const stickyPreferredChannelId = retryCount === 0
@@ -568,9 +575,10 @@ export async function handleChatSurfaceRequest(
         const upstreamContentType = (upstream.headers.get('content-type') || '').toLowerCase();
         let streamStarted = false;
         const startSseResponse = () => {
-          if (streamStarted) return;
-          streamStarted = true;
+          if (streamStarted || reply.raw.headersSent || reply.raw.writableEnded) return;
           reply.hijack();
+          streamStarted = true;
+          responseCommitted = true;
           reply.raw.statusCode = 200;
           reply.raw.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
           reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -588,27 +596,43 @@ export async function handleChatSurfaceRequest(
         };
         let upstreamUsagePresent = false;
         const recordStreamSuccess = async (latencyMs: number) => {
-          await recordSurfaceSuccess({
-            selected,
-            requestedModel,
-            modelName,
-            parsedUsage,
-            upstreamUsagePresent,
-            upstreamHeaders: upstream.headers,
-            requestStartedAtMs: startTime,
-            isStream: true,
-            firstByteLatencyMs,
-            latencyMs,
-            retryCount,
-            upstreamPath: successfulUpstreamPath,
-            logSuccess: failureToolkit.log,
-            recordDownstreamCost: (estimatedCost) => {
-              recordDownstreamCostUsage(request, estimatedCost);
-            },
-            bestEffortMetrics: {
-              errorLabel: '[proxy/chat] failed to record success metrics',
-            },
-          });
+          try {
+            await recordSurfaceSuccess({
+              selected,
+              requestedModel,
+              modelName,
+              parsedUsage,
+              upstreamUsagePresent,
+              upstreamHeaders: upstream.headers,
+              requestStartedAtMs: startTime,
+              isStream: true,
+              firstByteLatencyMs,
+              latencyMs,
+              retryCount,
+              upstreamPath: successfulUpstreamPath,
+              logSuccess: failureToolkit.log,
+              recordDownstreamCost: (estimatedCost) => {
+                recordDownstreamCostUsage(request, estimatedCost);
+              },
+              bestEffortMetrics: {
+                errorLabel: '[proxy/chat] failed to record success metrics',
+              },
+            });
+          } catch (error) {
+            console.error('[proxy/chat] post-stream success logging failed:', error);
+          }
+        };
+        const finalizeStreamDebugSuccess = async (streamDebugBody: unknown) => {
+          try {
+            await finalizeDebugSuccess(
+              200,
+              successfulUpstreamPath,
+              buildSurfaceProxyDebugResponseHeaders(upstream),
+              streamDebugBody,
+            );
+          } catch (error) {
+            console.error('[proxy/chat] post-stream debug finalization failed:', error);
+          }
         };
 
         const writeLines = (lines: string[]) => {
@@ -619,7 +643,7 @@ export async function handleChatSurfaceRequest(
         };
         const streamResponse = {
           end() {
-            if (streamStarted) {
+            if (isResponseCommitted() && !reply.raw.writableEnded && !reply.raw.destroyed) {
               reply.raw.end();
             }
           },
@@ -673,7 +697,7 @@ export async function handleChatSurfaceRequest(
                   type: 'stream_error',
                 },
               }, successfulUpstreamPath);
-              if (!streamStarted) {
+              if (!isResponseCommitted()) {
                 return reply.code(502).send({
                   error: {
                     message: streamResult.errorMessage,
@@ -684,10 +708,7 @@ export async function handleChatSurfaceRequest(
               return;
             }
             await recordStreamSuccess(latency);
-            await finalizeDebugSuccess(
-              200,
-              successfulUpstreamPath,
-              buildSurfaceProxyDebugResponseHeaders(upstream),
+            await finalizeStreamDebugSuccess(
               debugTrace?.options.captureStreamChunks
                 ? fallbackText
                 : {
@@ -773,7 +794,7 @@ export async function handleChatSurfaceRequest(
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
-            if (!streamStarted) {
+            if (!isResponseCommitted()) {
               return reply.code(502).send({
                 error: {
                   message: streamResult.errorMessage,
@@ -784,10 +805,7 @@ export async function handleChatSurfaceRequest(
             return;
           }
           await recordStreamSuccess(latency);
-          await finalizeDebugSuccess(
-            200,
-            successfulUpstreamPath,
-            buildSurfaceProxyDebugResponseHeaders(upstream),
+          await finalizeStreamDebugSuccess(
             debugTrace?.options.captureStreamChunks
               ? fallbackText
               : {
@@ -851,7 +869,7 @@ export async function handleChatSurfaceRequest(
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
-            if (!streamStarted) {
+            if (!isResponseCommitted()) {
               return reply.code(502).send({
                 error: {
                   message: streamResult.errorMessage,
@@ -870,10 +888,7 @@ export async function handleChatSurfaceRequest(
 
         const latency = Date.now() - startTime;
         await recordStreamSuccess(latency);
-        await finalizeDebugSuccess(
-          200,
-          successfulUpstreamPath,
-          buildSurfaceProxyDebugResponseHeaders(upstream),
+        await finalizeStreamDebugSuccess(
           debugTrace?.options.captureStreamChunks
             ? rawText
             : {
@@ -990,6 +1005,13 @@ export async function handleChatSurfaceRequest(
         stickySessionKey,
         selected,
       });
+      if (isResponseCommitted()) {
+        console.error('[proxy/chat] post-commit stream failure:', err);
+        if (!reply.raw.writableEnded && !reply.raw.destroyed) {
+          reply.raw.end();
+        }
+        return;
+      }
       const endpointFailureStatus = typeof err?.status === 'number' ? err.status : null;
       const isSiteApiEndpointFailure = (
         err instanceof SiteApiEndpointRequestError

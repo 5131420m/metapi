@@ -83,6 +83,23 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
     };
   };
 
+  const failReader = (error: unknown) => {
+    if (finalized) return;
+    finalized = true;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    markFailed({ error: { message: errorMessage } }, 'upstream stream failed');
+    if (input.downstreamFormat === 'openai') {
+      input.writeLines([
+        `data: ${JSON.stringify({ error: { message: errorMessage, type: 'upstream_error' } })}\n\n`,
+        ...downstreamTransformer.serializeDone(streamContext, claudeContext),
+      ]);
+      return;
+    }
+    input.writeLines([
+      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: errorMessage } })}\n\n`,
+    ]);
+  };
+
   const hasMeaningfulChatAggregateOutput = (): boolean => {
     if (input.downstreamFormat !== 'openai' || !chatAggregateState) return false;
     for (const choice of chatAggregateState.choices.values()) {
@@ -342,6 +359,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
         pullEvents: (buffer) => downstreamTransformer.pullSseEvents(buffer),
         handleEvent: handleEventBlock,
         onEof: finalize,
+        onReadError: failReader,
       });
       await lifecycle.run();
       return terminalResult;

@@ -189,6 +189,117 @@ describe('createResponsesProxyStreamSession', () => {
     expect(output).toContain('data: [DONE]');
   });
 
+  it('converts reader failures into an in-band response.failed terminal', async () => {
+    const lines: string[] = [];
+    let ended = false;
+    let reads = 0;
+    const usage = {
+      promptTokens: 5,
+      completionTokens: 1,
+      totalTokens: 6,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      promptTokensIncludeCache: null,
+    };
+    const reader = {
+      async read() {
+        reads += 1;
+        if (reads === 1) {
+          return {
+            done: false,
+            value: new TextEncoder().encode('data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"partial"}}]}\n\n'),
+          };
+        }
+        throw new Error('upstream stream interrupted');
+      },
+      async cancel() {
+        return undefined;
+      },
+      releaseLock() {},
+    };
+
+    const session = createResponsesProxyStreamSession({
+      modelName: 'gpt-5',
+      successfulUpstreamPath: '/v1/chat/completions',
+      getUsage: () => usage,
+      writeLines: (nextLines) => {
+        lines.push(...nextLines);
+      },
+      writeRaw: () => {},
+    });
+
+    const result = await session.run(reader as any, {
+      end() {
+        ended = true;
+      },
+    });
+
+    expect(result).toEqual({
+      status: 'failed',
+      errorMessage: 'upstream stream interrupted',
+    });
+    expect(ended).toBe(true);
+    const output = lines.join('');
+    expect(output).toContain('event: response.failed');
+    expect(output).toContain('upstream stream interrupted');
+    expect(output).toContain('data: [DONE]');
+  });
+
+  it('does not emit response.failed when the reader fails after response.completed', async () => {
+    const lines: string[] = [];
+    let reads = 0;
+    const usage = {
+      promptTokens: 5,
+      completionTokens: 3,
+      totalTokens: 8,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 0,
+      promptTokensIncludeCache: null,
+    };
+    const reader = {
+      async read() {
+        reads += 1;
+        if (reads === 1) {
+          return {
+            done: false,
+            value: new TextEncoder().encode([
+              'event: response.completed',
+              'data: {"type":"response.completed","response":{"id":"resp_stream_1","model":"gpt-5","usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}',
+              '',
+              '',
+            ].join('\n')),
+          };
+        }
+        throw new Error('late reader failure');
+      },
+      async cancel() {
+        return undefined;
+      },
+      releaseLock() {},
+    };
+
+    const session = createResponsesProxyStreamSession({
+      modelName: 'gpt-5',
+      successfulUpstreamPath: '/v1/responses',
+      getUsage: () => usage,
+      writeLines: (nextLines) => {
+        lines.push(...nextLines);
+      },
+      writeRaw: () => {},
+    });
+
+    const result = await session.run(reader as any, { end() {} });
+
+    expect(result).toEqual({
+      status: 'completed',
+      errorMessage: null,
+    });
+    const output = lines.join('');
+    expect(output).toContain('event: response.completed');
+    expect(output).not.toContain('event: response.failed');
+    expect(output).toContain('data: [DONE]');
+  });
+
   it('preserves non-SSE incomplete fallback payloads as response.incomplete', () => {
     const lines: string[] = [];
     let ended = false;

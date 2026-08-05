@@ -121,6 +121,8 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
   };
 
   const complete = () => {
+    if (finalized) return;
+    finalized = true;
     terminalResult = {
       status: 'completed',
       errorMessage: null,
@@ -128,7 +130,12 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
   };
 
   const closeOut = () => {
-    if (finalized) return;
+    if (finalized) {
+      if (terminalEventSeen) {
+        input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+      }
+      return;
+    }
     if (terminalEventSeen) {
       finalize();
       return;
@@ -279,6 +286,21 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         pullEvents: (buffer) => openAiResponsesStream.pullSseEvents(buffer),
         handleEvent: handleEventBlock,
         onEof: closeOut,
+        onReadError: (error) => {
+          if (terminalEventSeen || finalized) {
+            input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+            return;
+          }
+          fail(
+            {
+              type: 'response.failed',
+              error: {
+                message: error instanceof Error ? error.message : String(error),
+              },
+            },
+            'upstream stream failed',
+          );
+        },
       });
       await lifecycle.run();
       return terminalResult;

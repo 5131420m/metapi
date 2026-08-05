@@ -15,6 +15,7 @@ type ProxyStreamLifecycleInput<TEvent> = {
   pullEvents(buffer: string): PulledEventBatch<TEvent>;
   handleEvent(event: TEvent): Promise<boolean | void> | boolean | void;
   onEof?: () => Promise<void> | void;
+  onReadError?: (error: unknown) => Promise<void> | void;
 };
 
 export function createProxyStreamLifecycle<TEvent>(input: ProxyStreamLifecycleInput<TEvent>) {
@@ -53,7 +54,16 @@ export function createProxyStreamLifecycle<TEvent>(input: ProxyStreamLifecycleIn
 
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          let readResult: Awaited<ReturnType<typeof reader.read>>;
+          try {
+            readResult = await reader.read();
+          } catch (error) {
+            if (!input.onReadError) throw error;
+            await input.onReadError(error);
+            shouldStop = true;
+            break;
+          }
+          const { done, value } = readResult;
           if (done) break;
           if (!value) continue;
 

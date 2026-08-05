@@ -206,6 +206,134 @@ describe('chat proxy stream behavior', () => {
     expect(recordFailureMock).not.toHaveBeenCalled();
   });
 
+  it('does not replace committed chat SSE headers when the upstream stream throws', async () => {
+    const encoder = new TextEncoder();
+    let pullCount = 0;
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pullCount += 1;
+        if (pullCount === 1) {
+          controller.enqueue(encoder.encode('data: {"id":"chatcmpl-demo","model":"upstream-gpt","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+          return;
+        }
+        controller.error(new Error('upstream chat stream interrupted'));
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('partial');
+    expect(response.body).toContain('"error"');
+    expect(response.body).toContain('upstream chat stream interrupted');
+    expect(response.body).toContain('[DONE]');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry another channel after committed chat SSE bytes even when retries and a spare channel are available', async () => {
+    const previousAttempts = (config as any).proxyMaxChannelAttempts;
+    (config as any).proxyMaxChannelAttempts = 3;
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 99, routeId: 98 },
+      site: { name: 'spare-site', url: 'https://spare.example.com' },
+      account: { id: 97, username: 'spare-user' },
+      tokenName: 'spare',
+      tokenValue: 'sk-spare',
+      actualModel: 'upstream-gpt',
+    });
+
+    try {
+      const encoder = new TextEncoder();
+      let pullCount = 0;
+      const upstreamBody = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pullCount += 1;
+          if (pullCount === 1) {
+            controller.enqueue(encoder.encode('data: {"id":"chatcmpl-retry","model":"upstream-gpt","choices":[{"delta":{"content":"committed"},"finish_reason":null}]}\n\n'));
+            return;
+          }
+          controller.error(new Error('upstream died after commit'));
+        },
+      });
+      fetchMock.mockResolvedValue(new Response(upstreamBody, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+      }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'gpt-4o-mini',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('committed');
+      expect(response.body).toContain('upstream died after commit');
+      expect(response.body).toContain('[DONE]');
+      expect(response.body).not.toContain('"object":"error"');
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      (config as any).proxyMaxChannelAttempts = previousAttempts;
+    }
+  });
+
+  it('hijacks the chat SSE response exactly once across many stream writes', async () => {
+    const encoder = new TextEncoder();
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-once","model":"upstream-gpt","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-once","model":"upstream-gpt","choices":[{"delta":{"content":"one"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-once","model":"upstream-gpt","choices":[{"delta":{"content":"two"},"finish_reason":null}]}\n\n'));
+        controller.enqueue(encoder.encode('data: {"id":"chatcmpl-once","model":"upstream-gpt","choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'gpt-4o-mini',
+        stream: true,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    // A duplicated SSE startup would re-emit the hijack headers inline in the body.
+    expect(response.body).not.toContain('text/event-stream; charset=utf-8\n');
+    expect(response.body).toContain('one');
+    expect(response.body).toContain('two');
+    expect(response.body.match(/data: \[DONE\]/g)).toHaveLength(1);
+    expect(recordSuccessMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).not.toHaveBeenCalled();
+  });
+
   it('decodes zstd-compressed non-stream chat responses before serializing downstream JSON', async () => {
     const payload = JSON.stringify({
       id: 'chatcmpl-zstd',
@@ -1612,6 +1740,53 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('response.output_text.delta');
     expect(response.body).toContain('response.completed');
     expect(response.body).toContain('[DONE]');
+  });
+
+  it('finishes an already-started Responses stream in-band when the downgraded chat stream throws', async () => {
+    fetchModelPricingCatalogMock.mockResolvedValue({
+      models: [
+        {
+          modelName: 'upstream-gpt',
+          supportedEndpointTypes: ['/v1/chat/completions'],
+        },
+      ],
+      groupRatio: {},
+    });
+
+    const encoder = new TextEncoder();
+    let pullCount = 0;
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pullCount += 1;
+        if (pullCount === 1) {
+          controller.enqueue(encoder.encode('data: {"id":"chatcmpl-r1","model":"upstream-gpt","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+          return;
+        }
+        controller.error(new Error('upstream stream interrupted'));
+      },
+    });
+
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: {
+        model: 'gpt-5.2',
+        input: 'hello',
+        stream: true,
+      },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['content-type']).toContain('text/event-stream');
+    expect(response.body).toContain('response.output_text.delta');
+    expect(response.body).toContain('response.failed');
+    expect(response.body).toContain('[DONE]');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('replays downgraded chat-completions SSE for websocket transport without requiring native responses terminals', async () => {
