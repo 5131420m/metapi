@@ -173,6 +173,58 @@ describe('upstreamRequestBuilder', () => {
     expect(request.body.reasoning).toBeUndefined();
   });
 
+  it('forwards x-codex-* headers on responses endpoint regardless of platform', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.2',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'new-api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+      downstreamFormat: 'responses',
+      downstreamHeaders: {
+        'x-codex-window-id': 'window-abc',
+        'x-codex-turn-state': 'turn-state',
+        'x-client-request-id': 'req-123',
+        'x-codex-beta-features': 'feature-1',
+        'x-test-header': 'drop-me',
+      },
+    });
+
+    expect(request.headers['x-codex-window-id']).toBe('window-abc');
+    expect(request.headers['x-codex-turn-state']).toBe('turn-state');
+    expect(request.headers['x-codex-beta-features']).toBe('feature-1');
+    expect(request.headers['x-client-request-id']).toBeUndefined();
+    expect(request.headers['x-test-header']).toBeUndefined();
+  });
+
+  it('does not forward x-codex-* headers on chat endpoint', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'chat',
+      modelName: 'gpt-5.2',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'new-api',
+      siteUrl: 'https://example.com',
+      openaiBody: {
+        model: 'gpt-5.2',
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+      downstreamFormat: 'responses',
+      downstreamHeaders: {
+        'x-codex-window-id': 'window-abc',
+        'x-client-request-id': 'req-123',
+      },
+    });
+
+    expect(request.headers['x-codex-window-id']).toBeUndefined();
+    expect(request.headers['x-client-request-id']).toBeUndefined();
+  });
+
   it('drops responses-style continuation fields before proxying Claude count_tokens upstream', () => {
     const request = buildClaudeCountTokensUpstreamRequest({
       modelName: 'claude-opus-4-6',

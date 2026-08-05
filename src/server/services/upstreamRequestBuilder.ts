@@ -156,6 +156,7 @@ function extractResponsesPassthroughHeaders(
       || key.startsWith('x-openai-')
       || key.startsWith('x-stainless-')
       || key.startsWith('chatgpt-')
+      || key.startsWith('x-codex-')
       || key === 'originator'
     );
     if (!shouldForward) continue;
