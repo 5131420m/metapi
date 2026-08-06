@@ -412,10 +412,27 @@ function normalizeSub2ApiResponsesBodyForProxy(
   body: Record<string, unknown>,
   sitePlatform: string,
 ): Record<string, unknown> {
-  if (sitePlatform !== 'sub2api') return body;
+  if (sitePlatform !== 'sub2api' && sitePlatform !== 'new-api') return body;
+  const input = Array.isArray(body.input) ? body.input : null;
+  const sanitizedInput = input
+    ? input.flatMap((item) => {
+      if (!isRecord(item) || asTrimmedString(item.type).toLowerCase() !== 'reasoning') {
+        return [item];
+      }
+      if (!Object.prototype.hasOwnProperty.call(item, 'encrypted_content')) {
+        return [item];
+      }
+      const { encrypted_content: _encryptedContent, ...withoutEncryptedContent } = item;
+      const hasReasoningSummary = Object.keys(withoutEncryptedContent)
+        .some((key) => key !== 'type');
+      return hasReasoningSummary ? [withoutEncryptedContent] : [];
+    })
+    : null;
+
   return {
     ...body,
     store: false,
+    ...(sanitizedInput ? { input: sanitizedInput } : {}),
   };
 }
 

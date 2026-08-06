@@ -63,6 +63,37 @@ describe('upstreamRequestBuilder', () => {
     expect(request.body.store).toBe(false);
   });
 
+  it('removes replayed encrypted reasoning from sub2api Responses input while preserving tools and messages', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'upstream-gpt',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {},
+      downstreamFormat: 'responses',
+      responsesOriginalBody: {
+        model: 'gpt-5.2',
+        input: [
+          { type: 'reasoning', encrypted_content: 'foreign-blob' },
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+        ],
+        tools: [{ type: 'function', name: 'terminal', parameters: { type: 'object' } }],
+        tool_choice: 'auto',
+      },
+    });
+
+    expect(request.body.input).toEqual([
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+    ]);
+    expect(request.body.tools).toEqual([
+      { type: 'function', name: 'terminal', parameters: { type: 'object' } },
+    ]);
+    expect(request.body.tool_choice).toBe('auto');
+    expect(request.body.store).toBe(false);
+  });
+
   it('overrides downstream Accept so responses transport mode wins', () => {
     const request = buildUpstreamEndpointRequest({
       endpoint: 'responses',
@@ -82,6 +113,26 @@ describe('upstreamRequestBuilder', () => {
     });
 
     expect(request.headers.accept).toBe('text/event-stream');
+  });
+
+  it('applies the same Responses safeguards to the new-api platform alias', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'upstream-gpt',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'new-api',
+      siteUrl: 'https://example.com',
+      openaiBody: {},
+      downstreamFormat: 'responses',
+      responsesOriginalBody: {
+        model: 'gpt-5.2',
+        input: [{ type: 'reasoning', encrypted_content: 'foreign-blob' }],
+      },
+    });
+
+    expect(request.body.input).toEqual([]);
+    expect(request.body.store).toBe(false);
   });
 
   it('applies a sub2api-style allowlist to generic passthrough headers', () => {
