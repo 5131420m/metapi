@@ -185,6 +185,44 @@ describe('proxyDebugTraceStore', () => {
     expect(bodyPayload.preview).toContain('"model": "gpt-5.4"');
   });
 
+  it('stores a protocol summary and keeps both head and tail of large Responses bodies', async () => {
+    const trace = await store.createProxyDebugTrace({
+      downstreamPath: '/v1/responses',
+      clientKind: 'codex',
+      requestedModel: 'gpt-5.4',
+      requestBody: {
+        model: 'gpt-5.4',
+        input: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'head-marker' }] },
+          { type: 'reasoning', encrypted_content: 'secret-blob' },
+        ],
+        tools: [{ type: 'function', name: 'terminal' }],
+        tool_choice: 'auto',
+        padding: 'x'.repeat(5000),
+        tailMarker: 'tail-marker',
+      },
+      maxBodyBytes: 1024,
+    });
+
+    const detail = await store.getProxyDebugTraceDetail(trace.id);
+    const bodyPayload = JSON.parse(detail?.trace.requestBodyJson || 'null');
+
+    expect(bodyPayload).toMatchObject({
+      __metapiTruncated: true,
+      summary: {
+        model: 'gpt-5.4',
+        inputCount: 2,
+        reasoningCount: 1,
+        encryptedReasoningCount: 1,
+        toolCount: 1,
+        toolNames: ['terminal'],
+        toolChoice: 'auto',
+      },
+    });
+    expect(bodyPayload.preview).toContain('head-marker');
+    expect(bodyPayload.preview).toContain('tail-marker');
+  });
+
   it('normalizes undici response headers for proxy debug capture', () => {
     const response = new Response('ok', {
       headers: {

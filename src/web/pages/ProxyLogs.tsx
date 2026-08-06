@@ -266,6 +266,20 @@ async function copyTextToClipboard(text: string) {
   document.body.removeChild(textarea);
 }
 
+function downloadJsonFile(data: unknown, filename: string) {
+  const blob = new Blob([JSON.stringify(data, null, 2)], {
+    type: "application/json;charset=utf-8",
+  });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function formatLatency(ms: number) {
   if (ms >= 1000) {
     return `${(ms / 1000).toFixed(ms >= 10000 ? 0 : 1)}s`;
@@ -1401,6 +1415,19 @@ export default function ProxyLogs() {
     [toast],
   );
 
+  const handleExportDebugTrace = useCallback(() => {
+    const detail = selectedDebugTraceId
+      ? debugDetailById[selectedDebugTraceId]?.data
+      : undefined;
+    if (!detail) {
+      toast.error("追踪详情尚未加载，无法导出");
+      return;
+    }
+    const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
+    downloadJsonFile(detail, `metapi-proxy-debug-trace-${detail.trace.id}-${timestamp}.json`);
+    toast.success("已导出完整追踪记录");
+  }, [debugDetailById, selectedDebugTraceId, toast]);
+
   function renderTraceStatusBadge(trace: ProxyDebugTraceListItem) {
     const failed = trace.finalStatus === "failed";
     return (
@@ -1566,6 +1593,19 @@ export default function ProxyLogs() {
 
     return (
       <div style={{ display: "grid", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            style={{
+              border: "1px solid var(--color-border)",
+              padding: "7px 12px",
+            }}
+            onClick={handleExportDebugTrace}
+          >
+            导出完整记录
+          </button>
+        </div>
         <div style={{ ...formSectionStyle, gap: 10 }}>
           <div style={detailSectionTitleStyle}>基础信息</div>
           <div style={detailInfoGridStyle}>

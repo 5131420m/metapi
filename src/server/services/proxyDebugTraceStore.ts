@@ -31,15 +31,91 @@ type TruncatedDebugPreview = {
   preview: string;
   originalBytes: number;
   storedBytes: number;
+  summary?: Record<string, unknown>;
 };
 
-function buildTruncatedDebugPreview(text: string, maxBytes: number, originalBytes: number): string {
-  const truncated = Buffer.from(text, 'utf8').subarray(0, Math.max(0, maxBytes)).toString('utf8');
+function summarizeDebugPayload(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const body = value as Record<string, unknown>;
+  const input = Array.isArray(body.input) ? body.input : undefined;
+  const tools = Array.isArray(body.tools) ? body.tools : undefined;
+  if (!input && !tools && body.model === undefined) return undefined;
+
+  const inputTypeCounts: Record<string, number> = {};
+  let functionCallCount = 0;
+  let functionCallOutputCount = 0;
+  let reasoningCount = 0;
+  let encryptedReasoningCount = 0;
+  for (const item of input || []) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const type = String((item as Record<string, unknown>).type || 'unknown');
+    inputTypeCounts[type] = (inputTypeCounts[type] || 0) + 1;
+    if (type === 'function_call') functionCallCount += 1;
+    if (type === 'function_call_output') functionCallOutputCount += 1;
+    if (type === 'reasoning') {
+      reasoningCount += 1;
+      if (Object.prototype.hasOwnProperty.call(item, 'encrypted_content')) {
+        encryptedReasoningCount += 1;
+      }
+    }
+  }
+
+  const toolTypes: Record<string, number> = {};
+  const toolNames: string[] = [];
+  for (const tool of tools || []) {
+    if (!tool || typeof tool !== 'object' || Array.isArray(tool)) continue;
+    const record = tool as Record<string, unknown>;
+    const type = String(record.type || 'unknown');
+    toolTypes[type] = (toolTypes[type] || 0) + 1;
+    const name = typeof record.name === 'string'
+      ? record.name
+      : record.function && typeof record.function === 'object'
+        ? (record.function as Record<string, unknown>).name
+        : undefined;
+    if (typeof name === 'string' && name.trim()) toolNames.push(name.trim());
+  }
+
+  return {
+    model: typeof body.model === 'string' ? body.model : undefined,
+    stream: typeof body.stream === 'boolean' ? body.stream : undefined,
+    store: typeof body.store === 'boolean' ? body.store : undefined,
+    inputCount: input?.length,
+    inputTypeCounts,
+    functionCallCount,
+    functionCallOutputCount,
+    reasoningCount,
+    encryptedReasoningCount,
+    toolCount: tools?.length,
+    toolTypes,
+    toolNames: [...new Set(toolNames)].slice(0, 100),
+    toolChoice: typeof body.tool_choice === 'string' ? body.tool_choice : undefined,
+  };
+}
+
+function buildTruncatedDebugPreview(
+  text: string,
+  maxBytes: number,
+  originalBytes: number,
+  summary?: Record<string, unknown>,
+): string {
+  const source = Buffer.from(text, 'utf8');
+  const safeMaxBytes = Math.max(0, maxBytes);
+  const marker = '\n\n... [metapi middle truncated; see summary] ...\n\n';
+  const markerBytes = Buffer.byteLength(marker, 'utf8');
+  const contentBytes = Math.max(0, safeMaxBytes - markerBytes);
+  const headBytes = Math.floor(contentBytes / 2);
+  const tailBytes = Math.max(0, contentBytes - headBytes);
+  const truncated = Buffer.concat([
+    source.subarray(0, headBytes),
+    Buffer.from(marker, 'utf8'),
+    tailBytes > 0 ? source.subarray(Math.max(headBytes, source.length - tailBytes)) : Buffer.alloc(0),
+  ]).subarray(0, safeMaxBytes).toString('utf8');
   const payload: TruncatedDebugPreview = {
     __metapiTruncated: true,
     preview: truncated,
     originalBytes,
     storedBytes: maxBytes,
+    ...(summary ? { summary } : {}),
   };
   return JSON.stringify(payload, null, 2);
 }
@@ -64,7 +140,7 @@ function stringifyDebugValue(value: unknown, maxBytes: number): string | null {
     return text;
   }
 
-  return buildTruncatedDebugPreview(text, maxBytes, buffer.length);
+  return buildTruncatedDebugPreview(text, maxBytes, buffer.length, summarizeDebugPayload(value));
 }
 
 function normalizeHeadersValue(value: HeadersLike): Record<string, unknown> | null {
