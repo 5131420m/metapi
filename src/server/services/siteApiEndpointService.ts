@@ -181,7 +181,16 @@ export async function selectSiteApiEndpointTarget(
     });
 
   const selected = eligible[0];
-  if (!selected) return null;
+  if (!selected) {
+    return {
+      kind: 'site-fallback',
+      siteId: site.id,
+      endpointId: null,
+      baseUrl: normalizeSiteApiEndpointBaseUrl(site.url),
+      configuredEndpointCount: endpoints.length,
+      endpoint: null,
+    };
+  }
 
   return {
     kind: 'endpoint',
@@ -252,6 +261,7 @@ export async function runWithSiteApiEndpointPool<T>(
   operation: (target: SiteApiEndpointTarget) => Promise<T>,
 ): Promise<T> {
   const attemptedEndpointIds = new Set<number>();
+  let attemptedSiteFallback = false;
   let lastError: unknown;
 
   while (true) {
@@ -263,6 +273,13 @@ export async function runWithSiteApiEndpointPool<T>(
     if (target.endpointId && attemptedEndpointIds.has(target.endpointId)) {
       if (lastError) throw lastError;
       throw new Error('当前站点的 API 请求地址均不可用');
+    }
+    if (target.kind === 'site-fallback') {
+      if (attemptedSiteFallback) {
+        if (lastError) throw lastError;
+        throw new Error('主站点 API 请求地址不可用');
+      }
+      attemptedSiteFallback = true;
     }
 
     try {

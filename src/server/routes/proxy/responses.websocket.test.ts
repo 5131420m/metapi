@@ -318,6 +318,7 @@ describe('responses websocket transport', () => {
   let rejectedUpgradeStatus: number;
   let rejectedUpgradeStatusText: string;
   let rejectedUpgradeBody: string;
+  let rejectedUpgradeConnectionCount: number;
 
   beforeAll(async () => {
     const { responsesProxyRoute } = await import('./responses.js');
@@ -351,6 +352,7 @@ describe('responses websocket transport', () => {
 
     rejectedUpgradeServer = createServer();
     rejectedUpgradeServer.on('upgrade', (_request, socket) => {
+      rejectedUpgradeConnectionCount += 1;
       const body = rejectedUpgradeBody;
       socket.write(
         `HTTP/1.1 ${rejectedUpgradeStatus} ${rejectedUpgradeStatusText}\r\n`
@@ -396,6 +398,7 @@ describe('responses websocket transport', () => {
     (config as any).codexResponsesWebsocketBeta = originalCodexResponsesWebsocketBeta;
     (config as any).codexUpstreamWebsocketEnabled = true;
     (config as any).openAiServiceTierRules = undefined;
+    rejectedUpgradeConnectionCount = 0;
     rejectedUpgradeStatus = 426;
     rejectedUpgradeStatusText = 'Upgrade Required';
     rejectedUpgradeBody = 'Upgrade Required';
@@ -590,7 +593,7 @@ describe('responses websocket transport', () => {
     expect(upstreamConnectionCount).toBe(1);
   });
 
-  it('preserves the site endpoint exhaustion message on websocket errors', async () => {
+  it('falls back to the site URL when websocket api endpoints are exhausted', async () => {
     siteApiEndpointRows = [{
       id: 902,
       siteId: 44,
@@ -627,12 +630,13 @@ describe('responses websocket transport', () => {
 
     expect(errorMessage).toMatchObject({
       type: 'error',
-      status: 408,
+      status: 503,
       error: {
-        message: '当前站点的 API 请求地址均不可用',
+        message: 'No available channels for this model',
       },
     });
-    expect(fetchMock).toHaveBeenCalledTimes(0);
+    expect(rejectedUpgradeConnectionCount).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(upstreamConnectionCount).toBe(0);
   });
 

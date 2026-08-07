@@ -13,6 +13,7 @@ describe('siteApiEndpointService', () => {
   let selectSiteApiEndpointTarget: SiteApiEndpointServiceModule['selectSiteApiEndpointTarget'];
   let recordSiteApiEndpointFailure: SiteApiEndpointServiceModule['recordSiteApiEndpointFailure'];
   let recordSiteApiEndpointSuccess: SiteApiEndpointServiceModule['recordSiteApiEndpointSuccess'];
+  let runWithSiteApiEndpointPool: SiteApiEndpointServiceModule['runWithSiteApiEndpointPool'];
   let dataDir = '';
 
   beforeAll(async () => {
@@ -28,6 +29,7 @@ describe('siteApiEndpointService', () => {
     selectSiteApiEndpointTarget = serviceModule.selectSiteApiEndpointTarget;
     recordSiteApiEndpointFailure = serviceModule.recordSiteApiEndpointFailure;
     recordSiteApiEndpointSuccess = serviceModule.recordSiteApiEndpointSuccess;
+    runWithSiteApiEndpointPool = serviceModule.runWithSiteApiEndpointPool;
   });
 
   beforeEach(async () => {
@@ -176,7 +178,7 @@ describe('siteApiEndpointService', () => {
     });
   });
 
-  it('returns null when the site has configured api endpoints but none are currently eligible', async () => {
+  it('returns the site URL fallback when configured api endpoints are all unavailable', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'exhausted-site',
       url: 'https://panel.example.com',
@@ -202,7 +204,90 @@ describe('siteApiEndpointService', () => {
 
     const selected = await selectSiteApiEndpointTarget(site, '2026-03-31T12:00:00.000Z');
 
-    expect(selected).toBeNull();
+    expect(selected).toMatchObject({
+      kind: 'site-fallback',
+      siteId: site.id,
+      endpointId: null,
+      baseUrl: 'https://panel.example.com',
+      configuredEndpointCount: 2,
+      endpoint: null,
+    });
+  });
+
+  it('rotates retryable endpoint failures to the site URL fallback', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'rotation-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values([
+      { siteId: site.id, url: 'https://api-a.example.com', enabled: true, sortOrder: 0 },
+      { siteId: site.id, url: 'https://api-b.example.com', enabled: true, sortOrder: 1 },
+    ]).run();
+    const attempted: string[] = [];
+
+    const result = await runWithSiteApiEndpointPool(site, async (target) => {
+      attempted.push(target.baseUrl);
+      if (target.kind === 'endpoint') {
+        throw new Error(target.baseUrl.includes('api-a')
+          ? 'HTTP 502: temporary failure'
+          : 'fetch failed');
+      }
+      return 'site-ok';
+    });
+
+    expect(result).toBe('site-ok');
+    expect(attempted).toEqual([
+      'https://api-a.example.com',
+      'https://api-b.example.com',
+      'https://panel.example.com',
+    ]);
+    const stored = await db.select().from(schema.siteApiEndpoints)
+      .orderBy(asc(schema.siteApiEndpoints.sortOrder))
+      .all();
+    expect(stored.every((endpoint) => !!endpoint.cooldownUntil)).toBe(true);
+  });
+
+  it('does not rotate or fall back after a non-retryable endpoint failure', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'auth-failure-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values([
+      { siteId: site.id, url: 'https://api-a.example.com', enabled: true, sortOrder: 0 },
+      { siteId: site.id, url: 'https://api-b.example.com', enabled: true, sortOrder: 1 },
+    ]).run();
+    const attempted: string[] = [];
+
+    await expect(runWithSiteApiEndpointPool(site, async (target) => {
+      attempted.push(target.baseUrl);
+      throw new Error('HTTP 401: Invalid token');
+    })).rejects.toThrow('HTTP 401');
+
+    expect(attempted).toEqual(['https://api-a.example.com']);
+  });
+
+  it('returns the site fallback error when the site also fails', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'all-failed-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api-a.example.com',
+      enabled: true,
+      sortOrder: 0,
+    }).run();
+
+    await expect(runWithSiteApiEndpointPool(site, async (target) => {
+      if (target.kind === 'endpoint') throw new Error('HTTP 502: pool failed');
+      throw new Error('site fallback fetch failed');
+    })).rejects.toThrow('site fallback fetch failed');
   });
 
   it('records retryable failures with a 5-minute cooldown', async () => {
