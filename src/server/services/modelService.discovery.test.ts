@@ -180,7 +180,7 @@ describe('refreshModelsForAccount credential discovery', () => {
     expect(getModelsMock).toHaveBeenCalledWith('https://api.example.com', 'session-token', undefined);
   });
 
-  it('deduplicates discovered model names before writing availability rows', async () => {
+  it('deduplicates exact discovered names while preserving case-distinct upstream models', async () => {
     getApiTokenMock.mockResolvedValue(null);
     getModelsMock.mockResolvedValue(['? ', '?', 'GPT-4.1', 'gpt-4.1']);
 
@@ -205,15 +205,15 @@ describe('refreshModelsForAccount credential discovery', () => {
       accountId: account.id,
       refreshed: true,
       status: 'success',
-      modelCount: 2,
-      modelsPreview: ['?', 'GPT-4.1'],
+      modelCount: 3,
+      modelsPreview: ['?', 'GPT-4.1', 'gpt-4.1'],
     });
 
     const rows = await db.select().from(schema.modelAvailability)
       .where(eq(schema.modelAvailability.accountId, account.id))
       .all();
 
-    expect(rows.map((row) => row.modelName).sort()).toEqual(['?', 'GPT-4.1']);
+    expect(rows.map((row) => row.modelName).sort()).toEqual(['?', 'GPT-4.1', 'gpt-4.1']);
   });
 
   it('reuses one in-flight full refresh when concurrent callers request a rebuild', async () => {

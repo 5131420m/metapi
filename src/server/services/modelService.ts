@@ -35,6 +35,11 @@ import {
   validateGeminiCliOauthConnection,
 } from './platformDiscoveryRegistry.js';
 import { probeRuntimeModel, type RuntimeModelProbeStatus } from './runtimeModelProbe.js';
+import {
+  normalizeDiscoveredModelNames,
+  normalizeFullSourceModelName,
+  normalizeModelRouteName,
+} from './modelName.js';
 
 const API_TOKEN_DISCOVERY_TIMEOUT_MS = 8_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
@@ -197,23 +202,7 @@ function isSiteDisabled(status?: string | null): boolean {
 }
 
 function normalizeModels(models: string[]): string[] {
-  const normalizedModels: string[] = [];
-  const seen = new Set<string>();
-
-  for (const rawModel of models) {
-    if (typeof rawModel !== 'string') continue;
-    const modelName = rawModel.trim();
-    if (!modelName) continue;
-
-    // Keep app/database behavior stable across SQLite/MySQL by deduping with a
-    // case-insensitive key after trimming whitespace.
-    const dedupeKey = modelName.toLowerCase();
-    if (seen.has(dedupeKey)) continue;
-    seen.add(dedupeKey);
-    normalizedModels.push(modelName);
-  }
-
-  return normalizedModels;
+  return normalizeDiscoveredModelNames(models);
 }
 
 async function updateOauthModelDiscoveryState(input: {
@@ -688,7 +677,7 @@ export async function refreshModelsForAccount(
         eq(schema.modelAvailability.isManual, true),
       ))
       .all()
-    ).map((r) => r.modelName.toLowerCase()),
+    ).map((r) => normalizeFullSourceModelName(r.modelName)),
   );
 
   if (isSiteDisabled(site.status)) {
@@ -718,7 +707,7 @@ export async function refreshModelsForAccount(
         throw new Error('未获取到可用模型');
       }
 
-      const newCodexModels = codexModels.filter((m) => !manualModelNames.has(m.toLowerCase()));
+      const newCodexModels = codexModels.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
       if (newCodexModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newCodexModels.map((modelName) => ({
@@ -804,7 +793,7 @@ export async function refreshModelsForAccount(
       if (claudeModels.length === 0) {
         throw new Error('未获取到可用模型');
       }
-      const newClaudeModels = claudeModels.filter((m) => !manualModelNames.has(m.toLowerCase()));
+      const newClaudeModels = claudeModels.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
       if (newClaudeModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newClaudeModels.map((modelName) => ({
@@ -904,7 +893,7 @@ export async function refreshModelsForAccount(
           `gemini cli oauth validation timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
         );
       }
-      const newGeminiModels = GEMINI_CLI_STATIC_MODELS.filter((m) => !manualModelNames.has(m.toLowerCase()));
+      const newGeminiModels = GEMINI_CLI_STATIC_MODELS.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
       if (newGeminiModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newGeminiModels.map((modelName) => ({
@@ -990,7 +979,7 @@ export async function refreshModelsForAccount(
         throw new Error('未获取到可用模型');
       }
 
-      const newAntigravityModels = antigravityModels.filter((m) => !manualModelNames.has(m.toLowerCase()));
+      const newAntigravityModels = antigravityModels.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
       if (newAntigravityModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newAntigravityModels.map((modelName) => ({
@@ -1139,7 +1128,7 @@ export async function refreshModelsForAccount(
     });
   }
 
-  const accountModels = new Map<string, string>();   // lowercase key → original name (first-wins)
+  const accountModels = new Map<string, string>();   // case-sensitive full source name → trimmed original name
   const modelLatency = new Map<string, number | null>();
   let scannedTokenCount = 0;
   let discoveredByCredential = false;
@@ -1151,8 +1140,10 @@ export async function refreshModelsForAccount(
   };
 
   const mergeDiscoveredModels = (models: string[], latencyMs: number | null) => {
-    for (const modelName of models) {
-      const key = modelName.toLowerCase();
+    for (const modelNameRaw of models) {
+      const modelName = normalizeFullSourceModelName(modelNameRaw);
+      if (!modelName) continue;
+      const key = modelName;
       if (!accountModels.has(key)) accountModels.set(key, modelName);
       const prev = modelLatency.get(key);
       if (prev === undefined || prev === null) {
@@ -1256,14 +1247,14 @@ export async function refreshModelsForAccount(
   }
 
   const checkedAt = new Date().toISOString();
-  const newAccountModels = Array.from(accountModels.values()).filter((m) => !manualModelNames.has(m.toLowerCase()));
+  const newAccountModels = Array.from(accountModels.values()).filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
   if (newAccountModels.length > 0) {
     await db.insert(schema.modelAvailability).values(
       newAccountModels.map((modelName) => ({
         accountId: account.id,
         modelName,
         available: true,
-        latencyMs: modelLatency.get(modelName.toLowerCase()) ?? null,
+        latencyMs: modelLatency.get(modelName) ?? null,
         checkedAt,
       })),
     ).run();
@@ -1347,9 +1338,10 @@ export async function rebuildTokenRoutesFromAvailability() {
     disabledModelsBySite.get(row.siteId)!.add(row.modelName.toLowerCase());
   }
 
-  function isModelDisabledForSite(siteId: number, modelName: string): boolean {
+  function isModelDisabledForSite(siteId: number, originalName: string, canonicalName: string): boolean {
     const disabled = disabledModelsBySite.get(siteId);
-    return !!disabled && disabled.has(modelName.toLowerCase());
+    if (!disabled) return false;
+    return disabled.has(originalName.toLowerCase()) || disabled.has(canonicalName);
   }
 
   // Load global brand filter
@@ -1357,7 +1349,7 @@ export async function rebuildTokenRoutesFromAvailability() {
 
   // Load global allowed models whitelist
   const globalAllowedModels = new Set(
-    config.globalAllowedModels.map((m) => m.toLowerCase().trim()).filter(Boolean),
+    config.globalAllowedModels.map(normalizeModelRouteName).filter(Boolean),
   );
 
   function isModelAllowedByWhitelist(modelName: string): boolean {
@@ -1395,16 +1387,19 @@ export async function rebuildTokenRoutesFromAvailability() {
     accountId: number;
     tokenId: number | null;
     oauthRouteUnitId: number | null;
-  }) => (
-    input.oauthRouteUnitId
+    originalName: string;
+  }) => {
+    const credentialKey = input.oauthRouteUnitId
       ? `route-unit:${input.oauthRouteUnitId}`
-      : `${input.accountId}:${input.tokenId ?? 'account'}`
-  );
-  const buildChannelKey = (channel: typeof schema.routeChannels.$inferSelect) => (
-    channel.oauthRouteUnitId
+      : `${input.accountId}:${input.tokenId ?? 'account'}`;
+    return `${credentialKey}:source:${normalizeFullSourceModelName(input.originalName)}`;
+  };
+  const buildChannelKey = (channel: typeof schema.routeChannels.$inferSelect) => {
+    const credentialKey = channel.oauthRouteUnitId
       ? `route-unit:${channel.oauthRouteUnitId}`
-      : `${channel.accountId}:${channel.tokenId ?? 'account'}`
-  );
+      : `${channel.accountId}:${channel.tokenId ?? 'account'}`;
+    return `${credentialKey}:source:${normalizeFullSourceModelName(channel.sourceModel)}`;
+  };
   const addModelCandidate = (
     modelNameRaw: string | null | undefined,
     accountId: number,
@@ -1412,12 +1407,18 @@ export async function rebuildTokenRoutesFromAvailability() {
     siteId: number,
     oauthRouteUnitId: number | null = null,
   ) => {
-    const originalName = (modelNameRaw || '').trim();
+    const originalName = normalizeFullSourceModelName(modelNameRaw);
     if (!originalName) return;
-    const modelName = originalName.toLowerCase();
+    const modelName = normalizeModelRouteName(originalName);
     if (!isModelAllowedByWhitelist(modelName)) return;
-    if (isModelDisabledForSite(siteId, modelName)) return;
-    if (blockedBrandRules.length > 0 && isModelBlockedByBrand(modelName, blockedBrandRules)) return;
+    if (isModelDisabledForSite(siteId, originalName, modelName)) return;
+    if (
+      blockedBrandRules.length > 0
+      && (
+        isModelBlockedByBrand(originalName.toLowerCase(), blockedBrandRules)
+        || isModelBlockedByBrand(modelName, blockedBrandRules)
+      )
+    ) return;
     if (!modelCandidates.has(modelName)) {
       modelCandidates.set(modelName, { candidates: new Map() });
     }
@@ -1453,11 +1454,31 @@ export async function rebuildTokenRoutesFromAvailability() {
   let removedChannels = 0;
   let removedRoutes = 0;
 
+  const protectedAliasRouteIds = new Set<number>();
+
   for (const [modelName, entry] of modelCandidates.entries()) {
     const candidateMap = entry.candidates;
-    let route = routes.find((r) => (r.routeMode || 'pattern') !== 'explicit_group' && r.modelPattern.toLowerCase() === modelName);
+    const matchingRoutes = routes
+      .filter((candidateRoute) => (
+        (candidateRoute.routeMode || 'pattern') !== 'explicit_group'
+        && isExactModelPattern(candidateRoute.modelPattern)
+        && normalizeModelRouteName(candidateRoute.modelPattern) === modelName
+      ));
+    const routeHasManualChannels = (candidateRoute: typeof schema.tokenRoutes.$inferSelect) => (
+      channels.some((channel) => channel.routeId === candidateRoute.id && channel.manualOverride)
+    );
+    const selectableRoutes = matchingRoutes.filter((candidateRoute) => (
+      candidateRoute.modelPattern.trim().toLowerCase() === modelName
+      || !routeHasManualChannels(candidateRoute)
+    ));
+    selectableRoutes.sort((left, right) => {
+      const leftIsCanonical = left.modelPattern.trim().toLowerCase() === modelName;
+      const rightIsCanonical = right.modelPattern.trim().toLowerCase() === modelName;
+      if (leftIsCanonical !== rightIsCanonical) return leftIsCanonical ? -1 : 1;
+      return left.id - right.id;
+    });
+    let route = selectableRoutes[0];
     if (route && route.modelPattern !== modelName) {
-      // Normalise existing route pattern to lowercase (e.g. "DeepSeek-V4-pro" → "deepseek-v4-pro").
       await db.update(schema.tokenRoutes).set({ modelPattern: modelName }).where(eq(schema.tokenRoutes.id, route.id)).run();
       route = { ...route, modelPattern: modelName };
     }
@@ -1477,6 +1498,24 @@ export async function rebuildTokenRoutesFromAvailability() {
 
     const routeChannels = channels.filter((channel) => channel.routeId === route.id);
     const desiredKeys = new Set(Array.from(candidateMap.keys()));
+
+    for (const aliasRoute of matchingRoutes.filter((candidateRoute) => candidateRoute.id !== route.id)) {
+      const aliasChannels = channels.filter((channel) => channel.routeId === aliasRoute.id);
+      if (aliasChannels.some((channel) => channel.manualOverride)) {
+        protectedAliasRouteIds.add(aliasRoute.id);
+        console.warn(
+          `[model-routes] preserving alias route ${aliasRoute.id} (${aliasRoute.modelPattern}) because it owns manual channels`,
+        );
+        continue;
+      }
+      if (aliasChannels.length > 0) {
+        removedChannels += aliasChannels.length;
+      }
+      const deleted = (await db.delete(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, aliasRoute.id)).run()).changes;
+      if (deleted > 0) {
+        removedRoutes += deleted;
+      }
+    }
 
     for (const [candidateKey, candidate] of candidateMap.entries()) {
       const existingChannel = routeChannels.find((channel) => buildChannelKey(channel) === candidateKey);
@@ -1542,7 +1581,12 @@ export async function rebuildTokenRoutesFromAvailability() {
       continue;
     }
     const modelPattern = (route.modelPattern || '').trim();
-    if (!modelPattern || !isExactModelPattern(modelPattern) || latestModelNames.has(modelPattern.toLowerCase())) {
+    if (
+      protectedAliasRouteIds.has(route.id)
+      || !modelPattern
+      || !isExactModelPattern(modelPattern)
+      || latestModelNames.has(normalizeModelRouteName(modelPattern))
+    ) {
       continue;
     }
 

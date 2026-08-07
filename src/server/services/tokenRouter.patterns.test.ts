@@ -116,6 +116,42 @@ describe('TokenRouter patterns and model mapping', () => {
     return route;
   }
 
+  it('selects a healthy source-model channel and forwards its case-sensitive full upstream name', async () => {
+    const site = await createSite('alias-health-site');
+    const account = await createAccount(site.id, 'alias-health-user');
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'glm-5.2',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      sourceModel: 'glm-5.2',
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      cooldownUntil: '2099-01-01T00:00:00.000Z',
+    }).run();
+    const healthy = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      sourceModel: 'GLM-5.2',
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+    invalidateTokenRouterCache();
+
+    const router = new TokenRouter();
+    const selected = await router.selectChannel('glm-5.2');
+    const decision = await router.explainSelection('glm-5.2');
+
+    expect(selected?.channel.id).toBe(healthy.id);
+    expect(selected?.actualModel).toBe('GLM-5.2');
+    expect(decision.candidates).toHaveLength(2);
+    expect(decision.candidates.find((candidate) => candidate.channelId === healthy.id)?.probability).toBe(100);
+  });
+
   it('matches routes with re: regex patterns', async () => {
     await createRouteWithSingleChannel('re:^claude-(opus|sonnet)-4-6$');
     const router = new TokenRouter();
