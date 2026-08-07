@@ -2119,6 +2119,36 @@
           "notNull": false,
           "defaultValue": null,
           "primaryKey": false
+        },
+        "api_endpoint_site_fallback_enabled": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": "true",
+          "primaryKey": false
+        },
+        "api_endpoint_site_fallback_cooldown_until": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "api_endpoint_site_fallback_last_selected_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "api_endpoint_site_fallback_last_failed_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "api_endpoint_site_fallback_last_failure_reason": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
         }
       }
     },

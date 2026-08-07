@@ -78,6 +78,51 @@ export const SITE_COLUMN_COMPATIBILITY_SPECS: SiteColumnCompatibilitySpec[] = [
       postgres: 'ALTER TABLE "sites" ADD COLUMN "forced_endpoint" TEXT',
     },
   },
+  {
+    column: 'api_endpoint_site_fallback_enabled',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN api_endpoint_site_fallback_enabled integer DEFAULT 1;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `api_endpoint_site_fallback_enabled` BOOLEAN DEFAULT TRUE',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "api_endpoint_site_fallback_enabled" BOOLEAN DEFAULT TRUE',
+    },
+    normalizeSql: {
+      sqlite: 'UPDATE sites SET api_endpoint_site_fallback_enabled = 1 WHERE api_endpoint_site_fallback_enabled IS NULL;',
+      mysql: 'UPDATE `sites` SET `api_endpoint_site_fallback_enabled` = TRUE WHERE `api_endpoint_site_fallback_enabled` IS NULL',
+      postgres: 'UPDATE "sites" SET "api_endpoint_site_fallback_enabled" = TRUE WHERE "api_endpoint_site_fallback_enabled" IS NULL',
+    },
+  },
+  {
+    column: 'api_endpoint_site_fallback_cooldown_until',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN api_endpoint_site_fallback_cooldown_until text;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `api_endpoint_site_fallback_cooldown_until` TEXT NULL',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "api_endpoint_site_fallback_cooldown_until" TEXT',
+    },
+  },
+  {
+    column: 'api_endpoint_site_fallback_last_selected_at',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN api_endpoint_site_fallback_last_selected_at text;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `api_endpoint_site_fallback_last_selected_at` TEXT NULL',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "api_endpoint_site_fallback_last_selected_at" TEXT',
+    },
+  },
+  {
+    column: 'api_endpoint_site_fallback_last_failed_at',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN api_endpoint_site_fallback_last_failed_at text;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `api_endpoint_site_fallback_last_failed_at` TEXT NULL',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "api_endpoint_site_fallback_last_failed_at" TEXT',
+    },
+  },
+  {
+    column: 'api_endpoint_site_fallback_last_failure_reason',
+    addSql: {
+      sqlite: 'ALTER TABLE sites ADD COLUMN api_endpoint_site_fallback_last_failure_reason text;',
+      mysql: 'ALTER TABLE `sites` ADD COLUMN `api_endpoint_site_fallback_last_failure_reason` TEXT NULL',
+      postgres: 'ALTER TABLE "sites" ADD COLUMN "api_endpoint_site_fallback_last_failure_reason" TEXT',
+    },
+  },
 ];
 
 export const SITE_TABLE_COMPATIBILITY_SPECS: SiteTableCompatibilitySpec[] = [

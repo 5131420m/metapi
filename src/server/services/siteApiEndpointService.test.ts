@@ -13,6 +13,7 @@ describe('siteApiEndpointService', () => {
   let selectSiteApiEndpointTarget: SiteApiEndpointServiceModule['selectSiteApiEndpointTarget'];
   let recordSiteApiEndpointFailure: SiteApiEndpointServiceModule['recordSiteApiEndpointFailure'];
   let recordSiteApiEndpointSuccess: SiteApiEndpointServiceModule['recordSiteApiEndpointSuccess'];
+  let recordSiteApiFallbackFailure: SiteApiEndpointServiceModule['recordSiteApiFallbackFailure'];
   let runWithSiteApiEndpointPool: SiteApiEndpointServiceModule['runWithSiteApiEndpointPool'];
   let dataDir = '';
 
@@ -29,6 +30,7 @@ describe('siteApiEndpointService', () => {
     selectSiteApiEndpointTarget = serviceModule.selectSiteApiEndpointTarget;
     recordSiteApiEndpointFailure = serviceModule.recordSiteApiEndpointFailure;
     recordSiteApiEndpointSuccess = serviceModule.recordSiteApiEndpointSuccess;
+    recordSiteApiFallbackFailure = serviceModule.recordSiteApiFallbackFailure;
     runWithSiteApiEndpointPool = serviceModule.runWithSiteApiEndpointPool;
   });
 
@@ -288,6 +290,86 @@ describe('siteApiEndpointService', () => {
       if (target.kind === 'endpoint') throw new Error('HTTP 502: pool failed');
       throw new Error('site fallback fetch failed');
     })).rejects.toThrow('site fallback fetch failed');
+  });
+
+  it('returns null when fallback is disabled and no configured endpoints are eligible', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'fallback-disabled-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+      apiEndpointSiteFallbackEnabled: false,
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api-cooling.example.com',
+      enabled: true,
+      cooldownUntil: '2099-01-01T00:00:00.000Z',
+    }).run();
+
+    expect(await selectSiteApiEndpointTarget(site)).toBeNull();
+  });
+
+  it('skips the site fallback while its independent AI API cooldown is active', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'fallback-cooling-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+      apiEndpointSiteFallbackEnabled: true,
+      apiEndpointSiteFallbackCooldownUntil: '2099-01-01T00:00:00.000Z',
+    }).returning().get();
+
+    expect(await selectSiteApiEndpointTarget(site)).toBeNull();
+  });
+
+  it('records retryable site fallback failures in the independent AI API cooldown fields', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'fallback-failure-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+      apiEndpointSiteFallbackEnabled: true,
+    }).returning().get();
+
+    const result = await recordSiteApiFallbackFailure(site.id, {
+      status: 502,
+      message: 'Bad gateway',
+    }, '2026-03-31T12:00:00.000Z');
+
+    expect(result).toMatchObject({
+      retryable: true,
+      cooldownUntil: '2026-03-31T12:05:00.000Z',
+      failureReason: 'HTTP 502: Bad gateway',
+    });
+    expect(await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get()).toMatchObject({
+      apiEndpointSiteFallbackCooldownUntil: '2026-03-31T12:05:00.000Z',
+      apiEndpointSiteFallbackLastFailedAt: '2026-03-31T12:00:00.000Z',
+      apiEndpointSiteFallbackLastFailureReason: 'HTTP 502: Bad gateway',
+    });
+  });
+
+  it('records fallback failure and success state through the pool runner', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'fallback-runner-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+      apiEndpointSiteFallbackEnabled: true,
+    }).returning().get();
+
+    await expect(runWithSiteApiEndpointPool(site, async () => {
+      throw new Error('HTTP 502: primary failed');
+    })).rejects.toThrow('HTTP 502');
+    const failed = await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get();
+    expect(failed?.apiEndpointSiteFallbackCooldownUntil).toBeTruthy();
+
+    await db.update(schema.sites).set({ apiEndpointSiteFallbackCooldownUntil: null }).where(eq(schema.sites.id, site.id)).run();
+    expect(await runWithSiteApiEndpointPool(site, async () => 'ok')).toBe('ok');
+    expect(await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get()).toMatchObject({
+      apiEndpointSiteFallbackCooldownUntil: null,
+      apiEndpointSiteFallbackLastFailureReason: null,
+    });
   });
 
   it('records retryable failures with a 5-minute cooldown', async () => {

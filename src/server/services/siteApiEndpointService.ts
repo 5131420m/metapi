@@ -46,6 +46,10 @@ export interface RecordedSiteApiEndpointFailure extends SiteApiEndpointFailureDi
   cooldownUntil: string | null;
 }
 
+export interface RecordedSiteApiFallbackFailure extends SiteApiEndpointFailureDisposition {
+  cooldownUntil: string | null;
+}
+
 export class SiteApiEndpointRequestError extends Error {
   readonly status: number | null;
   readonly rawErrText: string | null;
@@ -159,15 +163,36 @@ export async function selectSiteApiEndpointTarget(
     .orderBy(asc(schema.siteApiEndpoints.sortOrder), asc(schema.siteApiEndpoints.id))
     .all();
 
-  if (endpoints.length === 0) {
+  let storedSite: SiteRow | undefined;
+  if (schema.sites?.id) {
+    try {
+      storedSite = await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get();
+    } catch {
+      // Some embedded/test database adapters expose only the endpoint query shape.
+      // The caller snapshot preserves routing while full adapters keep cooldown state live.
+    }
+  }
+  const currentSite = storedSite || site;
+
+  const fallbackEnabled = currentSite.apiEndpointSiteFallbackEnabled !== false;
+  const fallbackCooling = !!currentSite.apiEndpointSiteFallbackCooldownUntil
+    && currentSite.apiEndpointSiteFallbackCooldownUntil > nowIso;
+  const buildFallbackTarget = (): SiteApiEndpointTarget | null => {
+    if (!fallbackEnabled || fallbackCooling) return null;
+    const baseUrl = normalizeSiteApiEndpointBaseUrl(currentSite.url);
+    if (!baseUrl) return null;
     return {
       kind: 'site-fallback',
-      siteId: site.id,
+      siteId: currentSite.id,
       endpointId: null,
-      baseUrl: normalizeSiteApiEndpointBaseUrl(site.url),
-      configuredEndpointCount: 0,
+      baseUrl,
+      configuredEndpointCount: endpoints.length,
       endpoint: null,
     };
+  };
+
+  if (endpoints.length === 0) {
+    return buildFallbackTarget();
   }
 
   const eligible = endpoints
@@ -182,14 +207,7 @@ export async function selectSiteApiEndpointTarget(
 
   const selected = eligible[0];
   if (!selected) {
-    return {
-      kind: 'site-fallback',
-      siteId: site.id,
-      endpointId: null,
-      baseUrl: normalizeSiteApiEndpointBaseUrl(site.url),
-      configuredEndpointCount: endpoints.length,
-      endpoint: null,
-    };
+    return buildFallbackTarget();
   }
 
   return {
@@ -256,6 +274,41 @@ export async function recordSiteApiEndpointSuccess(
   }).where(eq(schema.siteApiEndpoints.id, endpointId)).run();
 }
 
+export async function recordSiteApiFallbackFailure(
+  siteId: number,
+  input: SiteApiEndpointFailureInput,
+  now?: string | Date,
+): Promise<RecordedSiteApiFallbackFailure> {
+  const nowIso = toIsoTimestamp(now);
+  const disposition = classifySiteApiEndpointFailure(input);
+  const cooldownUntil = disposition.retryable
+    ? new Date(Date.parse(nowIso) + SITE_API_ENDPOINT_COOLDOWN_MS).toISOString()
+    : null;
+  if (schema.sites?.id) {
+    await db.update(schema.sites).set({
+      apiEndpointSiteFallbackCooldownUntil: cooldownUntil,
+      apiEndpointSiteFallbackLastFailedAt: nowIso,
+      apiEndpointSiteFallbackLastFailureReason: disposition.failureReason,
+      updatedAt: nowIso,
+    }).where(eq(schema.sites.id, siteId)).run();
+  }
+  return { ...disposition, cooldownUntil };
+}
+
+export async function recordSiteApiFallbackSuccess(
+  siteId: number,
+  now?: string | Date,
+): Promise<void> {
+  const nowIso = toIsoTimestamp(now);
+  if (!schema.sites?.id) return;
+  await db.update(schema.sites).set({
+    apiEndpointSiteFallbackCooldownUntil: null,
+    apiEndpointSiteFallbackLastSelectedAt: nowIso,
+    apiEndpointSiteFallbackLastFailureReason: null,
+    updatedAt: nowIso,
+  }).where(eq(schema.sites.id, siteId)).run();
+}
+
 export async function runWithSiteApiEndpointPool<T>(
   site: SiteRow,
   operation: (target: SiteApiEndpointTarget) => Promise<T>,
@@ -290,11 +343,22 @@ export async function runWithSiteApiEndpointPool<T>(
         } catch (error) {
           console.warn('[siteApiEndpointService] failed to record endpoint success', error);
         }
+      } else {
+        try {
+          await recordSiteApiFallbackSuccess(target.siteId);
+        } catch (error) {
+          console.warn('[siteApiEndpointService] failed to record site fallback success', error);
+        }
       }
       return result;
     } catch (error) {
       lastError = error;
       if (!target.endpointId) {
+        await recordSiteApiFallbackFailure(target.siteId, {
+          status: error instanceof SiteApiEndpointRequestError ? error.status : undefined,
+          message: error instanceof Error ? error.message : String(error ?? ''),
+          error,
+        });
         throw error;
       }
 

@@ -1,1 +1,1 @@
-ALTER TABLE "sites" ADD COLUMN "forced_endpoint" TEXT;
+-- no schema changes detected for postgres

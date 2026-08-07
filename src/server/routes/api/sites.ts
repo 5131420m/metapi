@@ -472,7 +472,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (!parsedBody.success) {
       return reply.code(400).send({ error: parsedBody.error });
     }
-    const createBody = parsedBody.data as typeof parsedBody.data & { apiEndpoints?: unknown };
+    const createBody = parsedBody.data as typeof parsedBody.data & {
+      apiEndpoints?: unknown;
+      apiEndpointSiteFallbackEnabled?: unknown;
+    };
     const {
       name,
       url,
@@ -487,6 +490,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       sortOrder,
       globalWeight,
       forcedEndpoint,
+      apiEndpointSiteFallbackEnabled,
       apiEndpoints,
     } = createBody;
     const normalizedStatus = normalizeSiteStatus(status);
@@ -526,6 +530,10 @@ export async function sitesRoutes(app: FastifyInstance) {
       : getSiteInitializationPreset(initializationPresetId);
     if (initializationPresetId != null && initializationPresetId !== '' && !explicitInitializationPreset) {
       return reply.code(400).send({ error: 'Invalid initializationPresetId.' });
+    }
+    const normalizedFallbackEnabled = normalizePinnedFlag(apiEndpointSiteFallbackEnabled);
+    if (apiEndpointSiteFallbackEnabled !== undefined && normalizedFallbackEnabled === null) {
+      return reply.code(400).send({ error: 'Invalid apiEndpointSiteFallbackEnabled value. Expected boolean.' });
     }
     const normalizedApiEndpoints = normalizeSiteApiEndpointsInput(apiEndpoints);
     if (!normalizedApiEndpoints.valid) {
@@ -580,6 +588,7 @@ export async function sitesRoutes(app: FastifyInstance) {
           sortOrder: normalizedSortOrder ?? (maxSortOrder + 1),
           globalWeight: normalizedGlobalWeight ?? 1,
           forcedEndpoint: normalizedForcedEndpoint ?? null,
+          apiEndpointSiteFallbackEnabled: normalizedFallbackEnabled ?? true,
         }).run();
         const siteId = getInsertedRowId(siteInsert);
         if (siteId && normalizedApiEndpoints.present && normalizedApiEndpoints.apiEndpoints.length > 0) {
@@ -666,6 +675,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (!normalizedCustomHeaders.valid) {
       return reply.code(400).send({ error: normalizedCustomHeaders.error || 'Invalid customHeaders.' });
     }
+    const normalizedFallbackEnabled = normalizePinnedFlag((body as Record<string, unknown>).apiEndpointSiteFallbackEnabled);
+    if ((body as Record<string, unknown>).apiEndpointSiteFallbackEnabled !== undefined && normalizedFallbackEnabled === null) {
+      return reply.code(400).send({ error: 'Invalid apiEndpointSiteFallbackEnabled value. Expected boolean.' });
+    }
     const normalizedApiEndpoints = normalizeSiteApiEndpointsInput(body.apiEndpoints);
     if (!normalizedApiEndpoints.valid) {
       return reply.code(400).send({ error: normalizedApiEndpoints.error || 'Invalid apiEndpoints.' });
@@ -704,6 +717,13 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (body.sortOrder !== undefined) updates.sortOrder = normalizedSortOrder;
     if (body.globalWeight !== undefined) updates.globalWeight = normalizedGlobalWeight;
     const anyBody = body as Record<string, unknown>;
+    if (anyBody.apiEndpointSiteFallbackEnabled !== undefined) {
+      updates.apiEndpointSiteFallbackEnabled = normalizedFallbackEnabled;
+      updates.apiEndpointSiteFallbackCooldownUntil = null;
+      updates.apiEndpointSiteFallbackLastSelectedAt = null;
+      updates.apiEndpointSiteFallbackLastFailedAt = null;
+      updates.apiEndpointSiteFallbackLastFailureReason = null;
+    }
     if (anyBody.postRefreshProbeEnabled !== undefined) updates.postRefreshProbeEnabled = anyBody.postRefreshProbeEnabled === true || anyBody.postRefreshProbeEnabled === 1;
     if (anyBody.postRefreshProbeModel !== undefined) updates.postRefreshProbeModel = String(anyBody.postRefreshProbeModel || '').trim();
     if (anyBody.postRefreshProbeScope !== undefined) updates.postRefreshProbeScope = anyBody.postRefreshProbeScope === 'all' ? 'all' : 'single';

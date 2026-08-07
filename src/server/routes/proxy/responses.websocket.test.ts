@@ -106,6 +106,7 @@ vi.mock('../../db/index.js', () => ({
     select: () => ({
       from: () => ({
         where: () => ({
+          get: async () => undefined,
           orderBy: () => ({
             all: async () => siteApiEndpointRows,
           }),
@@ -130,6 +131,9 @@ vi.mock('../../db/index.js', () => ({
       id: {},
       siteId: {},
       sortOrder: {},
+    },
+    sites: {
+      id: {},
     },
   },
 }));
