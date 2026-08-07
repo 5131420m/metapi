@@ -27,7 +27,7 @@ import { isCodexPlatform } from './oauth/codexAccount.js';
 import { buildStoredOauthStateFromAccount, getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { refreshOauthAccessTokenSingleflight } from './oauth/refreshSingleflight.js';
 import { listEnabledOauthRouteUnitsWithMembers } from './oauth/routeUnitService.js';
-import { requireSiteApiBaseUrl } from './siteApiEndpointService.js';
+import { runWithSiteApiEndpointPool } from './siteApiEndpointService.js';
 import {
   discoverAntigravityModelsFromCloud,
   discoverClaudeModelsFromCloud,
@@ -1104,30 +1104,6 @@ export async function refreshModelsForAccount(
     }
   }
 
-  let aiBaseUrl: string;
-  try {
-    aiBaseUrl = await requireSiteApiBaseUrl(site);
-  } catch (err) {
-    const rawMessage = (err as { message?: string })?.message || '模型获取失败';
-    const errorCode = classifyModelDiscoveryError(rawMessage);
-    const errorMessage = rawMessage;
-    await setAccountRuntimeHealth(account.id, {
-      state: 'unhealthy',
-      reason: errorMessage,
-      source: 'model-discovery',
-      checkedAt: new Date().toISOString(),
-    });
-    await restorePreviousAvailability();
-    return buildFailedRefreshResult({
-      accountId,
-      errorCode,
-      errorMessage,
-      tokenScanned: 0,
-      discoveredByCredential: false,
-      discoveredApiToken: !!discoveredApiToken,
-    });
-  }
-
   const accountModels = new Map<string, string>();   // case-sensitive full source name → trimmed original name
   const modelLatency = new Map<string, number | null>();
   let scannedTokenCount = 0;
@@ -1155,6 +1131,23 @@ export async function refreshModelsForAccount(
     }
   };
 
+  const discoverModelsFromPool = async (credential: string): Promise<string[]> => {
+    const timeoutMessage = `model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`;
+    const deadline = Date.now() + MODEL_DISCOVERY_TIMEOUT_MS;
+    return runWithSiteApiEndpointPool(site, (target) => {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        throw new Error(timeoutMessage);
+      }
+      return withTimeout(
+        () => withAccountProxyOverride(accountProxyUrl,
+          () => adapter.getModels(target.baseUrl, credential, platformUserId)),
+        remainingMs,
+        timeoutMessage,
+      );
+    });
+  };
+
   const discoverModelsWithCredential = async (credentialRaw: string | null | undefined) => {
     const credential = (credentialRaw || '').trim();
     if (!credential) return;
@@ -1165,14 +1158,7 @@ export async function refreshModelsForAccount(
     const startedAt = Date.now();
     let models: string[] = [];
     try {
-      models = normalizeModels(
-        await withTimeout(
-          () => withAccountProxyOverride(accountProxyUrl,
-            () => adapter.getModels(aiBaseUrl, credential, platformUserId)),
-          MODEL_DISCOVERY_TIMEOUT_MS,
-          `model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
-        ),
-      );
+      models = normalizeModels(await discoverModelsFromPool(credential));
     } catch (err) {
       recordFailure(err);
       models = [];
@@ -1193,14 +1179,7 @@ export async function refreshModelsForAccount(
     let models: string[] = [];
 
     try {
-      models = normalizeModels(
-        await withTimeout(
-          () => withAccountProxyOverride(accountProxyUrl,
-            () => adapter.getModels(aiBaseUrl, token.token, platformUserId)),
-          MODEL_DISCOVERY_TIMEOUT_MS,
-          `model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`,
-        ),
-      );
+      models = normalizeModels(await discoverModelsFromPool(token.token));
     } catch (err) {
       recordFailure(err);
       models = [];

@@ -180,6 +180,75 @@ describe('refreshModelsForAccount credential discovery', () => {
     expect(getModelsMock).toHaveBeenCalledWith('https://api.example.com', 'session-token', undefined);
   });
 
+  it('rotates direct model discovery through configured endpoints and the site URL fallback', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockImplementation(async (baseUrl: string) => {
+      if (baseUrl === 'https://api-a.example.com') throw new Error('HTTP 502: endpoint A failed');
+      if (baseUrl === 'https://api-b.example.com') throw new Error('fetch failed');
+      if (baseUrl === 'https://console.example.com') return ['gpt-4.1'];
+      return [];
+    });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'fallback-panel',
+      url: 'https://console.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values([
+      { siteId: site.id, url: 'https://api-a.example.com', enabled: true, sortOrder: 0 },
+      { siteId: site.id, url: 'https://api-b.example.com', enabled: true, sortOrder: 1 },
+    ]).run();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'fallback-user',
+      accessToken: 'session-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({ status: 'success', modelCount: 1, modelsPreview: ['gpt-4.1'] });
+    expect(getModelsMock.mock.calls.map((call) => call[0])).toEqual([
+      'https://api-a.example.com',
+      'https://api-b.example.com',
+      'https://console.example.com',
+    ]);
+  });
+
+  it('uses the site URL directly when all configured model discovery endpoints are cooling', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockImplementation(async (baseUrl: string) => (
+      baseUrl === 'https://console.example.com' ? ['gpt-4.1'] : []
+    ));
+    const site = await db.insert(schema.sites).values({
+      name: 'cooling-panel',
+      url: 'https://console.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api-cooling.example.com',
+      enabled: true,
+      sortOrder: 0,
+      cooldownUntil: '2099-01-01T00:00:00.000Z',
+    }).run();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'cooling-user',
+      accessToken: 'session-token',
+      status: 'active',
+    }).returning().get();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({ status: 'success', modelCount: 1 });
+    expect(getModelsMock.mock.calls.map((call) => call[0])).toEqual(['https://console.example.com']);
+  });
+
   it('deduplicates exact discovered names while preserving case-distinct upstream models', async () => {
     getApiTokenMock.mockResolvedValue(null);
     getModelsMock.mockResolvedValue(['? ', '?', 'GPT-4.1', 'gpt-4.1']);
