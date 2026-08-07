@@ -98,7 +98,7 @@ function buildSiteApiEndpointSummary(site?: Pick<SiteRow, 'apiEndpoints'> | null
   const endpoints = getConfiguredSiteApiEndpoints(site);
   if (endpoints.length <= 0) return '跟随主站点 URL';
   const enabledCount = endpoints.filter((item) => item.enabled !== false).length;
-  return `${enabledCount}/${endpoints.length} 条启用`;
+  return `${enabledCount}/${endpoints.length} 条启用 · 主站兜底`;
 }
 
 function formatUsd(value?: number | null): string {
@@ -1462,7 +1462,7 @@ export default function Sites() {
               </button>
             </div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
-              这里只用于 `/v1/*`、模型发现和 API Key 验证。不填时默认跟随主站点 URL；多条地址会按列表顺序参与轮询，禁用的地址不会参与调度。
+              这里只用于 `/v1/*`、模型发现和 API Key 验证。不填时默认跟随主站点 URL；多条地址会按列表顺序参与轮询，禁用的地址不会参与调度；地址池全部禁用、冷却或重试失败时，会自动回退主站点 URL。
             </div>
             {form.apiEndpoints.map((endpoint, index) => (
               <div
