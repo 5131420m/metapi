@@ -1052,7 +1052,13 @@ export function convertResponsesBodyToOpenAiBody(
     flushPendingToolCalls();
     const role = asTrimmedString(item.role).toLowerCase() || 'user';
     const normalizedRole = role === 'developer' ? 'system' : role;
-    const content = toOpenAiMessageContent(item.content ?? item.input ?? item);
+    const contentSource = item.content ?? item.input;
+    // A Responses message without content has no Chat representation. Falling
+    // back to the whole item here nests the Responses envelope inside Chat
+    // content (`content: [{ type: 'message', role: ... }]`), which is invalid.
+    // Unknown non-message item families retain the compatibility fallback.
+    if (itemType === 'message' && contentSource === undefined) return;
+    const content = toOpenAiMessageContent(contentSource ?? item);
 
     if (normalizedRole === 'tool') {
       const toolCallId = asTrimmedString(item.tool_call_id ?? item.call_id ?? item.id);

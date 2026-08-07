@@ -1191,6 +1191,68 @@ describe('convertOpenAiBodyToResponsesBody', () => {
 });
 
 describe('convertResponsesBodyToOpenAiBody', () => {
+  it('drops a content-less Responses message instead of nesting the item in Chat content', () => {
+    const result = convertResponsesBodyToOpenAiBody(
+      {
+        model: 'gpt-5',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'inspect the repo' }],
+          },
+          {
+            type: 'message',
+            role: 'assistant',
+          },
+          {
+            type: 'function_call',
+            call_id: 'call_1',
+            name: 'read_file',
+            arguments: '{"path":"README.md"}',
+          },
+          {
+            type: 'function_call_output',
+            call_id: 'call_1',
+            output: 'done',
+          },
+        ],
+      },
+      'gpt-5',
+      false,
+    );
+
+    expect(result.messages).toEqual([
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'inspect the repo' }],
+      },
+      {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_1',
+            type: 'function',
+            function: {
+              name: 'read_file',
+              arguments: '{"path":"README.md"}',
+            },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        tool_call_id: 'call_1',
+        content: 'done',
+      },
+    ]);
+
+    expect(JSON.stringify(result.messages)).not.toContain(
+      '"content":[{"type":"message","role":"assistant"}]',
+    );
+  });
+
   it('maps Responses input_file blocks back into OpenAI chat file blocks', () => {
     const result = convertResponsesBodyToOpenAiBody(
       {
