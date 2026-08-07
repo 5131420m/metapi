@@ -22,6 +22,11 @@ export type SiteForm = {
   customHeaders: SiteCustomHeaderField[];
   globalWeight: string;
   forcedEndpoint: string;
+  apiEndpointSiteFallbackEnabled: boolean;
+  apiEndpointSiteFallbackCooldownUntil: string | null;
+  apiEndpointSiteFallbackLastSelectedAt: string | null;
+  apiEndpointSiteFallbackLastFailedAt: string | null;
+  apiEndpointSiteFallbackLastFailureReason: string | null;
 };
 
 export type SiteEditorState =
@@ -44,6 +49,7 @@ export type SiteSavePayload = {
   customHeaders: string;
   globalWeight: number;
   forcedEndpoint?: string | null;
+  apiEndpointSiteFallbackEnabled?: boolean;
   postRefreshProbeEnabled?: boolean;
   postRefreshProbeModel?: string;
   postRefreshProbeScope?: 'single' | 'all';
@@ -83,6 +89,11 @@ export function emptySiteForm(): SiteForm {
     customHeaders: [emptySiteCustomHeader()],
     globalWeight: '1',
     forcedEndpoint: '',
+    apiEndpointSiteFallbackEnabled: true,
+    apiEndpointSiteFallbackCooldownUntil: null,
+    apiEndpointSiteFallbackLastSelectedAt: null,
+    apiEndpointSiteFallbackLastFailedAt: null,
+    apiEndpointSiteFallbackLastFailureReason: null,
   };
 }
 
@@ -147,6 +158,11 @@ export function siteFormFromSite(site: Partial<Omit<SiteForm, 'apiEndpoints' | '
   customHeaders?: string | null;
   globalWeight?: number | string | null;
   forcedEndpoint?: string | null;
+  apiEndpointSiteFallbackEnabled?: boolean | null;
+  apiEndpointSiteFallbackCooldownUntil?: string | null;
+  apiEndpointSiteFallbackLastSelectedAt?: string | null;
+  apiEndpointSiteFallbackLastFailedAt?: string | null;
+  apiEndpointSiteFallbackLastFailureReason?: string | null;
 }): SiteForm {
   const globalWeightRaw = Number(site.globalWeight);
   const globalWeight = Number.isFinite(globalWeightRaw) && globalWeightRaw > 0 ? String(globalWeightRaw) : '1';
@@ -161,6 +177,11 @@ export function siteFormFromSite(site: Partial<Omit<SiteForm, 'apiEndpoints' | '
     customHeaders: parseCustomHeadersForEditor(site.customHeaders),
     globalWeight,
     forcedEndpoint: typeof site.forcedEndpoint === 'string' ? site.forcedEndpoint : '',
+    apiEndpointSiteFallbackEnabled: site.apiEndpointSiteFallbackEnabled !== false,
+    apiEndpointSiteFallbackCooldownUntil: site.apiEndpointSiteFallbackCooldownUntil ?? null,
+    apiEndpointSiteFallbackLastSelectedAt: site.apiEndpointSiteFallbackLastSelectedAt ?? null,
+    apiEndpointSiteFallbackLastFailedAt: site.apiEndpointSiteFallbackLastFailedAt ?? null,
+    apiEndpointSiteFallbackLastFailureReason: site.apiEndpointSiteFallbackLastFailureReason ?? null,
   };
 }
 

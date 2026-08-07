@@ -70,6 +70,11 @@ type SiteRow = {
   subscriptionSummary?: SiteSubscriptionSummary | null;
   createdAt?: string;
   forcedEndpoint?: string | null;
+  apiEndpointSiteFallbackEnabled?: boolean;
+  apiEndpointSiteFallbackCooldownUntil?: string | null;
+  apiEndpointSiteFallbackLastSelectedAt?: string | null;
+  apiEndpointSiteFallbackLastFailedAt?: string | null;
+  apiEndpointSiteFallbackLastFailureReason?: string | null;
   postRefreshProbeEnabled?: boolean;
   postRefreshProbeModel?: string | null;
   postRefreshProbeScope?: string | null;
@@ -94,11 +99,14 @@ function getConfiguredSiteApiEndpoints(site?: Pick<SiteRow, 'apiEndpoints'> | nu
     : [];
 }
 
-function buildSiteApiEndpointSummary(site?: Pick<SiteRow, 'apiEndpoints'> | null): string {
+function buildSiteApiEndpointSummary(site?: Pick<SiteRow, 'apiEndpoints' | 'apiEndpointSiteFallbackEnabled'> | null): string {
   const endpoints = getConfiguredSiteApiEndpoints(site);
-  if (endpoints.length <= 0) return '跟随主站点 URL';
+  if (endpoints.length <= 0) {
+    return site?.apiEndpointSiteFallbackEnabled === false ? '未配置 API 地址 · 主站兜底已关' : '跟随主站点 URL';
+  }
   const enabledCount = endpoints.filter((item) => item.enabled !== false).length;
-  return `${enabledCount}/${endpoints.length} 条启用 · 主站兜底`;
+  const fallbackLabel = site?.apiEndpointSiteFallbackEnabled === false ? '仅地址池' : '主站兜底';
+  return `${enabledCount}/${endpoints.length} 条启用 · ${fallbackLabel}`;
 }
 
 function formatUsd(value?: number | null): string {
@@ -770,6 +778,7 @@ export default function Sites() {
       customHeaders: serializedCustomHeaders.customHeaders,
       globalWeight: Number(parsedGlobalWeight.toFixed(3)),
       forcedEndpoint: form.forcedEndpoint || null,
+      apiEndpointSiteFallbackEnabled: form.apiEndpointSiteFallbackEnabled,
       postRefreshProbeEnabled: probeEnabled,
       postRefreshProbeModel: probeModel.trim(),
       postRefreshProbeScope: probeScope,
@@ -1462,8 +1471,40 @@ export default function Sites() {
               </button>
             </div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
-              这里只用于 `/v1/*`、模型发现和 API Key 验证。不填时默认跟随主站点 URL；多条地址会按列表顺序参与轮询，禁用的地址不会参与调度；地址池全部禁用、冷却或重试失败时，会自动回退主站点 URL。
+              这里只用于 `/v1/*`、模型发现和 API Key 验证。多条地址会按列表顺序参与轮询，禁用的地址不会参与调度。
             </div>
+            <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, fontSize: 12, color: 'var(--color-text-secondary)' }}>
+              <input
+                type="checkbox"
+                checked={form.apiEndpointSiteFallbackEnabled}
+                onChange={(e) => setForm((prev) => ({
+                  ...prev,
+                  apiEndpointSiteFallbackEnabled: e.target.checked,
+                  apiEndpointSiteFallbackCooldownUntil: null,
+                  apiEndpointSiteFallbackLastSelectedAt: null,
+                  apiEndpointSiteFallbackLastFailedAt: null,
+                  apiEndpointSiteFallbackLastFailureReason: null,
+                }))}
+              />
+              <span>
+                <strong>地址池耗尽后回退主站点 URL</strong>
+                <span style={{ display: 'block', marginTop: 3, color: 'var(--color-text-muted)', lineHeight: 1.6 }}>
+                  仅当主站支持 AI API 时开启。关闭后永不将主站用于 AI API；开启后主站发生可重试失败会独立冷却 5 分钟，不影响登录、签到和面板接口。
+                </span>
+              </span>
+            </label>
+            {form.apiEndpointSiteFallbackEnabled && (
+              form.apiEndpointSiteFallbackCooldownUntil || form.apiEndpointSiteFallbackLastFailureReason
+            ) ? (
+              <div style={{ fontSize: 11, color: 'var(--color-text-muted)', display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+                {form.apiEndpointSiteFallbackCooldownUntil
+                  ? <span>主站 AI API 冷却至 {formatDateTimeLocal(form.apiEndpointSiteFallbackCooldownUntil)}</span>
+                  : null}
+                {form.apiEndpointSiteFallbackLastFailureReason
+                  ? <span>最近失败: {form.apiEndpointSiteFallbackLastFailureReason}</span>
+                  : null}
+              </div>
+            ) : null}
             {form.apiEndpoints.map((endpoint, index) => (
               <div
                 key={endpoint.draftId || `site-api-endpoint-draft-${index}`}

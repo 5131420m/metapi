@@ -132,10 +132,20 @@ describe('buildSiteSaveAction', () => {
     expect(emptySiteForm().customHeaders).toEqual([emptySiteCustomHeader()]);
     expect(emptySiteForm().apiEndpoints).toEqual([emptySiteApiEndpoint()]);
     expect(emptySiteForm().proxyUrl).toBe('');
+    expect(emptySiteForm().apiEndpointSiteFallbackEnabled).toBe(true);
     expect(siteFormFromSite(legacySite)).not.toHaveProperty('apiKey');
     expect(siteFormFromSite({
       proxyUrl: 'http://127.0.0.1:8080',
     }).proxyUrl).toBe('http://127.0.0.1:8080');
+    expect(siteFormFromSite({
+      apiEndpointSiteFallbackEnabled: false,
+      apiEndpointSiteFallbackCooldownUntil: '2026-04-01T00:05:00.000Z',
+      apiEndpointSiteFallbackLastFailureReason: 'HTTP 502',
+    })).toMatchObject({
+      apiEndpointSiteFallbackEnabled: false,
+      apiEndpointSiteFallbackCooldownUntil: '2026-04-01T00:05:00.000Z',
+      apiEndpointSiteFallbackLastFailureReason: 'HTTP 502',
+    });
     expect(siteFormFromSite(legacySite).apiEndpoints).toEqual([
       {
         url: 'https://api.example.com',

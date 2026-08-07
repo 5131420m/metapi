@@ -20,8 +20,10 @@ describe('Sites centered modal adoption', () => {
     expect(source).toContain('API 请求地址（如 https://api.nih.cc）');
     expect(source).toContain('label="API 请求地址"');
     expect(source).toContain('API 地址: {buildSiteApiEndpointSummary(site)}');
-    expect(source).toContain('地址池全部禁用、冷却或重试失败时，会自动回退主站点 URL');
-    expect(source).toContain('条启用 · 主站兜底');
+    expect(source).toContain('地址池耗尽后回退主站点 URL');
+    expect(source).toContain('关闭后永不将主站用于 AI API');
+    expect(source).toContain('独立冷却 5 分钟');
+    expect(source).toContain('条启用 · ${fallbackLabel}');
     expect(source).not.toContain('站点 URL（面板/登录/签到地址，如 https://console.example.com）');
     expect(source).not.toContain('API 请求地址（如 https://api.example.com）');
     expect(source).not.toContain('AI 请求地址池');
