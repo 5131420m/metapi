@@ -254,6 +254,14 @@ export function normalizeResponsesMessageItem(item: Record<string, unknown>): Re
     return normalizeResponsesToolLifecycleItem(item) ?? item;
   }
 
+  // Explicit non-message Responses items own their payload shape. Some
+  // Responses Lite clients attach a role to extension items such as
+  // `additional_tools`; treating every role-bearing item as a message drops
+  // their tool payload because they intentionally have no content/text.
+  if (type && type !== 'message') {
+    return withNormalizedResponsesInputStatus(item);
+  }
+
   const role = asTrimmedString(item.role).toLowerCase() || 'user';
   const normalizedContent = normalizeResponsesMessageContent(
     firstMeaningfulValue(item.content, item.text),

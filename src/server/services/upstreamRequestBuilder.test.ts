@@ -94,6 +94,75 @@ describe('upstreamRequestBuilder', () => {
     expect(request.body.store).toBe(false);
   });
 
+  it('preserves Responses Lite additional_tools in native Responses passthrough bodies', () => {
+    const additionalTools = {
+      type: 'additional_tools',
+      role: 'developer',
+      tools: [
+        {
+          type: 'custom',
+          name: 'exec',
+          description: 'Run JavaScript code',
+          format: {
+            type: 'grammar',
+            syntax: 'lark',
+            definition: 'start: SOURCE',
+          },
+        },
+        {
+          type: 'function',
+          name: 'wait',
+          parameters: {
+            type: 'object',
+            properties: {
+              cell_id: { type: 'string' },
+            },
+            required: ['cell_id'],
+          },
+        },
+        {
+          type: 'namespace',
+          name: 'collaboration',
+        },
+      ],
+    };
+
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.6-sol',
+      stream: true,
+      tokenValue: 'sk-test',
+      sitePlatform: 'sub2api',
+      siteUrl: 'https://example.com',
+      openaiBody: {},
+      downstreamFormat: 'responses',
+      responsesOriginalBody: {
+        model: 'gpt-5.6-sol',
+        input: [
+          additionalTools,
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Read README.md' }],
+          },
+        ],
+        tool_choice: 'auto',
+      },
+    });
+
+    expect(request.path).toBe('/v1/responses');
+    expect(request.body.input).toEqual([
+      additionalTools,
+      {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: 'Read README.md' }],
+      },
+    ]);
+    expect(request.body.tool_choice).toBe('auto');
+    expect(request.body.store).toBe(false);
+  });
+
   it('overrides downstream Accept so responses transport mode wins', () => {
     const request = buildUpstreamEndpointRequest({
       endpoint: 'responses',

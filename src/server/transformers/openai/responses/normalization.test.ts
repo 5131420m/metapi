@@ -11,6 +11,58 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 describe('responses input normalization', () => {
+  it('preserves typed Responses Lite additional_tools items with their nested tool payload', () => {
+    const additionalTools = {
+      type: 'additional_tools',
+      role: 'developer',
+      tools: [
+        {
+          type: 'custom',
+          name: 'exec',
+          description: 'Run JavaScript code',
+          format: {
+            type: 'grammar',
+            syntax: 'lark',
+            definition: 'start: SOURCE',
+          },
+        },
+        {
+          type: 'function',
+          name: 'wait',
+          description: 'Wait for an exec cell',
+          parameters: {
+            type: 'object',
+            properties: {
+              cell_id: { type: 'string' },
+            },
+            required: ['cell_id'],
+          },
+        },
+        {
+          type: 'namespace',
+          name: 'collaboration',
+          description: 'Collaboration tools',
+        },
+      ],
+    };
+
+    expect(normalizeResponsesInputForCompatibility([additionalTools])).toEqual([
+      additionalTools,
+    ]);
+  });
+
+  it('preserves future typed extension items instead of inferring messages from their role', () => {
+    const extension = {
+      type: 'future_provider_extension',
+      role: 'developer',
+      payload: {
+        enabled: true,
+      },
+    };
+
+    expect(normalizeResponsesInputForCompatibility([extension])).toEqual([extension]);
+  });
+
   it('drops a role-only assistant item that carries no representable content', () => {
     // Reproduces the tool-call continuation shape that a Responses client sends:
     // an empty assistant placeholder sits between the reasoning item and the
