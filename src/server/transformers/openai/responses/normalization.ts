@@ -48,6 +48,17 @@ function withNormalizedResponsesInputStatus(item: Record<string, unknown>): Reco
   return rest;
 }
 
+/**
+ * Sentinel returned by {@link normalizeResponsesMessageItem} for an input item
+ * that carries no representable Responses payload and must be dropped rather
+ * than emitted. Identity-compared, never forwarded upstream.
+ */
+const UNNORMALIZABLE_RESPONSES_INPUT_ITEM: Record<string, unknown> = Object.freeze({});
+
+function isUnnormalizableResponsesInputItem(value: unknown): boolean {
+  return value === UNNORMALIZABLE_RESPONSES_INPUT_ITEM;
+}
+
 function firstNonEmptyTrimmedString(...values: unknown[]): string {
   for (const value of values) {
     const normalized = asTrimmedString(value);
@@ -258,6 +269,17 @@ export function normalizeResponsesMessageItem(item: Record<string, unknown>): Re
   }
 
   if (asTrimmedString(item.role)) {
+    // A role-only item with no meaningful content (e.g. the empty assistant
+    // placeholder that precedes a tool call) must not be turned into a
+    // Responses `message` item: `normalizedContent` is `undefined` here, so
+    // JSON.stringify drops the key and emits `{"role":...,"type":"message"}`.
+    // Native Responses upstreams reject that content-less item, which
+    // surfaces as an upstream failure wrapped in "No available channels for
+    // this model". Marking it as unnormalizable lets the caller drop it while
+    // preserving the surrounding reasoning/function_call history.
+    if (normalizedContent === undefined) {
+      return UNNORMALIZABLE_RESPONSES_INPUT_ITEM;
+    }
     return withNormalizedResponsesInputStatus({
       ...item,
       type: 'message',
@@ -288,13 +310,17 @@ export function normalizeResponsesInputForCompatibility(input: unknown): unknown
         return normalized ? [toResponsesInputMessageFromText(normalized)] : [];
       }
       if (!isRecord(item)) return [item];
-      return [normalizeResponsesMessageItem(item)];
+      const normalizedItem = normalizeResponsesMessageItem(item);
+      if (isUnnormalizableResponsesInputItem(normalizedItem)) return [];
+      return [normalizedItem];
     });
     return sanitizeResponsesInputToolLifecycle(normalized);
   }
 
   if (isRecord(input)) {
-    return sanitizeResponsesInputToolLifecycle([normalizeResponsesMessageItem(input)]);
+    const normalizedItem = normalizeResponsesMessageItem(input);
+    if (isUnnormalizableResponsesInputItem(normalizedItem)) return [];
+    return sanitizeResponsesInputToolLifecycle([normalizedItem]);
   }
 
   return input;
