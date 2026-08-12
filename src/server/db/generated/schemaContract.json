@@ -1803,6 +1803,24 @@
           "notNull": false,
           "defaultValue": "datetime('now')",
           "primaryKey": false
+        },
+        "consecutive_failure_count": {
+          "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": "0",
+          "primaryKey": false
+        },
+        "failure_window_started_at": {
+          "logicalType": "datetime",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "last_failure_scope_id": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
         }
       }
     },

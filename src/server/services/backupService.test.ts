@@ -161,6 +161,9 @@ describe('backupService', () => {
       enabled: true,
       sortOrder: 0,
       cooldownUntil: null,
+      consecutiveFailureCount: 2,
+      failureWindowStartedAt: now,
+      lastFailureScopeId: 'backup-scope',
       lastSelectedAt: now,
       lastFailedAt: null,
       lastFailureReason: null,
@@ -223,6 +226,9 @@ describe('backupService', () => {
         enabled: true,
         sortOrder: 0,
         cooldownUntil: null,
+        consecutiveFailureCount: 2,
+        failureWindowStartedAt: now,
+        lastFailureScopeId: 'backup-scope',
       }),
     ]);
     expect(exported.accounts.manualModels).toEqual([
