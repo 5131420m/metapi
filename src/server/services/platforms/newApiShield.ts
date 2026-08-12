@@ -207,7 +207,7 @@ function collectSetCookieHeaders(headers: Headers): string[] {
 export async function fetchJsonWithShieldCookieRetry<T>(
   url: string,
   options?: UndiciRequestInit,
-): Promise<{ data: T | null; cookieHeader: string }> {
+): Promise<{ data: T | null; cookieHeader: string; ok: boolean; status: number }> {
   const { fetch } = await import('undici');
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -233,23 +233,23 @@ export async function fetchJsonWithShieldCookieRetry<T>(
 
     cookieHeader = mergeSetCookiePairs(cookieHeader, collectSetCookieHeaders(response.headers));
     const parsed = parseJsonSafe<T>(text);
-    if (parsed) return { data: parsed, cookieHeader };
+    if (parsed) return { data: parsed, cookieHeader, ok: response.ok, status: response.status };
 
     if (!isShieldChallenge(response.headers.get('content-type') || '', text)) {
-      return { data: null, cookieHeader };
+      return { data: null, cookieHeader, ok: response.ok, status: response.status };
     }
     if (!cookieHeader) {
-      return { data: null, cookieHeader };
+      return { data: null, cookieHeader, ok: response.ok, status: response.status };
     }
 
     const acwScV2 = solveNewApiAcwScV2(text);
     if (!acwScV2) {
-      return { data: null, cookieHeader };
+      return { data: null, cookieHeader, ok: response.ok, status: response.status };
     }
 
     cookieHeader = upsertCookie(cookieHeader, 'acw_sc__v2', acwScV2);
     headers.Cookie = cookieHeader;
   }
 
-  return { data: null, cookieHeader };
+  return { data: null, cookieHeader, ok: false, status: 0 };
 }

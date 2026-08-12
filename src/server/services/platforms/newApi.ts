@@ -4,6 +4,13 @@ import { createContext, runInContext } from 'node:vm';
 import { withSiteProxyRequestInit } from '../siteProxy.js';
 import { fetchJsonWithShieldCookieRetry } from './newApiShield.js';
 
+class NewApiModelDiscoveryError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause !== undefined ? { cause } : undefined);
+    this.name = 'NewApiModelDiscoveryError';
+  }
+}
+
 export class NewApiAdapter extends BasePlatformAdapter {
   readonly platformName: string = 'new-api';
 
@@ -743,6 +750,9 @@ export class NewApiAdapter extends BasePlatformAdapter {
         cookieHeader = this.mergeSetCookiePairs(cookieHeader, getSetCookie.call(res.headers) || []);
       }
       const parsed = this.parseJsonSafe<T>(text);
+      if (!res.ok && parsed) {
+        return { data: null, cookieHeader };
+      }
       if (parsed) return { data: parsed, cookieHeader };
 
       if (!this.isShieldChallenge(res.headers.get('content-type') || '', text)) {
@@ -773,12 +783,13 @@ export class NewApiAdapter extends BasePlatformAdapter {
     token: string,
     platformUserId?: number,
     onFailureMessage?: (message: string) => void,
+    signal?: AbortSignal,
   ): Promise<any | null> {
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
         Object.assign(headers, this.userIdHeaders(platformUserId));
-        const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, { headers });
+        const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, { headers, signal });
         if (res?.success && res?.data) return res;
         if (typeof res?.message === 'string' && res.message.trim()) {
           onFailureMessage?.(res.message.trim());
@@ -788,13 +799,14 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return null;
   }
 
-  private async probeUserIdByCookie(baseUrl: string, token: string): Promise<number | null> {
+  private async probeUserIdByCookie(baseUrl: string, token: string, signal?: AbortSignal): Promise<number | null> {
     const candidates = this.buildUserIdProbeCandidates(token);
     for (const cookie of this.buildCookieCandidates(token)) {
       for (const id of candidates) {
         try {
           const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, {
             headers: { Cookie: cookie, ...this.userIdHeaders(id) },
+            signal,
           });
           if (res?.success && res?.data) return id;
         } catch {}
@@ -807,8 +819,9 @@ export class NewApiAdapter extends BasePlatformAdapter {
     baseUrl: string,
     token: string,
     currentUserId?: number | null,
+    signal?: AbortSignal,
   ): Promise<number | null> {
-    const probed = await this.probeUserIdByCookie(baseUrl, token);
+    const probed = await this.probeUserIdByCookie(baseUrl, token, signal);
     if (!probed) return null;
     if (typeof currentUserId === 'number' && currentUserId > 0 && probed === currentUserId) {
       return null;
@@ -829,19 +842,29 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return [];
   }
 
-  private async getSessionModelsByCookie(baseUrl: string, token: string, userId?: number | null): Promise<string[]> {
+  private async getSessionModelsByCookie(baseUrl: string, token: string, userId?: number | null, signal?: AbortSignal): Promise<string[]> {
+    let firstFailure: unknown = null;
+    let hadSuccessfulResponse = false;
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
         Object.assign(headers, this.userIdHeaders(userId));
-        const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/models`, { headers });
+        const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/models`, { headers, signal });
+        if (res === null) {
+          firstFailure ??= new Error('model discovery request failed');
+        } else {
+          hadSuccessfulResponse = true;
+        }
         if (Array.isArray(res?.data) && res.data.length > 0) return res.data.filter(Boolean);
         if (res?.data && typeof res.data === 'object') {
           const keys = Object.keys(res.data).filter(Boolean);
           if (keys.length > 0) return keys;
         }
-      } catch {}
+      } catch (error) {
+        firstFailure ??= error;
+      }
     }
+    if (!hadSuccessfulResponse && firstFailure) throw firstFailure;
     return [];
   }
 
@@ -850,45 +873,73 @@ export class NewApiAdapter extends BasePlatformAdapter {
     return payload.data.map((m: any) => m?.id).filter(Boolean);
   }
 
-  private async getOpenAiModelsViaShieldCookie(baseUrl: string, token: string): Promise<string[]> {
+  private async getOpenAiModelsViaShieldCookie(baseUrl: string, token: string, signal?: AbortSignal): Promise<string[]> {
+    let firstFailure: unknown = null;
+    let hadSuccessfulResponse = false;
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
-        const { data } = await fetchJsonWithShieldCookieRetry<any>(`${baseUrl}/v1/models`, {
+        const result = await fetchJsonWithShieldCookieRetry<any>(`${baseUrl}/v1/models`, {
           headers: {
             Authorization: `Bearer ${token}`,
             Cookie: cookie,
           },
+          signal,
         });
-        const models = this.extractOpenAiModels(data);
+        if (!result.ok) {
+          firstFailure ??= new Error(`HTTP ${result.status || 502}: model discovery failed`);
+          continue;
+        }
+        hadSuccessfulResponse = true;
+        const models = this.extractOpenAiModels(result.data);
         if (models.length > 0) return models;
-      } catch {}
+      } catch (error) {
+        firstFailure ??= error;
+      }
     }
+    if (!hadSuccessfulResponse && firstFailure) throw firstFailure;
     return [];
   }
 
-  private async getOpenAiModels(baseUrl: string, token: string): Promise<string[]> {
+  private async getOpenAiModels(
+    baseUrl: string,
+    token: string,
+    signal?: AbortSignal,
+    throwOnAllFailures = false,
+  ): Promise<string[]> {
+    let firstFailure: unknown = null;
+    let hadSuccessfulResponse = false;
     const shouldTryShieldCookie = this.platformName === 'anyrouter' || token.includes('=');
     if (shouldTryShieldCookie) {
-      const shieldModels = await this.getOpenAiModelsViaShieldCookie(baseUrl, token);
-      if (shieldModels.length > 0) return shieldModels;
+      try {
+        const shieldModels = await this.getOpenAiModelsViaShieldCookie(baseUrl, token, signal);
+        hadSuccessfulResponse = true;
+        if (shieldModels.length > 0) return shieldModels;
+      } catch (error) {
+        firstFailure ??= error;
+      }
     }
 
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/v1/models`, {
         headers: { Authorization: `Bearer ${token}` },
+        signal,
       });
+      hadSuccessfulResponse = true;
       return this.extractOpenAiModels(res);
-    } catch {
-      return [];
+    } catch (error) {
+      firstFailure ??= error;
     }
+    if (throwOnAllFailures && !hadSuccessfulResponse && firstFailure) throw firstFailure;
+    return [];
   }
 
-  private async discoverUserId(baseUrl: string, accessToken: string): Promise<number | null> {
+  private async discoverUserId(baseUrl: string, accessToken: string, signal?: AbortSignal): Promise<number | null> {
     const jwtId = this.tryDecodeUserId(accessToken);
     if (jwtId) {
       try {
         const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, {
           headers: this.authHeaders(accessToken, jwtId),
+          signal,
         });
         if (res?.success && res?.data) return jwtId;
       } catch {}
@@ -897,16 +948,17 @@ export class NewApiAdapter extends BasePlatformAdapter {
     try {
       const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/self`, {
         headers: { Authorization: `Bearer ${accessToken}` },
+        signal,
       });
       if (res?.success && res?.data?.id) return res.data.id;
     } catch {}
 
     try {
-      const cookieRes = await this.fetchUserSelfByCookie(baseUrl, accessToken);
+      const cookieRes = await this.fetchUserSelfByCookie(baseUrl, accessToken, undefined, undefined, signal);
       if (cookieRes?.success && cookieRes?.data?.id) return cookieRes.data.id;
     } catch {}
 
-    const cookieId = await this.probeUserIdByCookie(baseUrl, accessToken);
+    const cookieId = await this.probeUserIdByCookie(baseUrl, accessToken, signal);
     if (cookieId) return cookieId;
 
     return null;
@@ -1223,15 +1275,25 @@ export class NewApiAdapter extends BasePlatformAdapter {
     throw new Error(failureMessage || 'failed to fetch balance');
   }
 
-  async getModels(baseUrl: string, token: string, platformUserId?: number): Promise<string[]> {
-    const openAiModels = await this.getOpenAiModels(baseUrl, token);
+  async getModels(baseUrl: string, token: string, platformUserId?: number, options?: { signal?: AbortSignal }): Promise<string[]> {
+    const signal = options?.signal;
+    let firstFailure: unknown = null;
+    let hadSuccessfulResponse = false;
+    let openAiModels: string[] = [];
+    try {
+      openAiModels = await this.getOpenAiModels(baseUrl, token, signal, true);
+      hadSuccessfulResponse = true;
+    } catch (error) {
+      firstFailure = error;
+    }
     if (openAiModels.length > 0) return openAiModels;
 
-    const userId = platformUserId || await this.discoverUserId(baseUrl, token);
+    const userId = platformUserId || await this.discoverUserId(baseUrl, token, signal);
     if (userId) {
       try {
         const res = await this.fetchJson<any>(`${baseUrl}/api/user/models`, {
           headers: this.authHeaders(token, userId),
+          signal,
         });
         if (Array.isArray(res?.data)) {
           return res.data.filter(Boolean);
@@ -1239,18 +1301,39 @@ export class NewApiAdapter extends BasePlatformAdapter {
         if (res?.data && typeof res.data === 'object') {
           return Object.keys(res.data).filter(Boolean);
         }
-      } catch {}
+        hadSuccessfulResponse = true;
+      } catch (error) {
+        firstFailure ??= error;
+      }
     }
 
-    const cookieModels = await this.getSessionModelsByCookie(baseUrl, token, userId || platformUserId);
+    let cookieModels: string[] = [];
+    try {
+      cookieModels = await this.getSessionModelsByCookie(baseUrl, token, userId || platformUserId, signal);
+      hadSuccessfulResponse = true;
+    } catch (error) {
+      firstFailure ??= error;
+    }
     if (cookieModels.length > 0) return cookieModels;
 
-    const alternateCookieUserId = await this.probeAlternateUserIdByCookie(baseUrl, token, userId || platformUserId);
+    const alternateCookieUserId = await this.probeAlternateUserIdByCookie(baseUrl, token, userId || platformUserId, signal);
     if (alternateCookieUserId) {
-      const fallbackModels = await this.getSessionModelsByCookie(baseUrl, token, alternateCookieUserId);
+      let fallbackModels: string[] = [];
+      try {
+        fallbackModels = await this.getSessionModelsByCookie(baseUrl, token, alternateCookieUserId, signal);
+        hadSuccessfulResponse = true;
+      } catch (error) {
+        firstFailure ??= error;
+      }
       if (fallbackModels.length > 0) return fallbackModels;
     }
 
+    if (!hadSuccessfulResponse && firstFailure) {
+      throw new NewApiModelDiscoveryError(
+        `failed to discover models: ${firstFailure instanceof Error ? firstFailure.message : String(firstFailure)}`,
+        firstFailure,
+      );
+    }
     return [];
   }
 

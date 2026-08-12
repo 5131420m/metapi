@@ -177,7 +177,12 @@ describe('refreshModelsForAccount credential discovery', () => {
       modelCount: 1,
       modelsPreview: ['gpt-4.1'],
     });
-    expect(getModelsMock).toHaveBeenCalledWith('https://api.example.com', 'session-token', undefined);
+    expect(getModelsMock).toHaveBeenCalledWith(
+      'https://api.example.com',
+      'session-token',
+      undefined,
+      { signal: expect.any(AbortSignal) },
+    );
   });
 
   it('rotates direct model discovery through configured endpoints and the site URL fallback', async () => {
@@ -943,7 +948,8 @@ describe('refreshModelsForAccount credential discovery', () => {
       .all();
     const firstEndpoint = endpoints.find((item) => item.url === 'https://chatgpt.com/backend-api/codex-a');
     const secondEndpoint = endpoints.find((item) => item.url === 'https://chatgpt.com/backend-api/codex-b');
-    expect(firstEndpoint?.cooldownUntil).toBeTruthy();
+    expect(firstEndpoint?.cooldownUntil).toBeNull();
+    expect(firstEndpoint?.consecutiveFailureCount).toBe(1);
     expect(firstEndpoint?.lastFailureReason).toContain('HTTP 502');
     expect(secondEndpoint?.lastSelectedAt).toBeTruthy();
   });
@@ -2083,7 +2089,8 @@ describe('refreshModelsForAccount credential discovery', () => {
     const endpoints = await db.select().from(schema.siteApiEndpoints).all();
     const firstEndpoint = endpoints.find((item) => item.url === 'https://api-antigravity-a.example.com');
     const secondEndpoint = endpoints.find((item) => item.url === 'https://api-antigravity-b.example.com');
-    expect(firstEndpoint?.cooldownUntil).toBeTruthy();
+    expect(firstEndpoint?.cooldownUntil).toBeNull();
+    expect(firstEndpoint?.consecutiveFailureCount).toBe(1);
     expect(firstEndpoint?.lastFailureReason).toContain('HTTP 503');
     expect(secondEndpoint?.lastSelectedAt).toBeTruthy();
   });

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { AddressInfo } from 'node:net';
 import { createHash } from 'node:crypto';
@@ -575,6 +575,54 @@ describe('NewApiAdapter', () => {
     expect(
       requests.some((r) => r.url === '/api/user/models' && r.headers['new-api-user'] === '11494'),
     ).toBe(true);
+  });
+
+  it('throws when every model discovery request fails instead of returning a successful empty list', async () => {
+    const failingServer = createServer((_req, res) => {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'temporarily unavailable' } }));
+    });
+    await new Promise<void>((resolve) => failingServer.listen(0, '127.0.0.1', resolve));
+    const address = failingServer.address() as AddressInfo;
+
+    try {
+      const adapter = new NewApiAdapter();
+      await expect(adapter.getModels(`http://127.0.0.1:${address.port}`, 'failed-model-token'))
+        .rejects.toThrow(/HTTP 503|failed to discover models/i);
+    } finally {
+      await new Promise<void>((resolve, reject) => failingServer.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it('aborts in-flight model discovery when its signal is cancelled', async () => {
+    let requestClosed = false;
+    let requestStartedResolve: (() => void) | null = null;
+    const requestStarted = new Promise<void>((resolve) => {
+      requestStartedResolve = resolve;
+    });
+    const hangingServer = createServer((req) => {
+      requestStartedResolve?.();
+      req.on('close', () => {
+        requestClosed = true;
+      });
+    });
+    await new Promise<void>((resolve) => hangingServer.listen(0, '127.0.0.1', resolve));
+    const address = hangingServer.address() as AddressInfo;
+    const controller = new AbortController();
+
+    try {
+      const adapter = new NewApiAdapter();
+      const discovery = adapter.getModels(`http://127.0.0.1:${address.port}`, 'hanging-model-token', 11494, {
+        signal: controller.signal,
+      });
+      await requestStarted;
+      controller.abort(new Error('test model discovery deadline'));
+      await expect(discovery).rejects.toThrow();
+      await vi.waitFor(() => expect(requestClosed).toBe(true));
+      expect(requestClosed).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => hangingServer.close((error) => (error ? reject(error) : resolve())));
+    }
   });
 
   it('reuses shield cookie retry when anyrouter /v1/models returns challenge html', async () => {

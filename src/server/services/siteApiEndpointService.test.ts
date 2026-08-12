@@ -248,7 +248,7 @@ describe('siteApiEndpointService', () => {
     const stored = await db.select().from(schema.siteApiEndpoints)
       .orderBy(asc(schema.siteApiEndpoints.sortOrder))
       .all();
-    expect(stored.every((endpoint) => !!endpoint.cooldownUntil)).toBe(true);
+    expect(stored.map((endpoint) => endpoint.cooldownUntil)).toEqual([null, null]);
   });
 
   it('does not rotate or fall back after a non-retryable endpoint failure', async () => {
@@ -310,7 +310,7 @@ describe('siteApiEndpointService', () => {
     expect(await selectSiteApiEndpointTarget(site)).toBeNull();
   });
 
-  it('skips the site fallback while its independent AI API cooldown is active', async () => {
+  it('keeps the enabled site fallback eligible despite stale cooldown metadata', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'fallback-cooling-site',
       url: 'https://panel.example.com',
@@ -320,10 +320,14 @@ describe('siteApiEndpointService', () => {
       apiEndpointSiteFallbackCooldownUntil: '2099-01-01T00:00:00.000Z',
     }).returning().get();
 
-    expect(await selectSiteApiEndpointTarget(site)).toBeNull();
+    expect(await selectSiteApiEndpointTarget(site)).toMatchObject({
+      kind: 'site-fallback',
+      siteId: site.id,
+      baseUrl: 'https://panel.example.com',
+    });
   });
 
-  it('records retryable site fallback failures in the independent AI API cooldown fields', async () => {
+  it('records site fallback failures without hard-cooling the primary site URL', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'fallback-failure-site',
       url: 'https://panel.example.com',
@@ -339,11 +343,11 @@ describe('siteApiEndpointService', () => {
 
     expect(result).toMatchObject({
       retryable: true,
-      cooldownUntil: '2026-03-31T12:05:00.000Z',
+      cooldownUntil: null,
       failureReason: 'HTTP 502: Bad gateway',
     });
     expect(await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get()).toMatchObject({
-      apiEndpointSiteFallbackCooldownUntil: '2026-03-31T12:05:00.000Z',
+      apiEndpointSiteFallbackCooldownUntil: null,
       apiEndpointSiteFallbackLastFailedAt: '2026-03-31T12:00:00.000Z',
       apiEndpointSiteFallbackLastFailureReason: 'HTTP 502: Bad gateway',
     });
@@ -362,9 +366,8 @@ describe('siteApiEndpointService', () => {
       throw new Error('HTTP 502: primary failed');
     })).rejects.toThrow('HTTP 502');
     const failed = await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get();
-    expect(failed?.apiEndpointSiteFallbackCooldownUntil).toBeTruthy();
+    expect(failed?.apiEndpointSiteFallbackCooldownUntil).toBeNull();
 
-    await db.update(schema.sites).set({ apiEndpointSiteFallbackCooldownUntil: null }).where(eq(schema.sites.id, site.id)).run();
     expect(await runWithSiteApiEndpointPool(site, async () => 'ok')).toBe('ok');
     expect(await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get()).toMatchObject({
       apiEndpointSiteFallbackCooldownUntil: null,
@@ -372,7 +375,7 @@ describe('siteApiEndpointService', () => {
     });
   });
 
-  it('records retryable failures with a 5-minute cooldown', async () => {
+  it('requires three distinct request failures before cooling an endpoint for gateway 5xx', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'retryable-site',
       url: 'https://panel.example.com',
@@ -387,25 +390,72 @@ describe('siteApiEndpointService', () => {
       sortOrder: 0,
     }).returning().get();
 
-    const result = await recordSiteApiEndpointFailure(endpoint.id, {
+    const first = await recordSiteApiEndpointFailure(endpoint.id, {
       status: 502,
       message: 'Bad gateway',
+      requestScopeId: 'req-1',
     }, '2026-03-31T12:00:00.000Z');
 
-    expect(result).toMatchObject({
+    expect(first).toMatchObject({
       retryable: true,
       rotateToNextEndpoint: true,
-      cooldownUntil: '2026-03-31T12:05:00.000Z',
+      cooldownUntil: null,
       failureReason: 'HTTP 502: Bad gateway',
     });
+
+    const duplicate = await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 502,
+      message: 'Bad gateway',
+      requestScopeId: 'req-1',
+    }, '2026-03-31T12:00:10.000Z');
+    expect(duplicate.cooldownUntil).toBeNull();
+
+    const second = await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 503,
+      message: 'Unavailable',
+      requestScopeId: 'req-2',
+    }, '2026-03-31T12:00:20.000Z');
+    expect(second.cooldownUntil).toBeNull();
+
+    const third = await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 504,
+      message: 'Gateway timeout',
+      requestScopeId: 'req-3',
+    }, '2026-03-31T12:00:40.000Z');
+    expect(third.cooldownUntil).toBe('2026-03-31T12:05:40.000Z');
 
     const stored = await db.select().from(schema.siteApiEndpoints)
       .where(eq(schema.siteApiEndpoints.id, endpoint.id))
       .get();
     expect(stored).toMatchObject({
-      cooldownUntil: '2026-03-31T12:05:00.000Z',
-      lastFailedAt: '2026-03-31T12:00:00.000Z',
-      lastFailureReason: 'HTTP 502: Bad gateway',
+      cooldownUntil: '2026-03-31T12:05:40.000Z',
+      lastFailedAt: '2026-03-31T12:00:40.000Z',
+      lastFailureReason: 'HTTP 504: Gateway timeout',
+      consecutiveFailureCount: 3,
+    });
+  });
+
+  it('counts concurrent gateway failures from distinct request scopes', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'concurrent-threshold-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    const endpoint = await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api-concurrent.example.com',
+      enabled: true,
+    }).returning().get();
+
+    await Promise.all([
+      recordSiteApiEndpointFailure(endpoint.id, { status: 503, message: 'busy', requestScopeId: 'scope-a' }, '2026-03-31T12:00:00.000Z'),
+      recordSiteApiEndpointFailure(endpoint.id, { status: 503, message: 'busy', requestScopeId: 'scope-b' }, '2026-03-31T12:00:00.000Z'),
+    ]);
+
+    expect(await db.select().from(schema.siteApiEndpoints).where(eq(schema.siteApiEndpoints.id, endpoint.id)).get()).toMatchObject({
+      consecutiveFailureCount: 2,
+      cooldownUntil: null,
     });
   });
 
@@ -431,9 +481,134 @@ describe('siteApiEndpointService', () => {
     expect(result).toMatchObject({
       retryable: true,
       rotateToNextEndpoint: true,
-      cooldownUntil: '2026-03-31T12:05:00.000Z',
+      cooldownUntil: null,
       failureReason: 'HTTP 502: upstream temporarily unavailable',
     });
+  });
+
+  it('rotates without cooling or counting status 500, status 429, and synthetic first-byte timeout', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'non-address-failure-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    const endpoint = await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api.example.com',
+      enabled: true,
+      sortOrder: 0,
+    }).returning().get();
+
+    const serverError = await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 500,
+      message: 'Internal error',
+      requestScopeId: 'req-500',
+    }, '2026-03-31T12:00:00.000Z');
+    expect(serverError).toMatchObject({ rotateToNextEndpoint: true, cooldownUntil: null });
+
+    const rateLimit = await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 429,
+      message: 'Rate limited',
+      requestScopeId: 'req-429',
+    }, '2026-03-31T12:00:10.000Z');
+    expect(rateLimit).toMatchObject({ rotateToNextEndpoint: false, cooldownUntil: null });
+
+    const firstByteTimeout = await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 408,
+      message: 'first byte timeout (45s)',
+      failureKind: 'first-byte-timeout',
+      requestScopeId: 'req-first-byte',
+    }, '2026-03-31T12:00:20.000Z');
+    expect(firstByteTimeout).toMatchObject({ rotateToNextEndpoint: true, cooldownUntil: null });
+
+    expect(await db.select().from(schema.siteApiEndpoints).where(eq(schema.siteApiEndpoints.id, endpoint.id)).get()).toMatchObject({
+      cooldownUntil: null,
+      consecutiveFailureCount: 0,
+    });
+  });
+
+  it('immediately cools a custom endpoint after a clear DNS failure', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'dns-failure-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    const endpoint = await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://missing.example.com',
+      enabled: true,
+      sortOrder: 0,
+    }).returning().get();
+
+    const result = await recordSiteApiEndpointFailure(endpoint.id, {
+      message: 'getaddrinfo ENOTFOUND missing.example.com',
+      requestScopeId: 'req-dns',
+    }, '2026-03-31T12:00:00.000Z');
+
+    expect(result.cooldownUntil).toBe('2026-03-31T12:05:00.000Z');
+  });
+
+  it('resets the gateway-failure streak after a successful endpoint request', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'streak-reset-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    const endpoint = await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api.example.com',
+      enabled: true,
+      sortOrder: 0,
+    }).returning().get();
+
+    await recordSiteApiEndpointFailure(endpoint.id, {
+      status: 502,
+      message: 'Bad gateway',
+      requestScopeId: 'req-1',
+    }, '2026-03-31T12:00:00.000Z');
+    await recordSiteApiEndpointSuccess(endpoint.id, '2026-03-31T12:00:10.000Z');
+
+    expect(await db.select().from(schema.siteApiEndpoints).where(eq(schema.siteApiEndpoints.id, endpoint.id)).get()).toMatchObject({
+      cooldownUntil: null,
+      consecutiveFailureCount: 0,
+      failureWindowStartedAt: null,
+      lastFailureScopeId: null,
+    });
+  });
+
+  it('stops at an exhausted request deadline without selecting or cooling another target', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'deadline-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    await db.insert(schema.siteApiEndpoints).values([
+      { siteId: site.id, url: 'https://api-a.example.com', enabled: true, sortOrder: 0 },
+      { siteId: site.id, url: 'https://api-b.example.com', enabled: true, sortOrder: 1 },
+    ]).run();
+    const attempted: string[] = [];
+
+    await expect(runWithSiteApiEndpointPool(site, async (target, context) => {
+      attempted.push(target.baseUrl);
+      await new Promise<void>((_, reject) => {
+        context.signal.addEventListener('abort', () => reject(new Error('aborted by deadline')), { once: true });
+      });
+      return 'unreachable';
+    }, {
+      deadlineAtMs: Date.now() + 20,
+      timeoutMessage: 'model discovery timeout (12s)',
+      requestScopeId: 'refresh-1',
+    })).rejects.toThrow('model discovery timeout');
+
+    expect(attempted).toEqual(['https://api-a.example.com']);
+    const endpoints = await db.select().from(schema.siteApiEndpoints)
+      .orderBy(asc(schema.siteApiEndpoints.sortOrder))
+      .all();
+    expect(endpoints.map((row) => row.cooldownUntil)).toEqual([null, null]);
   });
 
   it('records auth and validation failures without triggering cooldown rotation', async () => {

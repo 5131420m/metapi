@@ -1,22 +1,28 @@
-import { asc, eq } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
+import { and, asc, eq, isNull, ne, or, sql } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { RETRYABLE_TIMEOUT_PATTERNS } from './proxyRetryPolicy.js';
 
-const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
+const ROTATABLE_STATUS_CODES = new Set([408, 500, 502, 503, 504]);
+const GATEWAY_FAILURE_STATUS_CODES = new Set([502, 503, 504]);
 const NON_RETRYABLE_STATUS_CODES = new Set([400, 401, 403, 404, 422]);
-const NETWORK_FAILURE_PATTERNS = [
+const IMMEDIATE_COOLDOWN_PATTERNS = [
+  /\benotfound\b/i,
+  /\beai_again\b/i,
+  /\beconnrefused\b/i,
+  /\behostunreach\b/i,
+  /\benetunreach\b/i,
+  /socket hang up/i,
+  /\beconnreset\b/i,
+];
+const AMBIGUOUS_NETWORK_FAILURE_PATTERNS = [
   /network error/i,
   /fetch failed/i,
-  /socket hang up/i,
-  /econnreset/i,
-  /econnrefused/i,
-  /enotfound/i,
-  /ehostunreach/i,
-  /ecanceled/i,
-  ...RETRYABLE_TIMEOUT_PATTERNS,
 ];
 
 export const SITE_API_ENDPOINT_COOLDOWN_MS = 5 * 60 * 1000;
+export const SITE_API_ENDPOINT_FAILURE_WINDOW_MS = 60 * 1000;
+export const SITE_API_ENDPOINT_FAILURE_THRESHOLD = 3;
 
 type SiteRow = typeof schema.sites.$inferSelect;
 type SiteApiEndpointRow = typeof schema.siteApiEndpoints.$inferSelect;
@@ -30,15 +36,20 @@ export interface SiteApiEndpointTarget {
   endpoint: SiteApiEndpointRow | null;
 }
 
+export type SiteApiEndpointFailureKind = 'first-byte-timeout' | 'request-deadline-exhausted';
+
 export interface SiteApiEndpointFailureInput {
   status?: number | null;
   message?: string | null;
   error?: unknown;
+  failureKind?: SiteApiEndpointFailureKind | null;
+  requestScopeId?: string | null;
 }
 
 export interface SiteApiEndpointFailureDisposition {
   retryable: boolean;
   rotateToNextEndpoint: boolean;
+  cooldownMode: 'none' | 'immediate' | 'threshold';
   failureReason: string;
 }
 
@@ -54,11 +65,13 @@ export class SiteApiEndpointRequestError extends Error {
   readonly status: number | null;
   readonly rawErrText: string | null;
   readonly firstByteLatencyMs: number | null;
+  readonly failureKind: SiteApiEndpointFailureKind | null;
 
   constructor(message: string, options?: {
     status?: number | null;
     rawErrText?: string | null;
     firstByteLatencyMs?: number | null;
+    failureKind?: SiteApiEndpointFailureKind | null;
     cause?: unknown;
   }) {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
@@ -70,7 +83,18 @@ export class SiteApiEndpointRequestError extends Error {
     this.firstByteLatencyMs = typeof options?.firstByteLatencyMs === 'number' && Number.isFinite(options.firstByteLatencyMs)
       ? options.firstByteLatencyMs
       : null;
+    this.failureKind = options?.failureKind ?? null;
   }
+}
+
+export interface SiteApiEndpointOperationContext {
+  signal: AbortSignal;
+}
+
+export interface SiteApiEndpointPoolOptions {
+  deadlineAtMs?: number;
+  timeoutMessage?: string;
+  requestScopeId?: string;
 }
 
 export function normalizeSiteApiEndpointBaseUrl(raw: string): string {
@@ -106,15 +130,12 @@ function isEndpointCoolingDown(endpoint: SiteApiEndpointRow, nowIso: string): bo
 function extractFailureMessage(input: SiteApiEndpointFailureInput): string {
   const direct = typeof input.message === 'string' ? input.message.trim() : '';
   if (direct) return direct;
-  const errorMessage = input.error instanceof Error ? input.error.message.trim() : '';
-  return errorMessage;
+  return input.error instanceof Error ? input.error.message.trim() : '';
 }
 
 function formatFailureReason(status: number | null, message: string): string {
   if (status && message) {
-    if (message.match(new RegExp(`^HTTP\\s+${status}\\b`, 'i'))) {
-      return message;
-    }
+    if (message.match(new RegExp(`^HTTP\\s+${status}\\b`, 'i'))) return message;
     return `HTTP ${status}: ${message}`;
   }
   if (status) return `HTTP ${status}`;
@@ -137,25 +158,45 @@ export function classifySiteApiEndpointFailure(
     : parseStatusFromFailureMessage(message);
   const failureReason = formatFailureReason(status, message);
 
+  if (input.failureKind === 'request-deadline-exhausted') {
+    return { retryable: false, rotateToNextEndpoint: false, cooldownMode: 'none', failureReason };
+  }
+  if (input.failureKind === 'first-byte-timeout') {
+    return { retryable: true, rotateToNextEndpoint: true, cooldownMode: 'none', failureReason };
+  }
+
   if (status !== null) {
-    if (RETRYABLE_STATUS_CODES.has(status)) {
-      return { retryable: true, rotateToNextEndpoint: true, failureReason };
+    if (status === 429) {
+      return { retryable: false, rotateToNextEndpoint: false, cooldownMode: 'none', failureReason };
+    }
+    if (GATEWAY_FAILURE_STATUS_CODES.has(status)) {
+      return { retryable: true, rotateToNextEndpoint: true, cooldownMode: 'threshold', failureReason };
+    }
+    if (ROTATABLE_STATUS_CODES.has(status)) {
+      return { retryable: true, rotateToNextEndpoint: true, cooldownMode: 'none', failureReason };
     }
     if (NON_RETRYABLE_STATUS_CODES.has(status)) {
-      return { retryable: false, rotateToNextEndpoint: false, failureReason };
+      return { retryable: false, rotateToNextEndpoint: false, cooldownMode: 'none', failureReason };
     }
   }
 
-  if (NETWORK_FAILURE_PATTERNS.some((pattern) => pattern.test(message))) {
-    return { retryable: true, rotateToNextEndpoint: true, failureReason };
+  if (IMMEDIATE_COOLDOWN_PATTERNS.some((pattern) => pattern.test(message))) {
+    return { retryable: true, rotateToNextEndpoint: true, cooldownMode: 'immediate', failureReason };
+  }
+  if (AMBIGUOUS_NETWORK_FAILURE_PATTERNS.some((pattern) => pattern.test(message))) {
+    return { retryable: true, rotateToNextEndpoint: true, cooldownMode: 'threshold', failureReason };
+  }
+  if (RETRYABLE_TIMEOUT_PATTERNS.some((pattern) => pattern.test(message))) {
+    return { retryable: true, rotateToNextEndpoint: true, cooldownMode: 'immediate', failureReason };
   }
 
-  return { retryable: false, rotateToNextEndpoint: false, failureReason };
+  return { retryable: false, rotateToNextEndpoint: false, cooldownMode: 'none', failureReason };
 }
 
 export async function selectSiteApiEndpointTarget(
   site: SiteRow,
   now?: string | Date,
+  excludedEndpointIds: ReadonlySet<number> = new Set(),
 ): Promise<SiteApiEndpointTarget | null> {
   const nowIso = toIsoTimestamp(now);
   const endpoints = await db.select().from(schema.siteApiEndpoints)
@@ -169,16 +210,12 @@ export async function selectSiteApiEndpointTarget(
       storedSite = await db.select().from(schema.sites).where(eq(schema.sites.id, site.id)).get();
     } catch {
       // Some embedded/test database adapters expose only the endpoint query shape.
-      // The caller snapshot preserves routing while full adapters keep cooldown state live.
     }
   }
   const currentSite = storedSite || site;
-
   const fallbackEnabled = currentSite.apiEndpointSiteFallbackEnabled !== false;
-  const fallbackCooling = !!currentSite.apiEndpointSiteFallbackCooldownUntil
-    && currentSite.apiEndpointSiteFallbackCooldownUntil > nowIso;
   const buildFallbackTarget = (): SiteApiEndpointTarget | null => {
-    if (!fallbackEnabled || fallbackCooling) return null;
+    if (!fallbackEnabled) return null;
     const baseUrl = normalizeSiteApiEndpointBaseUrl(currentSite.url);
     if (!baseUrl) return null;
     return {
@@ -191,12 +228,14 @@ export async function selectSiteApiEndpointTarget(
     };
   };
 
-  if (endpoints.length === 0) {
-    return buildFallbackTarget();
-  }
+  if (endpoints.length === 0) return buildFallbackTarget();
 
   const eligible = endpoints
-    .filter((endpoint) => (endpoint.enabled ?? true) && !isEndpointCoolingDown(endpoint, nowIso))
+    .filter((endpoint) => (
+      (endpoint.enabled ?? true)
+      && !isEndpointCoolingDown(endpoint, nowIso)
+      && !excludedEndpointIds.has(endpoint.id)
+    ))
     .sort((left, right) => {
       const sortOrder = (left.sortOrder ?? 0) - (right.sortOrder ?? 0);
       if (sortOrder !== 0) return sortOrder;
@@ -206,9 +245,7 @@ export async function selectSiteApiEndpointTarget(
     });
 
   const selected = eligible[0];
-  if (!selected) {
-    return buildFallbackTarget();
-  }
+  if (!selected) return buildFallbackTarget();
 
   return {
     kind: 'endpoint',
@@ -243,22 +280,98 @@ export async function recordSiteApiEndpointFailure(
   now?: string | Date,
 ): Promise<RecordedSiteApiEndpointFailure> {
   const nowIso = toIsoTimestamp(now);
+  const nowMs = Date.parse(nowIso);
   const disposition = classifySiteApiEndpointFailure(input);
-  const cooldownUntil = disposition.retryable
-    ? new Date(Date.parse(nowIso) + SITE_API_ENDPOINT_COOLDOWN_MS).toISOString()
-    : null;
+  let current: SiteApiEndpointRow | undefined;
+  try {
+    current = await db.select().from(schema.siteApiEndpoints)
+      .where(eq(schema.siteApiEndpoints.id, endpointId))
+      .get();
+  } catch {
+    current = undefined;
+  }
+
+  let consecutiveFailureCount = 0;
+  let failureWindowStartedAt: string | null = null;
+  let lastFailureScopeId: string | null = null;
+  let cooldownUntil: string | null = null;
+
+  if (disposition.cooldownMode === 'immediate') {
+    cooldownUntil = new Date(nowMs + SITE_API_ENDPOINT_COOLDOWN_MS).toISOString();
+  } else if (disposition.cooldownMode === 'threshold') {
+    const scopeId = input.requestScopeId?.trim() || null;
+    if (scopeId && current) {
+      const windowStartIso = new Date(nowMs - SITE_API_ENDPOINT_FAILURE_WINDOW_MS).toISOString();
+      const updateResult = await db.update(schema.siteApiEndpoints).set({
+        consecutiveFailureCount: sql<number>`case
+          when ${schema.siteApiEndpoints.failureWindowStartedAt} is null
+            or ${schema.siteApiEndpoints.failureWindowStartedAt} < ${windowStartIso}
+          then 1
+          else coalesce(${schema.siteApiEndpoints.consecutiveFailureCount}, 0) + 1
+        end`,
+        failureWindowStartedAt: sql<string>`case
+          when ${schema.siteApiEndpoints.failureWindowStartedAt} is null
+            or ${schema.siteApiEndpoints.failureWindowStartedAt} < ${windowStartIso}
+          then ${nowIso}
+          else ${schema.siteApiEndpoints.failureWindowStartedAt}
+        end`,
+        lastFailureScopeId: scopeId,
+        lastFailedAt: nowIso,
+        lastFailureReason: disposition.failureReason,
+        updatedAt: nowIso,
+      }).where(and(
+        eq(schema.siteApiEndpoints.id, endpointId),
+        or(
+          isNull(schema.siteApiEndpoints.lastFailureScopeId),
+          ne(schema.siteApiEndpoints.lastFailureScopeId, scopeId),
+        ),
+      )).run();
+      const incremented = Number(updateResult.changes || 0) > 0;
+      const row = incremented
+        ? await db.select().from(schema.siteApiEndpoints).where(eq(schema.siteApiEndpoints.id, endpointId)).get()
+        : current;
+      const rowWindowMs = row.failureWindowStartedAt ? Date.parse(row.failureWindowStartedAt) : Number.NaN;
+      consecutiveFailureCount = row.consecutiveFailureCount ?? 0;
+      failureWindowStartedAt = row.failureWindowStartedAt ?? null;
+      lastFailureScopeId = row.lastFailureScopeId ?? null;
+      if (Number.isFinite(rowWindowMs)
+        && nowMs - rowWindowMs <= SITE_API_ENDPOINT_FAILURE_WINDOW_MS
+        && consecutiveFailureCount >= SITE_API_ENDPOINT_FAILURE_THRESHOLD) {
+        cooldownUntil = new Date(nowMs + SITE_API_ENDPOINT_COOLDOWN_MS).toISOString();
+        await db.update(schema.siteApiEndpoints).set({ cooldownUntil, updatedAt: nowIso })
+          .where(eq(schema.siteApiEndpoints.id, endpointId)).run();
+      }
+      return { ...disposition, cooldownUntil };
+    }
+    const existingWindowMs = current?.failureWindowStartedAt
+      ? Date.parse(current.failureWindowStartedAt)
+      : Number.NaN;
+    const inWindow = Number.isFinite(existingWindowMs)
+      && nowMs - existingWindowMs <= SITE_API_ENDPOINT_FAILURE_WINDOW_MS;
+    failureWindowStartedAt = inWindow ? current?.failureWindowStartedAt ?? nowIso : nowIso;
+    consecutiveFailureCount = inWindow ? current?.consecutiveFailureCount ?? 0 : 0;
+    if (!scopeId || scopeId !== current?.lastFailureScopeId) {
+      consecutiveFailureCount += 1;
+      lastFailureScopeId = scopeId;
+    } else {
+      lastFailureScopeId = current?.lastFailureScopeId ?? null;
+    }
+    if (consecutiveFailureCount >= SITE_API_ENDPOINT_FAILURE_THRESHOLD) {
+      cooldownUntil = new Date(nowMs + SITE_API_ENDPOINT_COOLDOWN_MS).toISOString();
+    }
+  }
 
   await db.update(schema.siteApiEndpoints).set({
     cooldownUntil,
+    consecutiveFailureCount,
+    failureWindowStartedAt,
+    lastFailureScopeId,
     lastFailedAt: nowIso,
     lastFailureReason: disposition.failureReason,
     updatedAt: nowIso,
   }).where(eq(schema.siteApiEndpoints.id, endpointId)).run();
 
-  return {
-    ...disposition,
-    cooldownUntil,
-  };
+  return { ...disposition, cooldownUntil };
 }
 
 export async function recordSiteApiEndpointSuccess(
@@ -268,6 +381,9 @@ export async function recordSiteApiEndpointSuccess(
   const nowIso = toIsoTimestamp(now);
   await db.update(schema.siteApiEndpoints).set({
     cooldownUntil: null,
+    consecutiveFailureCount: 0,
+    failureWindowStartedAt: null,
+    lastFailureScopeId: null,
     lastSelectedAt: nowIso,
     lastFailureReason: null,
     updatedAt: nowIso,
@@ -281,12 +397,10 @@ export async function recordSiteApiFallbackFailure(
 ): Promise<RecordedSiteApiFallbackFailure> {
   const nowIso = toIsoTimestamp(now);
   const disposition = classifySiteApiEndpointFailure(input);
-  const cooldownUntil = disposition.retryable
-    ? new Date(Date.parse(nowIso) + SITE_API_ENDPOINT_COOLDOWN_MS).toISOString()
-    : null;
+  const cooldownUntil = null;
   if (schema.sites?.id) {
     await db.update(schema.sites).set({
-      apiEndpointSiteFallbackCooldownUntil: cooldownUntil,
+      apiEndpointSiteFallbackCooldownUntil: null,
       apiEndpointSiteFallbackLastFailedAt: nowIso,
       apiEndpointSiteFallbackLastFailureReason: disposition.failureReason,
       updatedAt: nowIso,
@@ -309,34 +423,68 @@ export async function recordSiteApiFallbackSuccess(
   }).where(eq(schema.sites.id, siteId)).run();
 }
 
+function buildDeadlineError(options: SiteApiEndpointPoolOptions): SiteApiEndpointRequestError {
+  return new SiteApiEndpointRequestError(options.timeoutMessage || 'request deadline exhausted', {
+    failureKind: 'request-deadline-exhausted',
+  });
+}
+
 export async function runWithSiteApiEndpointPool<T>(
   site: SiteRow,
-  operation: (target: SiteApiEndpointTarget) => Promise<T>,
+  operation: (target: SiteApiEndpointTarget, context: SiteApiEndpointOperationContext) => Promise<T>,
+  options: SiteApiEndpointPoolOptions = {},
 ): Promise<T> {
   const attemptedEndpointIds = new Set<number>();
   let attemptedSiteFallback = false;
   let lastError: unknown;
+  const requestScopeId = options.requestScopeId || randomUUID();
 
   while (true) {
-    const target = await selectSiteApiEndpointTarget(site);
+    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) {
+      throw buildDeadlineError(options);
+    }
+    const target = await selectSiteApiEndpointTarget(site, undefined, attemptedEndpointIds);
     if (!target) {
-      if (lastError) throw lastError;
+      if (lastError) throw normalizePoolTerminalError(lastError);
       throw new Error('当前站点的 API 请求地址均不可用');
     }
     if (target.endpointId && attemptedEndpointIds.has(target.endpointId)) {
-      if (lastError) throw lastError;
+      if (lastError) throw normalizePoolTerminalError(lastError);
       throw new Error('当前站点的 API 请求地址均不可用');
     }
     if (target.kind === 'site-fallback') {
       if (attemptedSiteFallback) {
-        if (lastError) throw lastError;
+        if (lastError) throw normalizePoolTerminalError(lastError);
         throw new Error('主站点 API 请求地址不可用');
       }
       attemptedSiteFallback = true;
     }
 
     try {
-      const result = await operation(target);
+      const controller = new AbortController();
+      const remainingMs = options.deadlineAtMs !== undefined
+        ? Math.max(0, options.deadlineAtMs - Date.now())
+        : null;
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+      const deadlinePromise = remainingMs !== null
+        ? new Promise<never>((_, reject) => {
+          deadlineTimer = setTimeout(() => {
+            const deadlineError = buildDeadlineError(options);
+            controller.abort(deadlineError);
+            reject(deadlineError);
+          }, remainingMs);
+        })
+        : null;
+      let result: T;
+      try {
+        const operationPromise = operation(target, { signal: controller.signal });
+        result = deadlinePromise
+          ? await Promise.race([operationPromise, deadlinePromise])
+          : await operationPromise;
+      } finally {
+        if (deadlineTimer) clearTimeout(deadlineTimer);
+      }
+
       if (target.endpointId) {
         try {
           await recordSiteApiEndpointSuccess(target.endpointId);
@@ -353,25 +501,42 @@ export async function runWithSiteApiEndpointPool<T>(
       return result;
     } catch (error) {
       lastError = error;
-      if (!target.endpointId) {
-        await recordSiteApiFallbackFailure(target.siteId, {
-          status: error instanceof SiteApiEndpointRequestError ? error.status : undefined,
-          message: error instanceof Error ? error.message : String(error ?? ''),
-          error,
-        });
+      if (error instanceof SiteApiEndpointRequestError && error.failureKind === 'request-deadline-exhausted') {
         throw error;
       }
-
-      const recordedFailure = await recordSiteApiEndpointFailure(target.endpointId, {
+      const failureInput: SiteApiEndpointFailureInput = {
         status: error instanceof SiteApiEndpointRequestError ? error.status : undefined,
         message: error instanceof Error ? error.message : String(error ?? ''),
         error,
-      });
-      if (!recordedFailure.rotateToNextEndpoint) {
-        throw error;
+        failureKind: error instanceof SiteApiEndpointRequestError ? error.failureKind : null,
+        requestScopeId,
+      };
+      if (!target.endpointId) {
+        await recordSiteApiFallbackFailure(target.siteId, failureInput);
+        if (error instanceof SiteApiEndpointRequestError) {
+          throw error;
+        }
+        throw new SiteApiEndpointRequestError(failureInput.message || 'upstream request failed', {
+          status: failureInput.status,
+          rawErrText: failureInput.message,
+          failureKind: failureInput.failureKind,
+          cause: error,
+        });
       }
 
+      const recordedFailure = await recordSiteApiEndpointFailure(target.endpointId, failureInput);
+      if (!recordedFailure.rotateToNextEndpoint) throw error;
       attemptedEndpointIds.add(target.endpointId);
     }
   }
+}
+
+function normalizePoolTerminalError(error: unknown): SiteApiEndpointRequestError {
+  if (error instanceof SiteApiEndpointRequestError) return error;
+  const message = error instanceof Error ? error.message : String(error ?? 'upstream request failed');
+  return new SiteApiEndpointRequestError(message, {
+    status: parseStatusFromFailureMessage(message),
+    rawErrText: message,
+    cause: error,
+  });
 }
