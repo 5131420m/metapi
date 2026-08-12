@@ -116,4 +116,25 @@ describe('executeEndpointFlow first-byte timeout', () => {
     }
     expect(attemptedPaths).toEqual(['/v1/responses']);
   });
+
+  it('preserves a typed first-byte-timeout failure when no protocol candidate succeeds', async () => {
+    const { executeEndpointFlow } = await import('./endpointFlow.js');
+    const result = await executeEndpointFlow({
+      siteUrl: 'https://example.com',
+      endpointCandidates: ['responses'],
+      buildRequest: () => requestFor('/v1/responses'),
+      dispatchRequest: async (
+        _request: BuiltEndpointRequest,
+        _targetUrl?: string,
+        signal?: AbortSignal,
+      ) => buildDelayedResponse(JSON.stringify({ ok: false }), 60, 200, signal) as unknown as Awaited<ReturnType<typeof import('undici').fetch>>,
+      firstByteTimeoutMs: 10,
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      status: 408,
+      failureKind: 'first-byte-timeout',
+    });
+  });
 });

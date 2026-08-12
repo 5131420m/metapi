@@ -59,6 +59,7 @@ export type EndpointFlowResult =
     status: number;
     errText: string;
     rawErrText?: string;
+    failureKind?: 'first-byte-timeout';
   };
 
 export type ExecuteEndpointFlowInput = {
@@ -111,6 +112,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
   let finalStatus = 0;
   let finalErrText = 'unknown error';
   let finalRawErrText: string | undefined;
+  let finalFailureKind: 'first-byte-timeout' | undefined;
 
   for (let endpointIndex = 0; endpointIndex < endpointCount; endpointIndex += 1) {
     const endpoint = input.endpointCandidates[endpointIndex] as UpstreamEndpoint;
@@ -176,6 +178,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
       finalStatus = response.status || 408;
       finalErrText = errText;
       finalRawErrText = rawErrText;
+      finalFailureKind = 'first-byte-timeout';
       if (input.disableCrossProtocolFallback) {
         break;
       }
@@ -213,6 +216,9 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
 
     rawErrText = baseContext.rawErrText;
     response = baseContext.response;
+    const failureKind = isObservedFirstByteTimeoutResponse(response)
+      ? 'first-byte-timeout' as const
+      : undefined;
     const errText = withUpstreamPath(
       baseContext.request.path,
       summarizeUpstreamError(response.status, rawErrText),
@@ -226,6 +232,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
       finalStatus = response.status;
       finalErrText = errText;
       finalRawErrText = rawErrText;
+      finalFailureKind = failureKind;
       break;
     }
     const shouldAbortRemainingEndpoints = !isLastEndpoint && !!input.shouldAbortRemainingEndpoints?.({
@@ -236,6 +243,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
       finalStatus = response.status;
       finalErrText = errText;
       finalRawErrText = rawErrText;
+      finalFailureKind = failureKind;
       break;
     }
     const shouldDowngrade = !isLastEndpoint && !!input.shouldDowngrade?.(baseContext);
@@ -250,6 +258,7 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
     finalStatus = response.status;
     finalErrText = errText;
     finalRawErrText = rawErrText;
+    finalFailureKind = failureKind;
     break;
   }
 
@@ -258,5 +267,6 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
     status: finalStatus || 502,
     errText: finalErrText || 'unknown error',
     rawErrText: finalRawErrText,
+    failureKind: finalFailureKind,
   };
 }

@@ -1,4 +1,5 @@
 import { TextDecoder } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
 import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
@@ -235,6 +236,7 @@ export async function handleChatSurfaceRequest(
 
   const excludeChannelIds: number[] = [];
   let retryCount = 0;
+  const siteApiEndpointRequestScopeId = randomUUID();
   let responseCommitted = false;
   const isResponseCommitted = () => (
     responseCommitted
@@ -560,12 +562,13 @@ export async function handleChatSurfaceRequest(
           const upstreamFailure = new SiteApiEndpointRequestError(result.errText || 'unknown error', {
             status: result.status || 502,
             rawErrText: result.rawErrText || result.errText || 'unknown error',
+            failureKind: result.failureKind,
           }) as SiteApiEndpointRequestError & { siteApiEndpointUpstreamFailure?: boolean };
           upstreamFailure.siteApiEndpointUpstreamFailure = true;
           throw upstreamFailure;
         }
         return result;
-      });
+      }, { requestScopeId: siteApiEndpointRequestScopeId });
 
       const upstream = endpointResult.upstream;
       const successfulUpstreamPath = endpointResult.upstreamPath;
@@ -1042,6 +1045,9 @@ export async function handleChatSurfaceRequest(
           modelName,
           status: endpointFailureStatus || 502,
           errText: err.message || 'unknown error',
+          failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
+            ? err.failureKind
+            : null,
           rawErrText: err.rawErrText || err.message || 'unknown error',
           isStream,
           latencyMs: Date.now() - startTime,
@@ -1199,6 +1205,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
   };
   const excludeChannelIds: number[] = [];
   let retryCount = 0;
+  const siteApiEndpointRequestScopeId = randomUUID();
 
   while (retryCount <= maxRetries) {
     const stickyPreferredChannelId = retryCount === 0
@@ -1422,7 +1429,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
           payload,
           latency,
         };
-      });
+      }, { requestScopeId: siteApiEndpointRequestScopeId });
 
       const {
         upstream,

@@ -1,4 +1,5 @@
 import { TextDecoder } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { config } from '../../config.js';
 import { reportProxyAllFailed } from '../../services/alertService.js';
@@ -354,6 +355,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
     };
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
     let streamStarted = false;
     const isResponseCommitted = () => (
       streamStarted
@@ -860,12 +862,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
             const upstreamFailure = new SiteApiEndpointRequestError(result.errText || 'unknown error', {
               status: result.status || 502,
               rawErrText: result.rawErrText || result.errText || 'unknown error',
+              failureKind: result.failureKind,
             }) as SiteApiEndpointRequestError & { siteApiEndpointUpstreamFailure?: boolean };
             upstreamFailure.siteApiEndpointUpstreamFailure = true;
             throw upstreamFailure;
           }
           return result;
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         const upstream = endpointResult.upstream;
         const successfulUpstreamPath = endpointResult.upstreamPath;
@@ -1395,6 +1398,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
           modelName,
           status: endpointFailureStatus || 502,
           errText: err?.message || 'unknown error',
+          failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
+            ? err.failureKind
+            : null,
           rawErrText: err?.rawErrText || err?.message || 'unknown error',
           isStream,
           latencyMs: Date.now() - startTime,

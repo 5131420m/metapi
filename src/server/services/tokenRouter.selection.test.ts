@@ -815,6 +815,60 @@ describe('TokenRouter selection scoring', () => {
     expect((recoveredCandidateB?.probability || 0)).toBeLessThan(70);
   });
 
+  it('does not open the global site breaker after repeated first-byte timeouts for one model', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 1,
+      valueScoreFactor: 0,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+    };
+
+    const route = await createRoute('gpt-first-byte');
+    const siteA = await createSite('first-byte-a');
+    const accountA = await createAccount(siteA.id, 'first-byte-user-a');
+    const tokenA = await createToken(accountA.id, 'first-byte-token-a');
+    const channelA = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountA.id,
+      tokenId: tokenA.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+    const siteB = await createSite('first-byte-b');
+    const accountB = await createAccount(siteB.id, 'first-byte-user-b');
+    const tokenB = await createToken(accountB.id, 'first-byte-token-b');
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountB.id,
+      tokenId: tokenB.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).run();
+
+    const router = new TokenRouter();
+    for (let index = 0; index < 3; index += 1) {
+      await router.recordFailure(channelA.id, {
+        status: 408,
+        errorText: 'first byte timeout (45s)',
+        modelName: 'gpt-first-byte',
+        failureKind: 'first-byte-timeout',
+      });
+      await db.update(schema.routeChannels).set({
+        cooldownUntil: null,
+        consecutiveFailCount: 0,
+        cooldownLevel: 0,
+      }).where(eq(schema.routeChannels.id, channelA.id)).run();
+    }
+    invalidateTokenRouterCache();
+
+    const decision = await router.explainSelection('gpt-first-byte');
+    const siteACandidate = decision.candidates.find((candidate) => candidate.channelId === channelA.id);
+    expect(siteACandidate?.reason || '').not.toContain('站点熔断');
+  });
+
   it('clears persisted runtime breaker state when channel cooldown is manually cleared', async () => {
     config.routingWeights = {
       baseWeightFactor: 1,

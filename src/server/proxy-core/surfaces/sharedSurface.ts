@@ -2,6 +2,7 @@ import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import type { SiteProxyConfigLike } from '../../services/siteProxy.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
+
 import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageFallbackService.js';
 import type { DownstreamRoutingPolicy } from '../../services/downstreamPolicyTypes.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
@@ -538,6 +539,7 @@ export function createSurfaceFailureToolkit(input: {
       status: number;
       errText: string;
       rawErrText?: string | null;
+      failureKind?: 'first-byte-timeout' | null;
       isStream?: boolean | null;
       firstByteLatencyMs?: number | null;
       latencyMs: number;
@@ -548,6 +550,7 @@ export function createSurfaceFailureToolkit(input: {
         status: args.status,
         errorText: rawErrText,
         modelName: args.modelName,
+        failureKind: args.failureKind,
       });
       await log({
         selected: args.selected,

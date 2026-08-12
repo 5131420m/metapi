@@ -70,10 +70,11 @@ type FailureAwareChannel = {
   lastFailAt?: string | null;
 };
 
-type SiteRuntimeFailureContext = {
+export type SiteRuntimeFailureContext = {
   status?: number | null;
   errorText?: string | null;
   modelName?: string | null;
+  failureKind?: 'first-byte-timeout' | null;
 };
 
 type SiteRuntimeHealthState = {
@@ -518,6 +519,9 @@ function resolveSiteRuntimeFailurePenalty(context: SiteRuntimeFailureContext = {
 }
 
 function isTransientSiteRuntimeFailure(context: SiteRuntimeFailureContext = {}): boolean {
+  if (context.failureKind === 'first-byte-timeout') {
+    return false;
+  }
   const status = typeof context.status === 'number' ? context.status : 0;
   const errorText = (context.errorText || '').trim();
   if (isUsageLimitRateLimitFailure({ status, errorText })) {
@@ -914,7 +918,9 @@ async function ensureSiteRuntimeHealthStateLoaded(): Promise<void> {
 }
 
 function recordSiteRuntimeFailure(siteId: number, context: SiteRuntimeFailureContext = {}, nowMs = Date.now()): void {
-  applyRuntimeHealthFailure(getOrCreateSiteRuntimeHealthState(siteId, nowMs), context, nowMs);
+  if (context.failureKind !== 'first-byte-timeout') {
+    applyRuntimeHealthFailure(getOrCreateSiteRuntimeHealthState(siteId, nowMs), context, nowMs);
+  }
   const modelState = getOrCreateSiteModelRuntimeHealthState(siteId, context.modelName, nowMs);
   if (modelState) {
     applyRuntimeHealthFailure(modelState, context, nowMs);
