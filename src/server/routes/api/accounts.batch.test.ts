@@ -4,12 +4,17 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-const { refreshBalanceMock } = vi.hoisted(() => ({
+const { refreshBalanceMock, refreshModelsForAccountMock } = vi.hoisted(() => ({
   refreshBalanceMock: vi.fn(),
+  refreshModelsForAccountMock: vi.fn(),
 }));
 
 vi.mock('../../services/balanceService.js', () => ({
   refreshBalance: refreshBalanceMock,
+}));
+
+vi.mock('../../services/modelService.js', () => ({
+  refreshModelsForAccount: refreshModelsForAccountMock,
 }));
 
 type DbModule = typeof import('../../db/index.js');
@@ -36,6 +41,8 @@ describe('accounts batch routes', () => {
 
   beforeEach(async () => {
     refreshBalanceMock.mockReset();
+    refreshModelsForAccountMock.mockReset();
+    refreshModelsForAccountMock.mockResolvedValue({ status: 'success', modelCount: 2 });
     refreshBalanceMock.mockImplementation(async (id: number) => {
       if (id === 999) return null;
       return { id, balance: 12.5 };
@@ -95,7 +102,7 @@ describe('accounts batch routes', () => {
     expect(refreshBalanceMock).toHaveBeenCalledTimes(3);
   });
 
-  it('rejects invalid accounts batch action', async () => {
+  it('rejects batch payloads whose ids include non-number values', async () => {
     const response = await app.inject({
       method: 'POST',
       url: '/api/accounts/batch',
@@ -121,5 +128,16 @@ describe('accounts batch routes', () => {
 
     expect(response.statusCode).toBe(400);
     expect((response.json() as { message?: string }).message).toContain('ids');
+  });
+
+  it('refreshes models for selected accounts', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/batch',
+      payload: { ids: [1], action: 'refreshModels' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(refreshModelsForAccountMock).toHaveBeenCalledWith(1);
   });
 });

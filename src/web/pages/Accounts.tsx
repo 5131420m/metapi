@@ -858,6 +858,15 @@ export default function Accounts() {
     }
   };
 
+  const handleToggleAccountEnabled = async (account: any) => {
+    const key = `status-toggle-${account.id}`;
+    await withLoading(
+      key,
+      () => api.updateAccount(account.id, { status: account.status === "disabled" ? "active" : "disabled" }),
+      account.status === "disabled" ? "连接已启用" : "连接已禁用",
+    );
+  };
+
   const handleToggleCheckin = async (account: any) => {
     const key = `checkin-toggle-${account.id}`;
     const nextEnabled = !account.checkinEnabled;
@@ -1022,7 +1031,7 @@ export default function Accounts() {
   };
 
   const runBatchAccountAction = async (
-    action: "enable" | "disable" | "delete" | "refreshBalance",
+    action: "enable" | "disable" | "delete" | "refreshBalance" | "refreshModels",
     skipDeleteConfirm = false,
   ) => {
     if (selectedAccountIds.length === 0) return;
@@ -1033,10 +1042,9 @@ export default function Accounts() {
 
     setBatchActionLoading(true);
     try {
-      const result = await api.batchUpdateAccounts({
-        ids: selectedAccountIds,
-        action,
-      });
+      const result = action === "refreshModels"
+        ? await api.batchRefreshAccountModels(selectedAccountIds)
+        : await api.batchUpdateAccounts({ ids: selectedAccountIds, action });
       const successIds = Array.isArray(result?.successIds)
         ? result.successIds.map((id: unknown) => Number(id))
         : [];
@@ -1510,6 +1518,17 @@ export default function Accounts() {
           >
             批量刷新余额
           </button>
+          {activeSegment === "apikey" && (
+            <button
+              data-testid="accounts-batch-refresh-models"
+              onClick={() => runBatchAccountAction("refreshModels")}
+              disabled={batchActionLoading}
+              className="btn btn-ghost"
+              style={{ border: "1px solid var(--color-border)" }}
+            >
+              批量刷新模型
+            </button>
+          )}
           <button
             onClick={() => runBatchAccountAction("enable")}
             disabled={batchActionLoading}
@@ -3012,6 +3031,26 @@ export default function Accounts() {
                                   </button>
                                 </>
                               )}
+                              {connectionMode === "apikey" && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleToggleAccountEnabled(a)}
+                                  disabled={!!actionLoading[`status-toggle-${a.id}`]}
+                                  className="btn btn-link btn-link-primary"
+                                >
+                                  {actionLoading[`status-toggle-${a.id}`] ? <span className="spinner spinner-sm" /> : (a.status === "disabled" ? "启用" : "禁用")}
+                                </button>
+                              )}
+                              {connectionMode === "apikey" && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleCheckModels(a.id)}
+                                  disabled={!!actionLoading[`models-${a.id}`]}
+                                  className="btn btn-link btn-link-info"
+                                >
+                                  {actionLoading[`models-${a.id}`] ? <span className="spinner spinner-sm" /> : "刷新模型"}
+                                </button>
+                              )}
                               {capabilities.canRefreshBalance && (
                                 <button
                                   onClick={() =>
@@ -3335,6 +3374,26 @@ export default function Accounts() {
                                     ↓
                                   </button>
                                 </>
+                              )}
+                              {connectionMode === "apikey" && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleToggleAccountEnabled(a)}
+                                  disabled={!!actionLoading[`status-toggle-${a.id}`]}
+                                  className="btn btn-link btn-link-primary"
+                                >
+                                  {actionLoading[`status-toggle-${a.id}`] ? <span className="spinner spinner-sm" /> : (a.status === "disabled" ? "启用" : "禁用")}
+                                </button>
+                              )}
+                              {connectionMode === "apikey" && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleCheckModels(a.id)}
+                                  disabled={!!actionLoading[`models-${a.id}`]}
+                                  className="btn btn-link btn-link-info"
+                                >
+                                  {actionLoading[`models-${a.id}`] ? <span className="spinner spinner-sm" /> : "刷新模型"}
+                                </button>
                               )}
                               {capabilities.canRefreshBalance && (
                                 <button

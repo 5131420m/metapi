@@ -11,6 +11,7 @@ const { apiMock } = vi.hoisted(() => ({
     getAccountsSnapshot: vi.fn(),
     getSites: vi.fn(),
     batchUpdateAccounts: vi.fn(),
+    batchRefreshAccountModels: vi.fn(),
     refreshAccountHealth: vi.fn(),
   },
 }));
@@ -57,6 +58,11 @@ describe('Accounts batch actions', () => {
       failedItems: [],
     });
     apiMock.refreshAccountHealth.mockResolvedValue({ success: true });
+    apiMock.batchRefreshAccountModels.mockResolvedValue({
+      success: true,
+      successIds: [1, 2],
+      failedItems: [],
+    });
   });
 
   afterEach(() => {
@@ -85,9 +91,7 @@ describe('Accounts batch actions', () => {
       });
 
       const batchButton = root.root.find((node) => node.props['data-testid'] === 'accounts-batch-refresh-balance');
-      await act(async () => {
-        batchButton.props.onClick();
-      });
+      await act(async () => batchButton.props.onClick());
       await flushMicrotasks();
 
       expect(apiMock.batchUpdateAccounts).toHaveBeenCalledWith({
@@ -114,13 +118,44 @@ describe('Accounts batch actions', () => {
       await flushMicrotasks();
 
       const row = root.root.find((node) => node.props['data-testid'] === 'account-row-1');
-      await act(async () => {
-        row.props.onClick({ target: { closest: () => null } });
-      });
+      await act(async () => row.props.onClick({ target: { closest: () => null } }));
       await flushMicrotasks();
 
       const checkbox = root.root.find((node) => node.props['data-testid'] === 'account-select-1');
       expect(checkbox.props.checked).toBe(true);
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('refreshes models for selected API Key connections', async () => {
+    apiMock.getAccounts.mockResolvedValue([{
+      id: 1,
+      siteId: 1,
+      username: '',
+      accessToken: '',
+      apiToken: 'sk-apikey',
+      credentialMode: 'apikey',
+      status: 'active',
+      site: { id: 1, name: 'Site A', status: 'active', platform: 'new-api' },
+    }]);
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/accounts?segment=apikey']}>
+            <ToastProvider><Accounts /></ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+      const checkbox = root.root.find((node) => node.props['data-testid'] === 'account-select-1');
+      await act(async () => checkbox.props.onChange({ target: { checked: true } }));
+      const button = root.root.find((node) => node.props['data-testid'] === 'accounts-batch-refresh-models');
+      await act(async () => button.props.onClick());
+      await flushMicrotasks();
+      expect(apiMock.batchRefreshAccountModels).toHaveBeenCalledWith([1]);
     } finally {
       root?.unmount();
     }
@@ -155,18 +190,14 @@ describe('Accounts batch actions', () => {
       await act(async () => {
         root = create(
           <MemoryRouter initialEntries={['/accounts?segment=apikey']}>
-            <ToastProvider>
-              <Accounts />
-            </ToastProvider>
+            <ToastProvider><Accounts /></ToastProvider>
           </MemoryRouter>,
         );
       });
       await flushMicrotasks();
 
       const row = root.root.find((node) => node.props['data-testid'] === 'account-row-2');
-      await act(async () => {
-        row.props.onClick({ target: { closest: () => null } });
-      });
+      await act(async () => row.props.onClick({ target: { closest: () => null } }));
       await flushMicrotasks();
 
       const checkbox = root.root.find((node) => node.props['data-testid'] === 'account-select-2');

@@ -1091,6 +1091,11 @@ export const api = {
     ) as Promise<ProxyDebugTraceDetail>,
   checkModels: (accountId: number) =>
     request(`/api/models/check/${accountId}`, { method: "POST" }),
+  batchRefreshAccountModels: (ids: number[]) =>
+    request("/api/accounts/batch", {
+      method: "POST",
+      body: JSON.stringify({ ids, action: "refreshModels" }),
+    }),
   getSiteDistribution: () => request("/api/stats/site-distribution"),
   getSiteTrend: (days = 7) => request(`/api/stats/site-trend?days=${days}`),
   getSiteSnapshot: async (days = 7, options?: { refresh?: boolean }) => {

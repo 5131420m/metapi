@@ -38,6 +38,7 @@ import {
 } from "../../services/siteProxy.js";
 import { createRateLimitGuard } from "../../middleware/requestRateLimit.js";
 import { getAccountsSnapshot } from "../../services/accountsOverviewService.js";
+import { refreshModelsForAccount } from "../../services/modelService.js";
 import {
   type AccountCreatePayload,
   parseAccountBatchPayload,
@@ -1592,7 +1593,7 @@ export async function accountsRoutes(app: FastifyInstance) {
     if (ids.length === 0) {
       return reply.code(400).send({ message: "ids is required" });
     }
-    if (!["enable", "disable", "delete", "refreshBalance"].includes(action)) {
+    if (!['enable', 'disable', 'delete', 'refreshBalance', 'refreshModels'].includes(action)) {
       return reply.code(400).send({ message: "Invalid action" });
     }
 
@@ -1612,6 +1613,17 @@ export async function accountsRoutes(app: FastifyInstance) {
             continue;
           }
           successIds.push(id);
+          continue;
+        }
+
+        if (action === "refreshModels") {
+          const refresh = await refreshModelsForAccount(id);
+          if (refresh.status !== "success") {
+            failedItems.push({ id, message: refresh.errorMessage || "模型刷新失败" });
+            continue;
+          }
+          successIds.push(id);
+          shouldRebuildRoutes = true;
           continue;
         }
 
