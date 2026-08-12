@@ -666,6 +666,20 @@ describe('settings and auth events', () => {
     expect(runtime.disableCrossProtocolFallback).toBe(true);
   });
 
+  it('does not acknowledge runtime settings before persistence completes', async () => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: { disableCrossProtocolFallback: true },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const saved = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, 'disable_cross_protocol_fallback'))
+      .get();
+    expect(saved?.value).toBe(JSON.stringify(true));
+  });
+
   it('persists and returns system proxy url from runtime settings', async () => {
     const updateResponse = await app.inject({
       method: 'PUT',
