@@ -1,5 +1,6 @@
 ﻿import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
+import { randomUUID } from 'node:crypto';
 import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
@@ -51,6 +52,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
 
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
 
     while (retryCount <= getProxyMaxChannelRetries()) {
       const selected = await selectProxyChannelForAttempt({
@@ -92,7 +94,8 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
               startedAtMs: attemptStartedAtMs,
             },
           );
-          const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
+          const observedResponseMeta = getObservedResponseMeta(response);
+          const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           const status = response.status;
           let responseText = '';
           try {
@@ -102,6 +105,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
               throw new SiteApiEndpointRequestError('unknown error', {
                 status,
                 firstByteLatencyMs: observedFirstByteLatencyMs,
+                failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
                 cause: error,
               });
             }
@@ -112,6 +116,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
               status,
               rawErrText: responseText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
+              failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
             });
           }
           return {
@@ -119,7 +124,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
             text: responseText,
             firstByteLatencyMs: observedFirstByteLatencyMs,
           };
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         let data: any = {};
         try { data = JSON.parse(text); } catch { data = {}; }
@@ -166,6 +171,9 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
+            ? err.failureKind
+            : null,
         }));
         logProxy(
           selected,

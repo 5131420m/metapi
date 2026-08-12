@@ -125,7 +125,7 @@ describe('/v1/completions site api endpoint rotation', () => {
     delete process.env.DATA_DIR;
   });
 
-  it('cools down a retryable failed endpoint and retries the next endpoint within the same site', async () => {
+  it('records a retryable failed endpoint and retries the next endpoint without cooling it immediately', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'nihao-panel',
       url: 'https://console.example.com',
@@ -216,10 +216,60 @@ describe('/v1/completions site api endpoint rotation', () => {
       url: 'https://api-a.example.com',
       lastFailureReason: 'HTTP 502: bad gateway',
     });
-    expect(storedEndpoints[0]?.cooldownUntil).toBeTruthy();
+    expect(storedEndpoints[0]?.cooldownUntil).toBeNull();
+    expect(storedEndpoints[0]?.consecutiveFailureCount).toBe(1);
     expect(storedEndpoints[1]).toMatchObject({
       url: 'https://api-b.example.com',
     });
     expect(storedEndpoints[1]?.lastSelectedAt).toBeTruthy();
+  });
+
+  it('counts one address failure once when the same downstream request retries another channel', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'retry-scope-panel',
+      url: 'https://console.example.com',
+      platform: 'new-api',
+      status: 'active',
+      apiEndpointSiteFallbackEnabled: false,
+    }).returning().get();
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'retry-user',
+      accessToken: '',
+      apiToken: 'sk-retry',
+      status: 'active',
+      checkinEnabled: false,
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+    const endpoint = await db.insert(schema.siteApiEndpoints).values({
+      siteId: site.id,
+      url: 'https://api-retry.example.com',
+      enabled: true,
+      sortOrder: 0,
+    }).returning().get();
+    const selected = (channelId: number) => ({
+      channel: { id: channelId, routeId: 22 },
+      site,
+      account,
+      tokenName: 'default',
+      tokenValue: 'sk-retry',
+      actualModel: 'gpt-4o-mini',
+    });
+    selectChannelMock.mockResolvedValue(selected(11));
+    selectNextChannelMock.mockResolvedValueOnce(selected(12)).mockResolvedValueOnce(null);
+    fetchMock.mockResolvedValue(new Response('bad gateway', { status: 502 }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/completions',
+      headers: { authorization: 'Bearer «redacted:sk-…»' },
+      payload: { model: 'gpt-4o-mini', prompt: 'hello' },
+    });
+
+    expect(response.statusCode).toBe(503);
+    expect(await db.select().from(schema.siteApiEndpoints).where(eq(schema.siteApiEndpoints.id, endpoint.id)).get()).toMatchObject({
+      consecutiveFailureCount: 1,
+      cooldownUntil: null,
+    });
   });
 });

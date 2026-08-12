@@ -1,5 +1,6 @@
 ﻿import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
+import { randomUUID } from 'node:crypto';
 import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
@@ -53,6 +54,7 @@ export async function completionsProxyRoute(app: FastifyInstance) {
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
 
     while (retryCount <= getProxyMaxChannelRetries()) {
       const selected = await selectProxyChannelForAttempt({
@@ -98,20 +100,22 @@ export async function completionsProxyRoute(app: FastifyInstance) {
               startedAtMs: attemptStartedAtMs,
             },
           );
-          const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
+          const observedResponseMeta = getObservedResponseMeta(response);
+          const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           if (!response.ok) {
             const errText = await response.text().catch(() => 'unknown error');
             throw new SiteApiEndpointRequestError(errText || 'unknown error', {
               status: response.status,
               rawErrText: errText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
+              failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
             });
           }
           return {
             upstream: response,
             firstByteLatencyMs: observedFirstByteLatencyMs,
           };
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         if (isStream) {
           reply.raw.writeHead(200, {
@@ -324,6 +328,9 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
+            ? err.failureKind
+            : null,
         }));
         logProxy(
           selected,

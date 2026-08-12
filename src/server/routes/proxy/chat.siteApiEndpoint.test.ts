@@ -238,7 +238,8 @@ describe('chat proxy site api endpoint rotation', () => {
       url: 'https://api-a.example.com',
       lastFailureReason: 'HTTP 502: [upstream:/v1/messages] Upstream returned HTTP 502: bad gateway via messages',
     });
-    expect(storedEndpoints[0]?.cooldownUntil).toBeTruthy();
+    expect(storedEndpoints[0]?.cooldownUntil).toBeNull();
+    expect(storedEndpoints[0]?.consecutiveFailureCount).toBe(1);
     expect(storedEndpoints[1]?.lastSelectedAt).toBeTruthy();
   });
 });

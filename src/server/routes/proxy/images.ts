@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
+import { randomUUID } from 'node:crypto';
 import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
@@ -48,6 +49,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
 
     while (retryCount <= getProxyMaxChannelRetries()) {
       const selected = await selectProxyChannelForAttempt({
@@ -93,13 +95,15 @@ export async function imagesProxyRoute(app: FastifyInstance) {
               startedAtMs: attemptStartedAtMs,
             },
           );
-          const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
+          const observedResponseMeta = getObservedResponseMeta(response);
+          const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           const responseText = await response.text();
           if (!response.ok) {
             throw new SiteApiEndpointRequestError(responseText || 'unknown error', {
               status: response.status,
               rawErrText: responseText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
+              failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
             });
           }
           return {
@@ -107,7 +111,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             text: responseText,
             firstByteLatencyMs: observedFirstByteLatencyMs,
           };
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         const data = parseUpstreamImageResponse(text);
         if (!data.ok) {
@@ -186,6 +190,9 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
+            ? err.failureKind
+            : null,
         }));
         logProxy(
           selected,
@@ -253,6 +260,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
 
     while (retryCount <= getProxyMaxChannelRetries()) {
       const selected = await selectProxyChannelForAttempt({
@@ -313,13 +321,15 @@ export async function imagesProxyRoute(app: FastifyInstance) {
               startedAtMs: attemptStartedAtMs,
             },
           );
-          const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
+          const observedResponseMeta = getObservedResponseMeta(response);
+          const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           const responseText = await response.text();
           if (!response.ok) {
             throw new SiteApiEndpointRequestError(responseText || 'unknown error', {
               status: response.status,
               rawErrText: responseText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
+              failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
             });
           }
           return {
@@ -327,7 +337,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             text: responseText,
             firstByteLatencyMs: observedFirstByteLatencyMs,
           };
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         const data = parseUpstreamImageResponse(text);
         if (!data.ok) {
@@ -406,6 +416,9 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
+            ? err.failureKind
+            : null,
         }));
         logProxy(
           selected,

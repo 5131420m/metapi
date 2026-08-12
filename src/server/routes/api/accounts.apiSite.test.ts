@@ -143,7 +143,8 @@ describe('accounts api endpoint host selection', { timeout: 15_000 }, () => {
     const endpoints = await db.select().from(schema.siteApiEndpoints).all();
     const firstEndpoint = endpoints.find((item) => item.url === 'https://api-a.example.com');
     const secondEndpoint = endpoints.find((item) => item.url === 'https://api-b.example.com');
-    expect(firstEndpoint?.cooldownUntil).toBeTruthy();
+    expect(firstEndpoint?.cooldownUntil).toBeNull();
+    expect(firstEndpoint?.consecutiveFailureCount).toBe(1);
     expect(firstEndpoint?.lastFailureReason).toContain('HTTP 502');
     expect(secondEndpoint?.lastSelectedAt).toBeTruthy();
   });

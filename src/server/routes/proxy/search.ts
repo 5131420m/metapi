@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
+import { randomUUID } from 'node:crypto';
 import { config } from '../../config.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
@@ -76,6 +77,7 @@ export async function searchProxyRoute(app: FastifyInstance) {
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
 
     while (retryCount <= getProxyMaxChannelRetries()) {
       const selected = await selectProxyChannelForAttempt({
@@ -125,13 +127,15 @@ export async function searchProxyRoute(app: FastifyInstance) {
               startedAtMs: attemptStartedAtMs,
             },
           );
-          const observedFirstByteLatencyMs = getObservedResponseMeta(response)?.firstByteLatencyMs ?? null;
+          const observedResponseMeta = getObservedResponseMeta(response);
+          const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           const responseText = await response.text();
           if (!response.ok) {
             throw new SiteApiEndpointRequestError(responseText || 'unknown error', {
               status: response.status,
               rawErrText: responseText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
+              failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
             });
           }
           return {
@@ -139,7 +143,7 @@ export async function searchProxyRoute(app: FastifyInstance) {
             text: responseText,
             firstByteLatencyMs: observedFirstByteLatencyMs,
           };
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         let data: any = {};
         try { data = JSON.parse(text); } catch { data = { data: [] }; }
@@ -172,6 +176,9 @@ export async function searchProxyRoute(app: FastifyInstance) {
           status,
           errorText,
           modelName: upstreamModel,
+          failureKind: error instanceof SiteApiEndpointRequestError && error.failureKind === 'first-byte-timeout'
+            ? error.failureKind
+            : null,
         }));
         logProxy(
           selected,

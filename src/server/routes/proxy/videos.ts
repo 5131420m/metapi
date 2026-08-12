@@ -1,5 +1,6 @@
 import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
+import { randomUUID } from 'node:crypto';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
 import { isTokenExpiredError } from '../../services/alertRules.js';
@@ -60,6 +61,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
     });
     const excludeChannelIds: number[] = [];
     let retryCount = 0;
+    const siteApiEndpointRequestScopeId = randomUUID();
 
     while (retryCount <= getProxyMaxChannelRetries()) {
       const selected = await selectProxyChannelForAttempt({
@@ -123,7 +125,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
             upstream: response,
             text: responseText,
           };
-        });
+        }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         let data: any = {};
         try { data = JSON.parse(text); } catch { data = {}; }
@@ -263,6 +265,7 @@ async function requestMappedVideoTaskUpstream(
   mapping: NonNullable<Awaited<ReturnType<typeof getProxyVideoTaskByPublicId>>>,
   method: 'GET' | 'DELETE',
 ): Promise<{ upstream: Awaited<ReturnType<typeof fetch>> }> {
+  const siteApiEndpointRequestScopeId = randomUUID();
   const buildRequest = async (baseUrl: string) => {
     const targetUrl = buildUpstreamUrl(baseUrl, `/v1/videos/${encodeURIComponent(mapping.upstreamVideoId)}`);
     const upstream = await fetch(targetUrl, await withSiteProxyRequestInit(targetUrl, {
@@ -285,15 +288,26 @@ async function requestMappedVideoTaskUpstream(
 
   const site = await resolveProxyVideoTaskSite(mapping.accountId);
   if (site) {
-    return runWithSiteApiEndpointPool(site, (target) => buildRequest(target.baseUrl));
+    return runWithSiteApiEndpointPool(
+      site,
+      (target) => buildRequest(target.baseUrl),
+      { requestScopeId: siteApiEndpointRequestScopeId },
+    );
   }
 
   return buildRequest(mapping.siteUrl);
 }
 
 function isSiteApiEndpointFailure(error: unknown): error is SiteApiEndpointRequestError {
-  return error instanceof SiteApiEndpointRequestError
-    || (typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'SiteApiEndpointRequestError');
+  if (error instanceof SiteApiEndpointRequestError) return true;
+  let current = error;
+  const seen = new Set<unknown>();
+  while (typeof current === 'object' && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if ((current as { name?: unknown }).name === 'SiteApiEndpointRequestError') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 function sendVideoTaskEndpointFailure(

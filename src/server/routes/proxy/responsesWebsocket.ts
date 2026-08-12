@@ -586,6 +586,7 @@ async function handleResponsesWebsocketConnection(
     messageQueue = messageQueue
       .catch(() => undefined)
       .then(async () => {
+        const siteApiEndpointRequestScopeId = randomUUID();
         try {
           const parsed = parseJsonObject(raw);
           if (!parsed) {
@@ -742,6 +743,7 @@ async function handleResponsesWebsocketConnection(
                     });
                   }
                 },
+                { requestScopeId: siteApiEndpointRequestScopeId },
               );
               lastResponseOutput = collectResponsesOutput(runtimeResult.events);
               for (const payload of runtimeResult.events) {
