@@ -2371,6 +2371,124 @@ describe('responses websocket transport', () => {
     expect(message?.type).toBe('response.failed');
     expect(message?.response?.error?.message).toBe('tool crashed');
     expect(message?.response?.output?.[0]?.content?.[0]?.text).toBe('partial before failure');
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      status: 502,
+      errorText: 'tool crashed',
+      modelName: 'gpt-5.4',
+    }));
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(dbInsertMock).toHaveBeenCalled();
+    expect(reportProxyAllFailedMock).toHaveBeenCalledWith({
+      model: 'gpt-5.4',
+      reason: 'tool crashed',
+    });
+  });
+
+  it('reselects a channel after response.failed instead of pinning the failed channel', async () => {
+    const failedChannel = createSelectedChannel({ siteUrl: upstreamSiteUrl });
+    const fallbackChannel = createSelectedChannel({
+      sitePlatform: 'openai',
+      siteUrl: 'https://api.openai.com',
+      actualModel: 'gpt-5.4',
+    });
+    selectChannelMock
+      .mockReturnValueOnce(failedChannel)
+      .mockReturnValueOnce(fallbackChannel);
+    previewSelectedChannelMock.mockResolvedValue(failedChannel);
+    upstreamMessageHandler = (socket) => {
+      socket.send(JSON.stringify({
+        type: 'response.failed',
+        response: {
+          id: 'resp_ws_failed_reselect',
+          model: 'gpt-5.4',
+          status: 'failed',
+          output: [],
+          error: { message: 'channel failed', type: 'server_error' },
+        },
+      }));
+    };
+    fetchMock.mockResolvedValueOnce(createSseResponse([
+      'event: response.completed\n',
+      'data: {"type":"response.completed","response":{"id":"resp_reselected","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+
+    const socket = createClientSocket(baseUrl);
+    await waitForSocketOpen(socket);
+    const failedPromise = waitForSocketMessageMatching(socket, (message) => message?.type === 'response.failed');
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: [] }));
+    await failedPromise;
+
+    const completedPromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'response.completed' && message?.response?.id === 'resp_reselected',
+    );
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: [] }));
+    await completedPromise;
+    socket.close();
+
+    expect(selectChannelMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      errorText: 'channel failed',
+    }));
+  });
+
+  it('still forwards response.failed and reselects when failure accounting throws', async () => {
+    const failedChannel = createSelectedChannel({ siteUrl: upstreamSiteUrl });
+    const fallbackChannel = createSelectedChannel({
+      sitePlatform: 'openai',
+      siteUrl: 'https://api.openai.com',
+      actualModel: 'gpt-5.4',
+    });
+    selectChannelMock
+      .mockReturnValueOnce(failedChannel)
+      .mockReturnValueOnce(fallbackChannel);
+    previewSelectedChannelMock.mockResolvedValue(failedChannel);
+    recordFailureMock.mockRejectedValueOnce(new Error('failure accounting unavailable'));
+    upstreamMessageHandler = (socket) => {
+      socket.send(JSON.stringify({
+        type: 'response.failed',
+        response: {
+          id: 'resp_ws_failed_accounting',
+          model: 'gpt-5.4',
+          status: 'failed',
+          output: [],
+          error: { message: 'channel failed despite accounting', type: 'server_error' },
+        },
+      }));
+    };
+    fetchMock.mockResolvedValueOnce(createSseResponse([
+      'event: response.completed\n',
+      'data: {"type":"response.completed","response":{"id":"resp_after_accounting_failure","model":"gpt-5.4","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+
+    const socket = createClientSocket(baseUrl);
+    await waitForSocketOpen(socket);
+    const failedPromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'response.failed' && message?.response?.id === 'resp_ws_failed_accounting',
+    );
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: [] }));
+    await failedPromise;
+
+    const completedPromise = waitForSocketMessageMatching(
+      socket,
+      (message) => message?.type === 'response.completed' && message?.response?.id === 'resp_after_accounting_failure',
+    );
+    socket.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: [] }));
+    await completedPromise;
+    socket.close();
+
+    expect(selectChannelMock.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(recordSuccessMock).toHaveBeenCalledTimes(1);
+    expect(dbInsertMock).toHaveBeenCalled();
+    expect(reportProxyAllFailedMock).toHaveBeenCalledWith({
+      model: 'gpt-5.4',
+      reason: 'channel failed despite accounting',
+    });
   });
 
   it('carries forward output from response.incomplete terminal payloads on non-incremental websocket turns', async () => {

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import type { IncomingMessage } from 'node:http';
+import { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../../proxy-core/runtime/codexWebsocketRuntime.js';
@@ -19,11 +19,12 @@ import { openAiResponsesTransformer } from '../../transformers/openai/responses/
 import { buildUpstreamEndpointRequest } from './upstreamEndpoint.js';
 import { config } from '../../config.js';
 import { applyOpenAiServiceTierPolicy } from '../../proxy-core/serviceTierPolicy.js';
+import { insertProxyLog } from '../../services/proxyLogStore.js';
+import { reportProxyAllFailed } from '../../services/alertService.js';
+import { markResponsesWebsocketBridgeRequest } from './responsesWebsocketBridgeContext.js';
 
 const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
-const RESPONSES_WEBSOCKET_MODE_HEADER = 'x-metapi-responses-websocket-mode';
-const RESPONSES_WEBSOCKET_TRANSPORT_HEADER = 'x-metapi-responses-websocket-transport';
 const codexWebsocketRuntime = createCodexWebsocketRuntime();
 
 type SelectedChannel = NonNullable<Awaited<ReturnType<typeof tokenRouter.selectChannel>>>;
@@ -416,8 +417,6 @@ async function forwardResponsesRequestViaHttp(input: {
 }): Promise<unknown[] | null> {
   const injectHeaders: Record<string, string | string[]> = {
     ...buildInjectHeaders(input.request),
-    [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
-    ...(input.preserveIncrementalMode ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
   };
   if (
     !headerValueToTrimmedString(injectHeaders.authorization)
@@ -427,11 +426,16 @@ async function forwardResponsesRequestViaHttp(input: {
     injectHeaders.authorization = `Bearer ${input.authToken}`;
   }
 
+  class ResponsesWebsocketBridgeRequest extends IncomingMessage {}
+  markResponsesWebsocketBridgeRequest(ResponsesWebsocketBridgeRequest, {
+    preserveIncrementalMode: input.preserveIncrementalMode,
+  });
   const response = await input.app.inject({
     method: 'POST',
     url: '/v1/responses',
     headers: injectHeaders,
     payload: input.payload,
+    Request: ResponsesWebsocketBridgeRequest,
   });
 
   if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -689,8 +693,6 @@ async function handleResponsesWebsocketConnection(
           if (codexWebsocketChannel) {
             const downstreamHeaders: Record<string, unknown> = {
               ...(request.headers as Record<string, unknown>),
-              [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
-              ...(supportsIncrementalInput ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
             };
             const providerHeaders = buildOauthProviderHeaders({
               account: codexWebsocketChannel.account,
@@ -722,6 +724,8 @@ async function handleResponsesWebsocketConnection(
                     downstreamHeaders,
                     providerHeaders,
                     codexExplicitSessionId: deriveCodexExplicitSessionId(normalized.request, websocketSessionId),
+                    responsesWebsocketTransport: true,
+                    preserveWebsocketIncrementalMode: supportsIncrementalInput,
                   });
                   const requestUrl = `${target.baseUrl.replace(/\/+$/, '')}${prepared.path}`;
 
@@ -763,6 +767,35 @@ async function handleResponsesWebsocketConnection(
                 }
                 return;
               }
+              selectedChannel = null;
+              runtimeSessionKeys.delete(websocketRuntimeSessionKey);
+              try {
+                await tokenRouter.recordFailure(codexWebsocketChannel.channel.id, {
+                  status: runtimeError.status || 502,
+                  errorText: runtimeError.message,
+                  modelName: asTrimmedString(codexWebsocketChannel.actualModel) || requestModel,
+                });
+              } catch {
+                // Failure delivery and channel reselection must not depend on cooldown bookkeeping.
+              }
+              try {
+                await insertProxyLog({
+                  routeId: codexWebsocketChannel.channel.routeId,
+                  channelId: codexWebsocketChannel.channel.id,
+                  accountId: codexWebsocketChannel.account.id,
+                  downstreamApiKeyId: authContext.source === 'managed' ? authContext.key?.id ?? null : null,
+                  modelRequested: requestModel,
+                  modelActual: asTrimmedString(codexWebsocketChannel.actualModel) || requestModel,
+                  status: 'failed',
+                  httpStatus: runtimeError.status || 502,
+                  isStream: true,
+                  errorMessage: runtimeError.message,
+                  retryCount: 0,
+                });
+              } catch {
+                // Failure delivery and channel release must not depend on observability storage.
+              }
+              void Promise.resolve(reportProxyAllFailed({ model: requestModel, reason: runtimeError.message })).catch(() => undefined);
               lastResponseOutput = collectResponsesOutput(runtimeError.events);
               for (const payload of runtimeError.events) {
                 socket.send(JSON.stringify(payload));
@@ -770,7 +803,10 @@ async function handleResponsesWebsocketConnection(
               const emittedTerminalResponsesEvent = runtimeError.events.some((payload) => {
                 if (!isRecord(payload)) return false;
                 const type = asTrimmedString(payload.type);
-                return type === 'response.completed' || type === 'response.failed' || type === 'response.incomplete';
+                return type === 'response.completed'
+                  || type === 'response.failed'
+                  || type === 'response.incomplete'
+                  || type === 'error';
               });
               if (!emittedTerminalResponsesEvent) {
                 writeResponsesWebsocketError(
@@ -779,6 +815,11 @@ async function handleResponsesWebsocketConnection(
                   runtimeError.message,
                   runtimeError.payload,
                 );
+              }
+              try {
+                await codexWebsocketRuntime.closeSession(websocketRuntimeSessionKey);
+              } catch {
+                // The runtime already rejects response.failed and clears its active socket.
               }
             }
             return;

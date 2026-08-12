@@ -94,31 +94,6 @@ function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function finalizeRetryAsUpstreamFailure(status: number, message: string) {
-  return {
-    action: 'respond' as const,
-    status,
-    payload: {
-      error: {
-        message,
-        type: 'upstream_error' as const,
-      },
-    },
-  };
-}
-
-function finalizeRetryAsExecutionFailure(message: string) {
-  return {
-    action: 'respond' as const,
-    status: 502,
-    payload: {
-      error: {
-        message: `Upstream error: ${message}`,
-        type: 'upstream_error' as const,
-      },
-    },
-  };
-}
 
 export async function handleChatSurfaceRequest(
   request: FastifyRequest,
@@ -262,13 +237,12 @@ export async function handleChatSurfaceRequest(
         model: requestedModel,
         reason: forcedChannelId ? noChannelMessage : 'No available channels after retries',
       });
-      const payload = {
-        error: { message: noChannelMessage, type: 'server_error' as const },
-      };
-      await finalizeDebugFailure(503, payload, null);
-      return reply.code(503).send({
-        error: { message: noChannelMessage, type: 'server_error' },
+      const terminalFailure = failureToolkit.resolveRoutingFailure({
+        requestedModel,
+        message: noChannelMessage,
       });
+      await finalizeDebugFailure(terminalFailure.status, terminalFailure.payload, null);
+      return reply.code(terminalFailure.status).send(terminalFailure.payload);
     }
 
     excludeChannelIds.push(selected.channel.id);
@@ -538,18 +512,15 @@ export async function handleChatSurfaceRequest(
         retryCount += 1;
         continue;
       }
-      await finalizeDebugFailure(503, {
-        error: {
-          message: busyMessage,
-          type: 'server_error',
-        },
+      const terminalFailure = failureToolkit.resolveTerminalFailure({
+        selected,
+        requestedModel,
+        modelName,
+        status: 503,
+        message: busyMessage,
       });
-      return reply.code(503).send({
-        error: {
-          message: busyMessage,
-          type: 'server_error',
-        },
-      });
+      await finalizeDebugFailure(terminalFailure.status, terminalFailure.payload);
+      return reply.code(terminalFailure.status).send(terminalFailure.payload);
     }
     const channelLease = leaseResult.lease;
 
@@ -566,6 +537,10 @@ export async function handleChatSurfaceRequest(
         }
         return result;
       });
+
+      if (!endpointResult || typeof endpointResult !== 'object' || !('upstream' in endpointResult)) {
+        throw new SiteApiEndpointRequestError('invalid site api endpoint result', { status: 502 });
+      }
 
       const upstream = endpointResult.upstream;
       const successfulUpstreamPath = endpointResult.upstreamPath;
@@ -636,6 +611,7 @@ export async function handleChatSurfaceRequest(
         };
 
         const writeLines = (lines: string[]) => {
+          if (lines.length <= 0) return;
           startSseResponse();
           for (const line of lines) {
             reply.raw.write(line);
@@ -660,6 +636,7 @@ export async function handleChatSurfaceRequest(
           },
           writeLines,
           writeRaw: (chunk) => {
+            if (!chunk) return;
             startSseResponse();
             reply.raw.write(chunk);
           },
@@ -679,6 +656,7 @@ export async function handleChatSurfaceRequest(
                 stickySessionKey,
                 selected,
               });
+              const streamFailureStatus = streamResult.failure?.status ?? 502;
               await failureToolkit.recordStreamFailure({
                 selected,
                 requestedModel,
@@ -690,20 +668,28 @@ export async function handleChatSurfaceRequest(
                 completionTokens: parsedUsage.completionTokens,
                 totalTokens: parsedUsage.totalTokens,
                 upstreamPath: successfulUpstreamPath,
+                runtimeFailureStatus: streamFailureStatus,
+                originalPayload: streamResult.failure?.payload,
+                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
               });
-              await finalizeDebugFailure(502, {
+              await finalizeDebugFailure(streamFailureStatus, {
                 error: {
                   message: streamResult.errorMessage,
                   type: 'stream_error',
                 },
               }, successfulUpstreamPath);
               if (!isResponseCommitted()) {
-                return reply.code(502).send({
-                  error: {
-                    message: streamResult.errorMessage,
-                    type: 'upstream_error',
-                  },
+                const terminalFailure = failureToolkit.resolveTerminalFailure({
+                  selected,
+                  requestedModel,
+                  modelName,
+                  status: streamFailureStatus,
+                  message: streamResult.errorMessage || 'stream processing failed',
+                  isStream,
+                  originalPayload: streamResult.failure?.payload,
+                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
                 });
+                return reply.code(terminalFailure.status).send(terminalFailure.payload);
               }
               return;
             }
@@ -755,7 +741,14 @@ export async function handleChatSurfaceRequest(
             const terminalFailureOutcome = failureOutcome.action === 'retry'
               ? (canRetryChannelSelection(retryCount, forcedChannelId)
                 ? null
-                : finalizeRetryAsUpstreamFailure(failure.status, failure.reason))
+                : failureToolkit.resolveTerminalFailure({
+                  selected,
+                  requestedModel,
+                  modelName,
+                  status: failure.status,
+                  message: failure.reason,
+                  isStream,
+                }))
               : failureOutcome;
             if (!terminalFailureOutcome) {
               retryCount += 1;
@@ -771,6 +764,7 @@ export async function handleChatSurfaceRequest(
 
           const streamResult = streamSession.consumeUpstreamFinalPayload(fallbackData, fallbackText, streamResponse);
           if (streamResult.status === 'failed') {
+            const streamFailureStatus = streamResult.failure?.status ?? 502;
             clearSurfaceStickyChannel({
               stickySessionKey,
               selected,
@@ -786,21 +780,28 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              runtimeFailureStatus: 502,
+              runtimeFailureStatus: streamFailureStatus,
+              originalPayload: streamResult.failure?.payload,
+              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
             });
-            await finalizeDebugFailure(502, {
+            await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
             if (!isResponseCommitted()) {
-              return reply.code(502).send({
-                error: {
-                  message: streamResult.errorMessage,
-                  type: 'upstream_error',
-                },
+              const terminalFailure = failureToolkit.resolveTerminalFailure({
+                selected,
+                requestedModel,
+                modelName,
+                status: streamFailureStatus,
+                message: streamResult.errorMessage || 'stream processing failed',
+                isStream,
+                originalPayload: streamResult.failure?.payload,
+                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
               });
+              return reply.code(terminalFailure.status).send(terminalFailure.payload);
             }
             return;
           }
@@ -846,6 +847,7 @@ export async function handleChatSurfaceRequest(
 
           const latency = Date.now() - startTime;
           if (streamResult.status === 'failed') {
+            const streamFailureStatus = streamResult.failure?.status ?? 502;
             clearSurfaceStickyChannel({
               stickySessionKey,
               selected,
@@ -861,21 +863,28 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              runtimeFailureStatus: 502,
+              runtimeFailureStatus: streamFailureStatus,
+              originalPayload: streamResult.failure?.payload,
+              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
             });
-            await finalizeDebugFailure(502, {
+            await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
             if (!isResponseCommitted()) {
-              return reply.code(502).send({
-                error: {
-                  message: streamResult.errorMessage,
-                  type: 'upstream_error',
-                },
+              const terminalFailure = failureToolkit.resolveTerminalFailure({
+                selected,
+                requestedModel,
+                modelName,
+                status: streamFailureStatus,
+                message: streamResult.errorMessage || 'stream processing failed',
+                isStream,
+                originalPayload: streamResult.failure?.payload,
+                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
               });
+              return reply.code(terminalFailure.status).send(terminalFailure.payload);
             }
             return;
           }
@@ -951,7 +960,14 @@ export async function handleChatSurfaceRequest(
         const terminalFailureOutcome = failureOutcome.action === 'retry'
           ? (canRetryChannelSelection(retryCount, forcedChannelId)
             ? null
-            : finalizeRetryAsUpstreamFailure(failure.status, failure.reason))
+            : failureToolkit.resolveTerminalFailure({
+              selected,
+              requestedModel,
+              modelName,
+              status: failure.status,
+              message: failure.reason,
+              isStream,
+            }))
           : failureOutcome;
         if (!terminalFailureOutcome) {
           retryCount += 1;
@@ -1050,7 +1066,14 @@ export async function handleChatSurfaceRequest(
         const terminalFailureOutcome = failureOutcome.action === 'retry'
           ? (canRetryChannelSelection(retryCount, forcedChannelId)
             ? null
-            : finalizeRetryAsUpstreamFailure(endpointFailureStatus || 502, err.message || 'unknown error'))
+            : failureToolkit.resolveTerminalFailure({
+              selected,
+              requestedModel,
+              modelName,
+              status: endpointFailureStatus || 502,
+              message: err.message || 'unknown error',
+              isStream,
+            }))
           : failureOutcome;
         if (!terminalFailureOutcome) {
           retryCount += 1;
@@ -1075,7 +1098,14 @@ export async function handleChatSurfaceRequest(
       const terminalFailureOutcome = failureOutcome.action === 'retry'
         ? (canRetryChannelSelection(retryCount, forcedChannelId)
           ? null
-          : finalizeRetryAsExecutionFailure(err?.message || 'network failure'))
+          : failureToolkit.resolveTerminalFailure({
+            selected,
+            requestedModel,
+            modelName,
+            status: 502,
+            message: `Upstream error: ${err?.message || 'network failure'}`,
+            isStream,
+          }))
         : failureOutcome;
       if (!terminalFailureOutcome) {
         retryCount += 1;
@@ -1219,12 +1249,12 @@ export async function handleClaudeCountTokensSurfaceRequest(
         model: requestedModel,
         reason: forcedChannelId ? noChannelMessage : 'No available channels after retries',
       });
-      await finalizeDebugFailure(503, {
-        error: { message: noChannelMessage, type: 'server_error' },
+      const terminalFailure = failureToolkit.resolveRoutingFailure({
+        requestedModel,
+        message: noChannelMessage,
       });
-      return reply.code(503).send({
-        error: { message: noChannelMessage, type: 'server_error' },
-      });
+      await finalizeDebugFailure(terminalFailure.status, terminalFailure.payload);
+      return reply.code(terminalFailure.status).send(terminalFailure.payload);
     }
 
     excludeChannelIds.push(selected.channel.id);
@@ -1314,18 +1344,15 @@ export async function handleClaudeCountTokensSurfaceRequest(
         retryCount += 1;
         continue;
       }
-      await finalizeDebugFailure(503, {
-        error: {
-          message: busyMessage,
-          type: 'server_error',
-        },
+      const terminalFailure = failureToolkit.resolveTerminalFailure({
+        selected,
+        requestedModel,
+        modelName,
+        status: 503,
+        message: busyMessage,
       });
-      return reply.code(503).send({
-        error: {
-          message: busyMessage,
-          type: 'server_error',
-        },
-      });
+      await finalizeDebugFailure(terminalFailure.status, terminalFailure.payload);
+      return reply.code(terminalFailure.status).send(terminalFailure.payload);
     }
     const channelLease = leaseResult.lease;
 
@@ -1498,7 +1525,14 @@ export async function handleClaudeCountTokensSurfaceRequest(
         const terminalFailureOutcome = failureOutcome.action === 'retry'
           ? (canRetryChannelSelection(retryCount, forcedChannelId)
             ? null
-            : finalizeRetryAsUpstreamFailure(endpointFailureStatus || 502, error.message || 'unknown error'))
+            : failureToolkit.resolveTerminalFailure({
+              selected,
+              requestedModel,
+              modelName,
+              status: endpointFailureStatus || 502,
+              message: error.message || 'unknown error',
+              isStream: false,
+            }))
           : failureOutcome;
         if (!terminalFailureOutcome) {
           retryCount += 1;
@@ -1519,7 +1553,14 @@ export async function handleClaudeCountTokensSurfaceRequest(
       const terminalFailureOutcome = failureOutcome.action === 'retry'
         ? (canRetryChannelSelection(retryCount, forcedChannelId)
           ? null
-          : finalizeRetryAsExecutionFailure(error?.message || 'network failure'))
+          : failureToolkit.resolveTerminalFailure({
+            selected,
+            requestedModel,
+            modelName,
+            status: 502,
+            message: `Upstream error: ${error?.message || 'network failure'}`,
+            isStream: false,
+          }))
         : failureOutcome;
       if (!terminalFailureOutcome) {
         retryCount += 1;

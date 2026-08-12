@@ -3,7 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { eq } from 'drizzle-orm';
+import { eq, inArray } from 'drizzle-orm';
 import { resetRequestRateLimitStore } from '../../middleware/requestRateLimit.js';
 
 type DbModule = typeof import('../../db/index.js');
@@ -39,9 +39,11 @@ describe('settings and auth events', () => {
     resetRequestRateLimitStore();
     await db.delete(schema.events).run();
     await db.delete(schema.settings).run();
+    await db.delete(schema.downstreamApiKeys).run();
 
     config.authToken = 'old-admin-token-123';
     config.proxyToken = 'sk-old-proxy-token-123';
+    config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
     config.systemProxyUrl = '';
     config.checkinCron = '0 8 * * *';
     (config as any).checkinScheduleMode = 'cron';
@@ -745,6 +747,178 @@ describe('settings and auth events', () => {
       'too many requests',
     ]);
     expect(runtime.proxyEmptyContentFailEnabled).toBe(true);
+  });
+
+  it('persists and validates the scoped downstream terminal error policy', async () => {
+    const dedicatedKey = await db.insert(schema.downstreamApiKeys).values({
+      name: 'CPA dedicated lane',
+      key: 'sk-cpa-dedicated-lane',
+      enabled: true,
+    }).returning().get();
+    const updateResponse = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        downstreamErrorPolicy: {
+          mode: 'cpa-hermes-resilient',
+          downstreamApiKeyIds: [dedicatedKey.id, dedicatedKey.id],
+        },
+      },
+    });
+
+    expect(updateResponse.statusCode).toBe(200);
+    expect(config.downstreamErrorPolicy).toEqual({
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [dedicatedKey.id],
+    });
+    const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'downstream_error_policy')).get();
+    expect(JSON.parse(String(saved?.value))).toEqual({
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [dedicatedKey.id],
+    });
+  });
+
+  it('rejects resilient policy references to missing downstream keys', async () => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        downstreamErrorPolicy: {
+          mode: 'cpa-hermes-resilient',
+          downstreamApiKeyIds: [999999],
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toContain('不存在');
+  });
+
+  it('does not persist a valid downstream policy when another field makes the request invalid', async () => {
+    const dedicatedKey = await db.insert(schema.downstreamApiKeys).values({
+      name: 'CPA atomic lane',
+      key: 'sk-cpa-atomic-lane',
+      enabled: true,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        downstreamErrorPolicy: {
+          mode: 'cpa-hermes-resilient',
+          downstreamApiKeyIds: [dedicatedKey.id],
+        },
+        globalBlockedBrands: 'not-an-array',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(config.downstreamErrorPolicy).toEqual({ mode: 'off', downstreamApiKeyIds: [] });
+    const saved = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, 'downstream_error_policy'))
+      .get();
+    expect(saved).toBeUndefined();
+  });
+
+  it('does not persist a valid downstream policy when a later runtime field is invalid', async () => {
+    const dedicatedKey = await db.insert(schema.downstreamApiKeys).values({
+      name: 'CPA late-validation lane',
+      key: 'sk-cpa-late-validation-lane',
+      enabled: true,
+    }).returning().get();
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        downstreamErrorPolicy: {
+          mode: 'cpa-hermes-resilient',
+          downstreamApiKeyIds: [dedicatedKey.id],
+        },
+        smtpPort: 0,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(config.downstreamErrorPolicy).toEqual({ mode: 'off', downstreamApiKeyIds: [] });
+    const saved = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, 'downstream_error_policy'))
+      .get();
+    expect(saved).toBeUndefined();
+  });
+
+  it('rejects the complete mixed runtime payload before applying earlier sibling settings', async () => {
+    const previousMode = config.checkinScheduleMode;
+    const previousIntervalHours = config.checkinIntervalHours;
+    const previousCodexWebsocketEnabled = config.codexUpstreamWebsocketEnabled;
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        checkinScheduleMode: previousMode === 'cron' ? 'interval' : 'cron',
+        checkinIntervalHours: previousIntervalHours === 8 ? 6 : 8,
+        codexUpstreamWebsocketEnabled: !previousCodexWebsocketEnabled,
+        smtpPort: 0,
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(config.checkinScheduleMode).toBe(previousMode);
+    expect(config.checkinIntervalHours).toBe(previousIntervalHours);
+    expect(config.codexUpstreamWebsocketEnabled).toBe(previousCodexWebsocketEnabled);
+    const savedRows = await db.select().from(schema.settings)
+      .where(inArray(schema.settings.key, [
+        'checkin_schedule_mode',
+        'checkin_interval_hours',
+        'codex_upstream_websocket_enabled',
+      ]))
+      .all();
+    expect(savedRows).toEqual([]);
+  });
+
+  it('rejects an invalid later cron sibling before applying earlier schedule settings', async () => {
+    const previousMode = config.checkinScheduleMode;
+    const previousIntervalHours = config.checkinIntervalHours;
+
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        checkinScheduleMode: 'interval',
+        checkinIntervalHours: 8,
+        balanceRefreshCron: 'definitely-not-cron',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(config.checkinScheduleMode).toBe(previousMode);
+    expect(config.checkinIntervalHours).toBe(previousIntervalHours);
+    const persistedRows = await db.select()
+      .from(schema.settings)
+      .where(inArray(schema.settings.key, [
+        'checkin_schedule_mode',
+        'checkin_interval_hours',
+      ]))
+      .all();
+    expect(persistedRows).toHaveLength(0);
+  });
+
+  it('rejects resilient policy without a dedicated downstream key', async () => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        downstreamErrorPolicy: {
+          mode: 'cpa-hermes-resilient',
+          downstreamApiKeyIds: [],
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toContain('至少选择一个专用下游 API Key');
   });
 
   it('persists global model and brand filters as JSON arrays', async () => {

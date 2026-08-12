@@ -243,7 +243,7 @@ describe('codexWebsocketRuntime', () => {
     await runtime.closeSession('exec-session-incomplete');
   });
 
-  it('keeps the upstream websocket session alive across response.failed terminal turns', async () => {
+  it('rejects response.failed as an operational failure and reconnects the next turn', async () => {
     upstreamMessageHandler = (socket, parsed, requestIndex) => {
       if (requestIndex === 1) {
         socket.send(JSON.stringify({
@@ -281,7 +281,7 @@ describe('codexWebsocketRuntime', () => {
     const { createCodexWebsocketRuntime } = await import('./codexWebsocketRuntime.js');
     const runtime = createCodexWebsocketRuntime();
 
-    const first = await runtime.sendRequest({
+    await expect(runtime.sendRequest({
       sessionId: 'exec-session-failed-turn',
       requestUrl: upstreamWsUrl,
       headers: {
@@ -292,6 +292,16 @@ describe('codexWebsocketRuntime', () => {
         model: 'gpt-5.4',
         input: [],
       },
+    })).rejects.toMatchObject({
+      name: 'CodexWebsocketRuntimeError',
+      message: 'tool execution failed',
+      status: 502,
+      events: [
+        expect.objectContaining({
+          type: 'response.failed',
+          response: expect.objectContaining({ id: 'resp-failed' }),
+        }),
+      ],
     });
 
     const second = await runtime.sendRequest({
@@ -308,24 +318,12 @@ describe('codexWebsocketRuntime', () => {
       },
     });
 
-    expect(first.events).toEqual([
-      expect.objectContaining({
-        type: 'response.failed',
-        response: expect.objectContaining({
-          id: 'resp-failed',
-          error: expect.objectContaining({
-            message: 'tool execution failed',
-          }),
-        }),
-      }),
-    ]);
-    expect(first.reusedSession).toBe(false);
     expect(second.events[0]).toMatchObject({
       type: 'response.completed',
       response: { id: 'resp-2' },
     });
-    expect(second.reusedSession).toBe(true);
-    expect(upstreamConnectionCount).toBe(1);
+    expect(second.reusedSession).toBe(false);
+    expect(upstreamConnectionCount).toBe(2);
     expect(upstreamRequests).toHaveLength(2);
 
     await runtime.closeSession('exec-session-failed-turn');
@@ -483,5 +481,35 @@ describe('codexWebsocketRuntime', () => {
         }),
       }),
     ]);
+  });
+
+  it('preserves string HTTP status values from websocket error frames', async () => {
+    upstreamMessageHandler = (socket) => {
+      socket.send(JSON.stringify({
+        type: 'error',
+        status: '429',
+        error: {
+          message: 'quota exhausted',
+          type: 'rate_limit_error',
+        },
+      }));
+    };
+
+    const { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } = await import('./codexWebsocketRuntime.js');
+    const runtime = createCodexWebsocketRuntime();
+    let error: unknown;
+    try {
+      await runtime.sendRequest({
+        sessionId: 'exec-session-string-status',
+        requestUrl: upstreamWsUrl,
+        headers: { Authorization: 'Bearer oauth-access-token' },
+        body: { model: 'gpt-5.4', input: [] },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(CodexWebsocketRuntimeError);
+    expect(error).toMatchObject({ message: 'quota exhausted', status: 429 });
   });
 });

@@ -8,6 +8,7 @@ import {
 } from './responseBridge.js';
 import { openAiChatStream } from './streamBridge.js';
 import { config } from '../../../config.js';
+import { extractTypedStreamFailure, type TypedStreamFailure } from '../../shared/streamFailure.js';
 
 type StreamReader = {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -31,6 +32,8 @@ type ResponseSink = {
 type ChatProxyStreamResult = {
   status: 'completed' | 'failed';
   errorMessage: string | null;
+  failure?: TypedStreamFailure;
+  meaningfulOutputSeen?: boolean;
 };
 
 export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput) {
@@ -77,9 +80,12 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
   };
 
   const markFailed = (payload: unknown, fallbackMessage?: string) => {
+    const failure = extractTypedStreamFailure(payload, fallbackMessage);
     terminalResult = {
       status: 'failed',
-      errorMessage: extractFailureMessage(payload, fallbackMessage),
+      errorMessage: failure.message,
+      failure,
+      meaningfulOutputSeen: forwardedDownstreamOutput,
     };
   };
 
@@ -135,10 +141,6 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
 
   const emitLines = (lines: string[], options?: { meaningful?: boolean; force?: boolean }) => {
     if (lines.length <= 0) return;
-    if (input.downstreamFormat !== 'openai') {
-      input.writeLines(lines);
-      return;
-    }
     if (forwardedDownstreamOutput) {
       input.writeLines(lines);
       return;
@@ -150,9 +152,9 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       return;
     }
     if (options?.meaningful) {
-      forwardedDownstreamOutput = true;
       flushPendingWrites();
       input.writeLines(lines);
+      forwardedDownstreamOutput = true;
       return;
     }
     pendingWrites.push(...lines);
@@ -160,7 +162,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
 
   const emitRaw = (chunk: string, options?: { meaningful?: boolean; force?: boolean }) => {
     if (!chunk) return;
-    if (input.downstreamFormat !== 'openai') {
+    if (input.downstreamFormat !== 'openai' && forwardedDownstreamOutput) {
       input.writeRaw(chunk);
       return;
     }
@@ -175,9 +177,9 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       return;
     }
     if (options?.meaningful) {
-      forwardedDownstreamOutput = true;
       flushPendingWrites();
       input.writeRaw(chunk);
+      forwardedDownstreamOutput = true;
       return;
     }
     pendingWrites.push(chunk);
@@ -265,10 +267,29 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
         input.onParsedPayload?.(parsedPayload);
       }
       if (consumed.handled) {
-        input.writeLines(consumed.lines);
+        const payloadType = parsedPayload && typeof parsedPayload === 'object'
+          && typeof (parsedPayload as Record<string, unknown>).type === 'string'
+          ? String((parsedPayload as Record<string, unknown>).type)
+          : '';
+        if (payloadType === 'error') {
+          markFailed(parsedPayload);
+          if (!forwardedDownstreamOutput) {
+            pendingWrites.length = 0;
+            return true;
+          }
+        }
+        const convertedMeaningful = consumed.lines.some((line) => (
+          line.includes('event: content_block_start')
+          || line.includes('event: content_block_delta')
+        ));
+        emitLines(consumed.lines, {
+          meaningful: convertedMeaningful,
+          force: payloadType === 'error',
+        });
         return consumed.done;
       }
-    } else {
+    }
+    if (parsedPayload === null) {
       try {
         parsedPayload = JSON.parse(eventBlock.data);
       } catch {
@@ -291,10 +312,21 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       if (input.downstreamFormat === 'openai' && chatAggregateState) {
         applyOpenAiChatStreamEvent(chatAggregateState, normalizedEvent);
       }
+      const serializedLines = downstreamTransformer.serializeStreamEvent(
+        normalizedEvent,
+        streamContext,
+        claudeContext,
+      );
+      const meaningfulOutput = input.downstreamFormat === 'openai'
+        ? hasMeaningfulChatAggregateOutput()
+        : serializedLines.some((line) => (
+          line.includes('event: content_block_start')
+          || line.includes('event: content_block_delta')
+        ));
       emitLines(
-        downstreamTransformer.serializeStreamEvent(normalizedEvent, streamContext, claudeContext),
+        serializedLines,
         {
-          meaningful: hasMeaningfulChatAggregateOutput(),
+          meaningful: meaningfulOutput,
           force: isFailurePayload,
         },
       );

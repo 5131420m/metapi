@@ -3,8 +3,9 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
+import { config } from '../../config.js';
 
 type DbModule = typeof import('../../db/index.js');
 
@@ -33,6 +34,8 @@ describe('downstream api keys routes', () => {
     await db.delete(schema.downstreamApiKeys).run();
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.sites).run();
+    await db.delete(schema.settings).run();
+    config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
   });
 
   afterAll(async () => {
@@ -51,6 +54,78 @@ describe('downstream api keys routes', () => {
     expect(rendered).toContain('date_trunc');
     expect(rendered).toContain('cast');
     expect(rendered).toContain('timestamp');
+  });
+
+  it('removes deleted keys from the active downstream terminal error policy', async () => {
+    const inserted = await db.insert(schema.downstreamApiKeys).values([
+      { name: 'dedicated-a', key: 'sk-dedicated-a', enabled: true },
+      { name: 'dedicated-b', key: 'sk-dedicated-b', enabled: true },
+    ]).returning().all();
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: inserted.map((row: { id: number }) => row.id),
+    };
+    await db.insert(schema.settings).values({
+      key: 'downstream_error_policy',
+      value: JSON.stringify(config.downstreamErrorPolicy),
+    }).run();
+
+    const response = await app.inject({
+      method: 'DELETE',
+      url: `/api/downstream-keys/${inserted[0].id}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(config.downstreamErrorPolicy).toEqual({
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [inserted[1].id],
+    });
+    const saved = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, 'downstream_error_policy'))
+      .get();
+    expect(JSON.parse(String(saved?.value))).toEqual(config.downstreamErrorPolicy);
+  });
+
+  it('does not delete a downstream key when policy cleanup persistence fails', async () => {
+    const inserted = await db.insert(schema.downstreamApiKeys).values({
+      name: 'dedicated-protected',
+      key: 'sk-dedicated-protected',
+      enabled: true,
+    }).returning().get();
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [inserted.id],
+    };
+    await db.insert(schema.settings).values({
+      key: 'downstream_error_policy',
+      value: JSON.stringify(config.downstreamErrorPolicy),
+    }).run();
+
+    await db.run(sql`
+      CREATE TRIGGER fail_downstream_policy_update
+      BEFORE UPDATE OF value ON settings
+      WHEN OLD.key = 'downstream_error_policy'
+      BEGIN
+        SELECT RAISE(ABORT, 'policy persistence failed');
+      END
+    `);
+    try {
+      const response = await app.inject({
+        method: 'DELETE',
+        url: `/api/downstream-keys/${inserted.id}`,
+      });
+
+      expect(response.statusCode).toBeGreaterThanOrEqual(400);
+      expect(await db.select().from(schema.downstreamApiKeys)
+        .where(eq(schema.downstreamApiKeys.id, inserted.id))
+        .get()).toBeDefined();
+      expect(config.downstreamErrorPolicy).toEqual({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [inserted.id],
+      });
+    } finally {
+      await db.run(sql`DROP TRIGGER IF EXISTS fail_downstream_policy_update`);
+    }
   });
 
   it('creates, updates, resets and deletes downstream api keys', async () => {

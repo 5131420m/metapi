@@ -3,6 +3,7 @@ import {
   normalizeTokenRouterFailureCooldownMaxSec,
 } from './config.js';
 import { normalizePayloadRulesConfig } from './services/payloadRules.js';
+import { parseDownstreamErrorPolicyConfig } from './services/downstreamErrorPolicy.js';
 import { normalizeLogCleanupRetentionDays } from './shared/logCleanupRetentionDays.js';
 
 export function parseSettingFromMap<T>(settingsMap: Map<string, string>, key: string): T | undefined {
@@ -81,6 +82,15 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
   const proxyEmptyContentFailEnabled = parseSettingFromMap<boolean>(settingsMap, 'proxy_empty_content_fail_enabled');
   if (typeof proxyEmptyContentFailEnabled === 'boolean') {
     config.proxyEmptyContentFailEnabled = proxyEmptyContentFailEnabled;
+  }
+
+  const downstreamErrorPolicy = parseSettingFromMap<unknown>(settingsMap, 'downstream_error_policy');
+  if (downstreamErrorPolicy !== undefined) {
+    try {
+      config.downstreamErrorPolicy = parseDownstreamErrorPolicyConfig(downstreamErrorPolicy);
+    } catch {
+      // Invalid persisted values leave the safe current policy unchanged.
+    }
   }
 
   const globalBlockedBrands = parseSettingFromMap<string[]>(settingsMap, 'global_blocked_brands');

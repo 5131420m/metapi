@@ -454,6 +454,8 @@ export function buildUpstreamEndpointRequest(input: {
   providerHeaders?: Record<string, string>;
   codexSessionCacheKey?: string | null;
   codexExplicitSessionId?: string | null;
+  responsesWebsocketTransport?: boolean;
+  preserveWebsocketIncrementalMode?: boolean;
 }): {
   path: string;
   headers: Record<string, string>;
@@ -678,12 +680,8 @@ export function buildUpstreamEndpointRequest(input: {
   }
 
   if (input.endpoint === 'responses') {
-    const responsesWebsocketTransport = getInputHeader(
-      input.downstreamHeaders,
-      'x-metapi-responses-websocket-transport',
-    ) === '1';
-    const websocketMode = Object.entries(input.downstreamHeaders || {}).find(([rawKey]) => rawKey.trim().toLowerCase() === 'x-metapi-responses-websocket-mode');
-    const preserveWebsocketIncrementalMode = asTrimmedString(websocketMode?.[1]).toLowerCase() === 'incremental';
+    const responsesWebsocketTransport = input.responsesWebsocketTransport === true;
+    const preserveWebsocketIncrementalMode = input.preserveWebsocketIncrementalMode === true;
     const responsesHeaders = input.downstreamFormat === 'responses'
       ? extractResponsesPassthroughHeaders(input.downstreamHeaders)
       : {};

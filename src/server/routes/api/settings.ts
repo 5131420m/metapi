@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import cron from 'node-cron';
 import { fetch } from 'undici';
+import { inArray } from 'drizzle-orm';
 import { config, normalizeTokenRouterFailureCooldownMaxSec } from '../../config.js';
 import { db, runtimeDbDialect, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
@@ -49,6 +50,7 @@ import {
   stopChannelRecoveryProbeScheduler,
 } from '../../services/channelRecoveryProbeService.js';
 import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
+import { parseDownstreamErrorPolicyConfig } from '../../services/downstreamErrorPolicy.js';
 
 type RoutingWeights = typeof config.routingWeights;
 
@@ -108,6 +110,7 @@ interface RuntimeSettingsBody {
   routingWeights?: Partial<RoutingWeights>;
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
+  downstreamErrorPolicy?: unknown;
   globalBlockedBrands?: string[];
   globalAllowedModels?: string[];
 }
@@ -312,6 +315,19 @@ function parseProxyErrorKeywords(value: unknown): string[] {
 function parseBooleanFlag(value: unknown, label: string): boolean {
   if (typeof value === 'boolean') return value;
   throw new Error(`${label}格式无效：需要 boolean`);
+}
+
+async function validateDownstreamErrorPolicyReferences(policy: ReturnType<typeof parseDownstreamErrorPolicyConfig>): Promise<void> {
+  if (policy.mode !== 'cpa-hermes-resilient') return;
+  const rows = await db.select({ id: schema.downstreamApiKeys.id })
+    .from(schema.downstreamApiKeys)
+    .where(inArray(schema.downstreamApiKeys.id, policy.downstreamApiKeyIds))
+    .all();
+  const existingIds = new Set(rows.map((row: { id: number }) => Number(row.id)));
+  const missingIds = policy.downstreamApiKeyIds.filter((id) => !existingIds.has(id));
+  if (missingIds.length > 0) {
+    throw new Error(`下游终态错误策略包含不存在的 API Key: ${missingIds.join(', ')}`);
+  }
 }
 
 function isValidHttpUrl(raw: string): boolean {
@@ -532,6 +548,14 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
     case 'proxy_empty_content_fail_enabled': {
       try {
         config.proxyEmptyContentFailEnabled = parseBooleanFlag(value, '空内容判定失败开关');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'downstream_error_policy': {
+      try {
+        config.downstreamErrorPolicy = parseDownstreamErrorPolicyConfig(value);
       } catch {
         return;
       }
@@ -784,6 +808,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     payloadRules: config.payloadRules,
     proxyErrorKeywords: config.proxyErrorKeywords,
     proxyEmptyContentFailEnabled: config.proxyEmptyContentFailEnabled,
+    downstreamErrorPolicy: config.downstreamErrorPolicy,
     proxyTokenMasked: maskSecret(config.proxyToken),
     globalBlockedBrands: config.globalBlockedBrands,
     globalAllowedModels: config.globalAllowedModels,
@@ -926,6 +951,48 @@ export async function settingsRoutes(app: FastifyInstance) {
     const changedLabels: string[] = [];
     const currentRequestIp = extractClientIp(request.ip, request.headers['x-forwarded-for']);
     let pendingPayloadRules: typeof config.payloadRules | undefined;
+    let pendingDownstreamErrorPolicy: ReturnType<typeof parseDownstreamErrorPolicyConfig> | undefined;
+
+    if (body.systemProxyUrl !== undefined) {
+      const rawSystemProxyUrl = String(body.systemProxyUrl || '').trim();
+      if (rawSystemProxyUrl && !normalizeSiteProxyUrl(rawSystemProxyUrl)) {
+        return reply.code(400).send({ success: false, message: '系统代理地址无效，请填写合法的 http(s)/socks 代理 URL' });
+      }
+    }
+    if (body.payloadRules !== undefined) {
+      const parsedPayloadRules = parsePayloadRulesConfigInput(body.payloadRules);
+      if (!parsedPayloadRules.success) {
+        return reply.code(400).send({ success: false, message: parsedPayloadRules.message });
+      }
+      pendingPayloadRules = parsedPayloadRules.normalized;
+    }
+    if (body.adminIpAllowlist !== undefined) {
+      const nextAllowlist = toStringList(body.adminIpAllowlist);
+      if (nextAllowlist.length > 0 && !isIpAllowed(currentRequestIp, nextAllowlist)) {
+        return reply.code(400).send({
+          success: false,
+          message: `保存失败：当前请求 IP（${currentRequestIp || 'unknown'}）不在新白名单中。请至少保留当前 IP，避免把自己锁出后台。`,
+        });
+      }
+    }
+
+    if (body.globalBlockedBrands !== undefined && !Array.isArray(body.globalBlockedBrands)) {
+      return reply.code(400).send({ error: 'globalBlockedBrands must be an array of strings' });
+    }
+    if (body.globalAllowedModels !== undefined && !Array.isArray(body.globalAllowedModels)) {
+      return reply.code(400).send({ error: 'globalAllowedModels must be an array of strings' });
+    }
+    if (body.downstreamErrorPolicy !== undefined) {
+      try {
+        pendingDownstreamErrorPolicy = parseDownstreamErrorPolicyConfig(body.downstreamErrorPolicy);
+        await validateDownstreamErrorPolicyReferences(pendingDownstreamErrorPolicy);
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '下游终态错误策略格式无效',
+        });
+      }
+    }
 
     const webhookTouched = body.webhookUrl !== undefined || body.webhookEnabled !== undefined;
     const nextWebhookUrl = body.webhookUrl !== undefined
@@ -1157,20 +1224,11 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
 
     if (body.payloadRules !== undefined) {
-      const parsedPayloadRules = parsePayloadRulesConfigInput(body.payloadRules);
-      if (!parsedPayloadRules.success) {
-        return reply.code(400).send({
-          success: false,
-          message: parsedPayloadRules.message,
-        });
-      }
-
       const previousRules = JSON.stringify(config.payloadRules);
-      const nextRules = JSON.stringify(parsedPayloadRules.normalized);
+      const nextRules = JSON.stringify(pendingPayloadRules);
       if (previousRules !== nextRules) {
         changedLabels.push('Payload 规则');
       }
-      pendingPayloadRules = parsedPayloadRules.normalized;
     }
 
     if (body.modelAvailabilityProbeEnabled !== undefined) {
@@ -1457,9 +1515,6 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
 
     if (body.globalBlockedBrands !== undefined) {
-      if (!Array.isArray(body.globalBlockedBrands)) {
-        return reply.code(400).send({ error: 'globalBlockedBrands must be an array of strings' });
-      }
       const nextBrands = body.globalBlockedBrands.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
       const uniqueBrands = Array.from(new Set(nextBrands));
       const prev = JSON.stringify(config.globalBlockedBrands);
@@ -1482,9 +1537,6 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
 
     if (body.globalAllowedModels !== undefined) {
-      if (!Array.isArray(body.globalAllowedModels)) {
-        return reply.code(400).send({ error: 'globalAllowedModels must be an array of strings' });
-      }
       const nextModels = body.globalAllowedModels.filter((m): m is string => typeof m === 'string').map((m) => m.trim()).filter(Boolean);
       const uniqueModels = Array.from(new Set(nextModels));
       const prev = JSON.stringify(config.globalAllowedModels);
@@ -1759,6 +1811,15 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.tokenRouterFailureCooldownMaxSec = normalized;
       upsertSetting('token_router_failure_cooldown_max_sec', normalized);
+    }
+
+    if (pendingDownstreamErrorPolicy !== undefined) {
+      const nextPolicy = pendingDownstreamErrorPolicy;
+      if (JSON.stringify(nextPolicy) !== JSON.stringify(config.downstreamErrorPolicy)) {
+        changedLabels.push('下游终态错误策略');
+      }
+      await upsertSetting('downstream_error_policy', nextPolicy);
+      config.downstreamErrorPolicy = nextPolicy;
     }
 
     if (pendingPayloadRules !== undefined) {
