@@ -43,11 +43,14 @@ function isTerminalEvent(payload: Record<string, unknown>): boolean {
 
 function isRuntimeErrorEvent(payload: Record<string, unknown>): boolean {
   const type = asTrimmedString(payload.type);
-  return type === 'error';
+  return type === 'error' || type === 'response.failed';
 }
 
 function asFiniteNumber(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || !/^\d{3}$/.test(value.trim())) return undefined;
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function extractFailureTerminalStatus(payload: Record<string, unknown>): number {

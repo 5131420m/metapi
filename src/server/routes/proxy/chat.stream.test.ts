@@ -538,6 +538,7 @@ describe('chat proxy stream behavior', () => {
     });
 
     expect(response.statusCode).toBe(502);
+
     expect(response.headers['content-type']).not.toContain('text/event-stream');
     expect(response.json()?.error?.type).toBe('upstream_error');
     expect(response.json()?.error?.message).toContain('empty content');
@@ -945,6 +946,7 @@ describe('chat proxy stream behavior', () => {
         messages: [{ role: 'user', content: 'hello' }],
       },
     });
+
 
     expect(response.statusCode, response.body).toBe(200);
     expect(response.headers['content-type']).toContain('text/event-stream');
@@ -1789,7 +1791,7 @@ describe('chat proxy stream behavior', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it('replays downgraded chat-completions SSE for websocket transport without requiring native responses terminals', async () => {
+  it('does not trust a public header as an internal websocket transport marker', async () => {
     fetchModelPricingCatalogMock.mockResolvedValue({
       models: [
         {
@@ -1823,18 +1825,20 @@ describe('chat proxy stream behavior', () => {
       },
       payload: {
         model: 'gpt-5.2',
+        previous_response_id: 'resp_untrusted_public_marker',
         input: 'hello',
         stream: true,
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.headers['content-type']).toContain('text/event-stream');
-    expect(response.body).toContain('response.output_item.added');
-    expect(response.body).toContain('response.output_text.delta');
-    expect(response.body).toContain('response.completed');
-    expect(response.body).not.toContain('response.failed');
-    expect(response.body).toContain('[DONE]');
+    expect(response.statusCode).toBe(400);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'invalid_request_error',
+      },
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('initializes reasoning items before emitting reasoning summary deltas on /v1/responses streams', async () => {
@@ -1940,7 +1944,45 @@ describe('chat proxy stream behavior', () => {
     expect(response.body).toContain('response.completed');
   });
 
-  it('emits response.failed without synthetic response.completed when upstream stream fails on /v1/responses', async () => {
+  it('returns an initial Claude error terminal as HTTP before committing Messages SSE', async () => {
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(
+          'event: error\ndata: {"type":"error","error":{"status":429,"type":"rate_limit_error","code":"rate_limit_exceeded","message":"claude quota exhausted"}}\n\n',
+        ));
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/messages',
+      payload: {
+        model: 'claude-opus-4-6',
+        stream: true,
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'hello' }],
+      },
+    });
+
+    expect(response.statusCode).toBe(429);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({
+      type: 'error',
+      error: { code: 'rate_limit_exceeded', message: 'claude quota exhausted' },
+    });
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      status: 429,
+      errorText: 'claude quota exhausted',
+    }));
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+  });
+
+  it('returns a pre-commit HTTP failure without synthetic response.completed when upstream stream fails before meaningful output on /v1/responses', async () => {
     fetchModelPricingCatalogMock.mockResolvedValue({
       models: [
         {
@@ -1976,11 +2018,15 @@ describe('chat proxy stream behavior', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('response.failed');
-    expect(response.body).toContain('"status":"failed"');
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'upstream_error',
+        message: 'upstream stream failed',
+      },
+    });
     expect(response.body).not.toContain('response.completed');
-    expect(response.body).toContain('[DONE]');
   });
 
   it('preserves Responses-specific payload fields and forwards openai headers on /v1/responses', async () => {

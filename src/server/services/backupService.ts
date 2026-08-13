@@ -6,6 +6,8 @@ import { upsertSetting } from '../db/upsertSetting.js';
 import { mergeAccountExtraConfig } from './accountExtraConfig.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { PLATFORM_ALIASES, detectPlatformByUrlHint } from '../../shared/platformIdentity.js';
+import { parseDownstreamErrorPolicyConfig } from './downstreamErrorPolicy.js';
+
 
 const BACKUP_VERSION = '2.1';
 
@@ -1300,7 +1302,66 @@ function isSettingValueAcceptable(key: string, value: unknown): boolean {
     return keys.every((weightKey) => value[weightKey] === undefined || isFiniteNumber(value[weightKey]));
   }
 
+  if (key === 'downstream_error_policy') {
+    if (isRecord(value) && Array.isArray(value.downstreamApiKeyKeys)) {
+      if (value.mode === 'cpa-hermes-resilient') {
+        if (value.downstreamApiKeyKeys.length === 0) return false;
+        const keys = value.downstreamApiKeyKeys.filter(
+          (key): key is string => typeof key === 'string' && key.trim().length > 0,
+        );
+        return keys.length === value.downstreamApiKeyKeys.length && new Set(keys).size === keys.length;
+      }
+      return (value.mode === 'off' || value.mode === 'passthrough')
+        && value.downstreamApiKeyKeys.length === 0;
+    }
+    try {
+      parseDownstreamErrorPolicyConfig(value);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   return true;
+}
+
+async function hasExistingDownstreamErrorPolicyKeys(value: unknown): Promise<boolean> {
+  if (isRecord(value) && value.mode === 'cpa-hermes-resilient' && Array.isArray(value.downstreamApiKeyKeys)) {
+    const keys = value.downstreamApiKeyKeys.filter((key): key is string => typeof key === 'string' && key.trim().length > 0);
+    if (keys.length !== value.downstreamApiKeyKeys.length) return false;
+    const rows = await db.select({ key: schema.downstreamApiKeys.key }).from(schema.downstreamApiKeys).all();
+    const existing = new Set(rows.map((row: { key: string }) => row.key));
+    return keys.every((key) => existing.has(key));
+  }
+  if (!isRecord(value) || value.mode !== 'cpa-hermes-resilient' || !Array.isArray(value.downstreamApiKeyIds)) return true;
+  const ids = value.downstreamApiKeyIds.filter((id): id is number => typeof id === 'number');
+  if (ids.length !== value.downstreamApiKeyIds.length) return false;
+  const rows = await db.select({ id: schema.downstreamApiKeys.id })
+    .from(schema.downstreamApiKeys)
+    .all();
+  const existing = new Set(rows.map((row: { id: number }) => Number(row.id)));
+  return ids.every((id) => existing.has(id));
+}
+
+async function normalizeImportedDownstreamErrorPolicy(value: unknown): Promise<unknown> {
+  if (!isRecord(value) || !Array.isArray(value.downstreamApiKeyKeys)) return value;
+  if (value.mode === 'off' || value.mode === 'passthrough') {
+    if (value.downstreamApiKeyKeys.length !== 0) return null;
+    return { mode: value.mode, downstreamApiKeyIds: [] };
+  }
+  if (value.mode !== 'cpa-hermes-resilient') return null;
+  const rows = await db.select({ id: schema.downstreamApiKeys.id, key: schema.downstreamApiKeys.key }).from(schema.downstreamApiKeys).all();
+  const idByKey = new Map(rows.map((row: { id: number; key: string }) => [row.key, row.id]));
+  const keys = value.downstreamApiKeyKeys.filter((key): key is string => typeof key === 'string' && key.trim().length > 0);
+  if (
+    keys.length !== value.downstreamApiKeyKeys.length
+    || new Set(keys).size !== keys.length
+    || keys.some((key) => !idByKey.has(key))
+  ) return null;
+  return {
+    mode: value.mode,
+    downstreamApiKeyIds: keys.map((key) => idByKey.get(key)!),
+  };
 }
 
 async function exportAccountsSection(): Promise<AccountsBackupSection> {
@@ -1379,12 +1440,31 @@ async function exportAccountsSection(): Promise<AccountsBackupSection> {
   };
 }
 
-async function exportPreferencesSection(): Promise<PreferencesBackupSection> {
-  const settings = (await db.select().from(schema.settings).all())
-    .filter((row) => !EXCLUDED_SETTING_KEYS.has(row.key))
-    .map((row) => ({
+async function exportPreferencesSection(input?: {
+  includeDownstreamErrorPolicy?: boolean;
+}): Promise<PreferencesBackupSection> {
+  const [settingRows, downstreamApiKeys] = await Promise.all([
+    db.select().from(schema.settings).all(),
+    db.select({ id: schema.downstreamApiKeys.id, key: schema.downstreamApiKeys.key }).from(schema.downstreamApiKeys).all(),
+  ]);
+  const downstreamKeyById = new Map(downstreamApiKeys.map((row: { id: number; key: string }) => [row.id, row.key]));
+  const settings = settingRows
+    .filter((row: { key: string }) => !EXCLUDED_SETTING_KEYS.has(row.key))
+    .filter((row: { key: string }) => input?.includeDownstreamErrorPolicy !== false || row.key !== 'downstream_error_policy')
+    .map((row: { key: string; value: string }) => ({
       key: row.key,
-      value: parseSettingValue(row.value),
+      value: (() => {
+        const value = parseSettingValue(row.value);
+        if (row.key !== 'downstream_error_policy' || !isRecord(value)) return value;
+        const ids = Array.isArray(value.downstreamApiKeyIds) ? value.downstreamApiKeyIds : [];
+        return {
+          mode: value.mode,
+          downstreamApiKeyKeys: ids
+            .filter((id): id is number => typeof id === 'number')
+            .map((id) => downstreamKeyById.get(id))
+            .filter((key): key is string => !!key),
+        };
+      })(),
     }));
 
   return { settings };
@@ -1406,7 +1486,7 @@ export async function exportBackup(type: BackupExportType): Promise<BackupV2> {
       version: BACKUP_VERSION,
       timestamp: now,
       type: 'preferences',
-      preferences: await exportPreferencesSection(),
+      preferences: await exportPreferencesSection({ includeDownstreamErrorPolicy: false }),
     };
   }
 
@@ -1414,7 +1494,7 @@ export async function exportBackup(type: BackupExportType): Promise<BackupV2> {
     version: BACKUP_VERSION,
     timestamp: now,
     accounts: await exportAccountsSection(),
-    preferences: await exportPreferencesSection(),
+    preferences: await exportPreferencesSection({ includeDownstreamErrorPolicy: true }),
   };
 }
 
@@ -1532,6 +1612,25 @@ function detectImportMetadata(data: RawBackupData): {
 
 async function importAccountsSection(section: AccountsBackupSection): Promise<void> {
   const runtimeState = await collectCurrentRuntimeStateSnapshot();
+  const persistedPolicyRow = await db.select({ value: schema.settings.value })
+    .from(schema.settings)
+    .where(eq(schema.settings.key, 'downstream_error_policy'))
+    .get();
+  let persistedPolicyKeys: string[] | null = null;
+  if (persistedPolicyRow) {
+    try {
+      const policy = parseSettingValue(persistedPolicyRow.value);
+      if (isRecord(policy) && policy.mode === 'cpa-hermes-resilient' && Array.isArray(policy.downstreamApiKeyIds)) {
+        const keyById = new Map(Array.from(runtimeState.downstreamApiKeyIdByKey, ([key, id]) => [id, key]));
+        persistedPolicyKeys = policy.downstreamApiKeyIds
+          .filter((id): id is number => typeof id === 'number')
+          .map((id) => keyById.get(id))
+          .filter((key): key is string => !!key);
+      }
+    } catch {
+      persistedPolicyKeys = null;
+    }
+  }
   const importedIndexes = buildRuntimeIdentityIndexesFromSection(section);
   const shouldReplaceSiteDisabledModels = Array.isArray(section.siteDisabledModels);
   const shouldReplaceManualModels = Array.isArray(section.manualModels);
@@ -1814,6 +1913,15 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<vo
         );
         downstreamApiKeyIdByKey.set(normalizedKey, downstreamApiKeyId);
       }
+      if (persistedPolicyKeys) {
+        const remappedIds = persistedPolicyKeys
+          .map((key) => downstreamApiKeyIdByKey.get(key))
+          .filter((id): id is number => typeof id === 'number');
+        const remappedPolicy = remappedIds.length > 0
+          ? { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: remappedIds }
+          : { mode: 'off', downstreamApiKeyIds: [] };
+        await upsertSetting('downstream_error_policy', remappedPolicy, tx);
+      }
     }
 
     for (const row of runtimeState.proxyLogs) {
@@ -1871,10 +1979,14 @@ async function importPreferencesSection(section: PreferencesBackupSection): Prom
 
   await db.transaction(async (tx) => {
     for (const row of section.settings) {
-      if (!isSettingValueAcceptable(row.key, row.value)) continue;
+      const normalizedValue = row.key === 'downstream_error_policy'
+        ? await normalizeImportedDownstreamErrorPolicy(row.value)
+        : row.value;
+      if (normalizedValue === null || !isSettingValueAcceptable(row.key, normalizedValue)) continue;
+      if (row.key === 'downstream_error_policy' && !await hasExistingDownstreamErrorPolicyKeys(normalizedValue)) continue;
 
-      await upsertSetting(row.key, row.value, tx);
-      applied.push({ key: row.key, value: row.value });
+      await upsertSetting(row.key, normalizedValue, tx);
+      applied.push({ key: row.key, value: normalizedValue });
     }
   });
 

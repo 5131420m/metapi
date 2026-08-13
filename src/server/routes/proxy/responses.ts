@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { handleOpenAiResponsesSurfaceRequest } from '../../proxy-core/surfaces/openAiResponsesSurface.js';
 import { ensureResponsesWebsocketTransport } from './responsesWebsocket.js';
+import { getResponsesWebsocketBridgeContext } from './responsesWebsocketBridgeContext.js';
 
 function resolveAliasedResponsesDownstreamPath(
   request: FastifyRequest,
@@ -26,7 +27,20 @@ export async function responsesProxyRoute(app: FastifyInstance) {
   ensureResponsesWebsocketTransport(app);
 
   app.post('/v1/responses', async (request: FastifyRequest, reply: FastifyReply) =>
-    handleOpenAiResponsesSurfaceRequest(request, reply, '/v1/responses'));
+    handleOpenAiResponsesSurfaceRequest(
+      request,
+      reply,
+      '/v1/responses',
+      (() => {
+        const bridge = getResponsesWebsocketBridgeContext(request.raw);
+        return bridge
+          ? {
+            responsesWebsocketTransport: true,
+            preserveWebsocketIncrementalMode: bridge.preserveIncrementalMode,
+          }
+          : undefined;
+      })(),
+    ));
   app.get('/v1/responses', async (_request: FastifyRequest, reply: FastifyReply) =>
     reply.code(426).send({
       error: {

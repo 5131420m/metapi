@@ -9,6 +9,7 @@ import {
   serializeResponsesUpstreamFinalAsStream,
 } from './streamBridge.js';
 import { config } from '../../../config.js';
+import { extractTypedStreamFailure, type TypedStreamFailure } from '../../shared/streamFailure.js';
 
 type StreamReader = {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -23,6 +24,8 @@ type ResponseSink = {
 type ResponsesProxyStreamResult = {
   status: 'completed' | 'failed';
   errorMessage: string | null;
+  failure?: TypedStreamFailure;
+  meaningfulOutputSeen?: boolean;
 };
 
 type ResponsesProxyStreamSessionInput = {
@@ -95,9 +98,32 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
     || input.successfulUpstreamPath.endsWith('/responses/compact');
   let finalized = false;
   let terminalEventSeen = false;
+  let meaningfulOutputSeen = false;
+  const pendingWrites: string[] = [];
   let terminalResult: ResponsesProxyStreamResult = {
     status: 'completed',
     errorMessage: null,
+  };
+
+  const flushPendingWrites = () => {
+    if (pendingWrites.length <= 0) return;
+    input.writeLines([...pendingWrites]);
+    pendingWrites.length = 0;
+  };
+
+  const writeLines = (lines: string[], meaningful = false) => {
+    if (lines.length <= 0) return;
+    if (meaningfulOutputSeen) {
+      input.writeLines(lines);
+      return;
+    }
+    if (meaningful) {
+      meaningfulOutputSeen = true;
+      flushPendingWrites();
+      input.writeLines(lines);
+      return;
+    }
+    pendingWrites.push(...lines);
   };
 
   const finalize = () => {
@@ -107,17 +133,24 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
       status: 'completed',
       errorMessage: null,
     };
-    input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+    writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()), true);
   };
 
   const fail = (payload: unknown, fallbackMessage?: string) => {
     if (finalized) return;
     finalized = true;
+    const failure = extractTypedStreamFailure(payload, fallbackMessage);
     terminalResult = {
       status: 'failed',
-      errorMessage: getResponsesStreamFailureMessage(payload, fallbackMessage),
+      errorMessage: failure.message,
+      failure,
+      meaningfulOutputSeen,
     };
-    input.writeLines(failResponsesStream(responsesState, streamContext, input.getUsage(), payload));
+    if (meaningfulOutputSeen) {
+      input.writeLines(failResponsesStream(responsesState, streamContext, input.getUsage(), payload));
+    } else {
+      pendingWrites.length = 0;
+    }
   };
 
   const complete = () => {
@@ -132,7 +165,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
   const closeOut = () => {
     if (finalized) {
       if (terminalEventSeen) {
-        input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+        writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()), true);
       }
       return;
     }
@@ -213,7 +246,9 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         }, 'Upstream returned empty content');
         return true;
       }
-      input.writeLines(convertedLines);
+      const meaningful = hasMeaningfulAggregateOutput(responsesState)
+        || (isRecord(parsedPayload.response) && hasMeaningfulResponsesPayloadOutput(parsedPayload.response));
+      writeLines(convertedLines, meaningful);
       if (eventBlock.event === 'response.completed' || payloadType === 'response.completed' || isIncompleteEvent) {
         terminalEventSeen = true;
         complete();
@@ -221,12 +256,12 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
       return false;
     }
 
-    input.writeLines(serializeConvertedResponsesEvents({
+    writeLines(serializeConvertedResponsesEvents({
       state: responsesState,
       streamContext,
       event: { contentDelta: eventBlock.data },
       usage: input.getUsage(),
-    }));
+    }), true);
     return false;
   };
 
@@ -275,7 +310,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         status: 'completed',
         errorMessage: null,
       };
-      input.writeLines(lines);
+      writeLines(lines, true);
       response?.end();
       return terminalResult;
     },
@@ -288,7 +323,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         onEof: closeOut,
         onReadError: (error) => {
           if (terminalEventSeen || finalized) {
-            input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+            writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()), true);
             return;
           }
           fail(

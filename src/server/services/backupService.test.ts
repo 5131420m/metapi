@@ -190,7 +190,7 @@ describe('backupService', () => {
       },
     ]).run();
 
-    await db.insert(schema.downstreamApiKeys).values({
+    const exportedDownstreamKey = await db.insert(schema.downstreamApiKeys).values({
       name: 'Shared Downstream',
       key: 'downstream-roundtrip-key',
       description: 'shared quota',
@@ -212,6 +212,13 @@ describe('backupService', () => {
       lastUsedAt: now,
       createdAt: now,
       updatedAt: now,
+    }).returning().get();
+    await db.insert(schema.settings).values({
+      key: 'downstream_error_policy',
+      value: JSON.stringify({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [exportedDownstreamKey.id],
+      }),
     }).run();
 
     const exported = await backupService.exportBackup('all') as any;
@@ -275,8 +282,15 @@ describe('backupService', () => {
     const restoredDisabledModels = await db.select().from(schema.siteDisabledModels).all();
     const restoredModelAvailability = await db.select().from(schema.modelAvailability).all();
     const restoredDownstreamKeys = await db.select().from(schema.downstreamApiKeys).all();
+    const restoredPolicy = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, 'downstream_error_policy'))
+      .get();
 
     expect(restoredSite?.proxyUrl).toBe('http://127.0.0.1:8080');
+    expect(JSON.parse(String(restoredPolicy?.value))).toEqual({
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [restoredDownstreamKeys[0].id],
+    });
     expect(restoredSite?.externalCheckinUrl).toBe('https://checkin.roundtrip.example.com');
     expect(restoredSite?.useSystemProxy).toBe(true);
     expect(restoredSite?.customHeaders).toBe('{"cf-access-client-id":"roundtrip-client"}');
@@ -370,6 +384,80 @@ describe('backupService', () => {
     expect(savedKeys).not.toContain('db_type');
     expect(savedKeys).not.toContain('db_url');
     expect(savedKeys).not.toContain('db_ssl');
+  });
+
+  it('rejects invalid downstream error policy from a preferences backup', async () => {
+    const result = await backupService.importBackup({
+      version: '2.1',
+      timestamp: Date.now(),
+      type: 'preferences',
+      preferences: {
+        settings: [{
+          key: 'downstream_error_policy',
+          value: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [] },
+        }],
+      },
+    });
+
+    expect(result.appliedSettings).toEqual([]);
+    const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'downstream_error_policy')).get();
+    expect(saved).toBeUndefined();
+  });
+
+  it('rejects a preferences-only resilient policy whose downstream keys do not exist', async () => {
+    const result = await backupService.importBackup({
+      version: '2.1',
+      timestamp: Date.now(),
+      type: 'preferences',
+      preferences: {
+        settings: [{
+          key: 'downstream_error_policy',
+          value: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [999999] },
+        }],
+      },
+    });
+
+    expect(result.appliedSettings).toEqual([]);
+  });
+
+  it('normalizes an imported off policy from stable-key backup form', async () => {
+    const result = await backupService.importBackup({
+      version: '2.1',
+      timestamp: Date.now(),
+      type: 'preferences',
+      preferences: {
+        settings: [{
+          key: 'downstream_error_policy',
+          value: { mode: 'off', downstreamApiKeyKeys: [] },
+        }],
+      },
+    });
+
+    expect(result.appliedSettings).toEqual([{
+      key: 'downstream_error_policy',
+      value: { mode: 'off', downstreamApiKeyIds: [] },
+    }]);
+  });
+
+  it('does not export a resilient policy in a preferences-only backup without its dedicated keys', async () => {
+    const dedicatedKey = await db.insert(schema.downstreamApiKeys).values({
+      name: 'preferences-only dedicated key',
+      key: 'sk-preferences-only-dedicated-key',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.settings).values({
+      key: 'downstream_error_policy',
+      value: JSON.stringify({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [dedicatedKey.id],
+      }),
+    }).run();
+
+    const exported = await backupService.exportBackup('preferences') as any;
+
+    expect(exported.preferences.settings).not.toContainEqual(expect.objectContaining({
+      key: 'downstream_error_policy',
+    }));
   });
 
   it('preserves local logs and runtime stats when importing account backups', async () => {
@@ -707,6 +795,14 @@ describe('backupService', () => {
       updatedAt: exportedAt,
     }).returning().get();
 
+    await db.insert(schema.settings).values({
+      key: 'downstream_error_policy',
+      value: JSON.stringify({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [downstreamKey.id],
+      }),
+    }).run();
+
     const exported = await backupService.exportBackup('accounts') as any;
     expect(exported.version).toBe('2.1');
 
@@ -916,6 +1012,10 @@ describe('backupService', () => {
     const restoredTokenAvailability = await db.select().from(schema.tokenModelAvailability).all();
     const restoredAnnouncements = await db.select().from(schema.siteAnnouncements).all();
     const restoredDownstreamKeys = await db.select().from(schema.downstreamApiKeys).all();
+    const restoredPolicy = await db.select()
+      .from(schema.settings)
+      .where(eq(schema.settings.key, 'downstream_error_policy'))
+      .get();
     const restoredProxyLogs = await db.select().from(schema.proxyLogs).all();
     const restoredCheckinLogs = await db.select().from(schema.checkinLogs).all();
     const restoredEvents = await db.select().from(schema.events).all();
@@ -923,6 +1023,10 @@ describe('backupService', () => {
     const restoredProxyFiles = await db.select().from(schema.proxyFiles).all();
 
     expect(restoredSite?.name).toBe('backup-site');
+    expect(JSON.parse(String(restoredPolicy?.value))).toEqual({
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [restoredDownstreamKeys[0]?.id],
+    });
     expect(restoredRoute?.displayName).toBe('backup-route');
     expect(restoredAccount?.balanceUsed).toBe(99);
     expect(restoredAccount?.lastCheckinAt).toBe(localRuntimeAt);

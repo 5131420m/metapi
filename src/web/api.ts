@@ -415,6 +415,10 @@ export type RuntimeSettingsPayload = {
   routingWeights?: RuntimeRoutingWeightsPayload;
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
+  downstreamErrorPolicy?: {
+    mode: 'off' | 'passthrough' | 'cpa-hermes-resilient';
+    downstreamApiKeyIds: number[];
+  };
   globalBlockedBrands?: string[];
   globalAllowedModels?: string[];
 };

@@ -234,9 +234,11 @@ describe('createResponsesProxyStreamSession', () => {
       },
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: 'failed',
       errorMessage: 'upstream stream interrupted',
+      failure: { status: 502, message: 'upstream stream interrupted' },
+      meaningfulOutputSeen: true,
     });
     expect(ended).toBe(true);
     const output = lines.join('');
@@ -298,6 +300,66 @@ describe('createResponsesProxyStreamSession', () => {
     expect(output).toContain('event: response.completed');
     expect(output).not.toContain('event: response.failed');
     expect(output).toContain('data: [DONE]');
+  });
+
+
+  it('buffers an initial response.failed terminal and returns its typed upstream failure', async () => {
+    const lines: string[] = [];
+    const payload = {
+      type: 'response.failed',
+      response: {
+        id: 'resp_failed_precommit',
+        status: 'failed',
+        error: {
+          status: '429',
+          type: 'rate_limit_error',
+          code: 'rate_limit_exceeded',
+          message: 'quota exhausted upstream',
+        },
+      },
+    };
+    const chunk = `event: response.failed\ndata: ${JSON.stringify(payload)}\n\ndata: [DONE]\n\n`;
+    let reads = 0;
+    const reader = {
+      async read() {
+        reads += 1;
+        return reads === 1
+          ? { done: false, value: new TextEncoder().encode(chunk) }
+          : { done: true };
+      },
+      async cancel() { return undefined; },
+      releaseLock() {},
+    };
+    const session = createResponsesProxyStreamSession({
+      modelName: 'gpt-5',
+      successfulUpstreamPath: '/v1/responses',
+      getUsage: () => ({
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        promptTokensIncludeCache: null,
+      }),
+      writeLines: (nextLines) => lines.push(...nextLines),
+      writeRaw: (chunk) => lines.push(chunk),
+    });
+
+    const result = await session.run(reader as any, { end() {} });
+
+    expect(result).toEqual({
+      status: 'failed',
+      errorMessage: 'quota exhausted upstream',
+      failure: {
+        status: 429,
+        type: 'rate_limit_error',
+        code: 'rate_limit_exceeded',
+        message: 'quota exhausted upstream',
+        payload,
+      },
+      meaningfulOutputSeen: false,
+    });
+    expect(lines).toEqual([]);
   });
 
   it('preserves non-SSE incomplete fallback payloads as response.incomplete', () => {

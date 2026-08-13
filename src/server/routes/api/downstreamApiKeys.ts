@@ -1,6 +1,8 @@
 import { FastifyInstance } from 'fastify';
 import { and, eq, inArray, sql, type SQL } from 'drizzle-orm';
 import { db, hasProxyLogDownstreamApiKeyIdColumn, runtimeDbDialect, schema } from '../../db/index.js';
+import { upsertSetting } from '../../db/upsertSetting.js';
+import { config } from '../../config.js';
 import { insertAndGetById } from '../../db/insertHelpers.js';
 import {
   getDownstreamApiKeyById,
@@ -22,6 +24,7 @@ import {
   parseDownstreamApiKeyBatchPayload,
   parseDownstreamApiKeyPayload,
 } from '../../contracts/downstreamApiKeyRoutePayloads.js';
+import { parseDownstreamErrorPolicyConfig } from '../../services/downstreamErrorPolicy.js';
 
 function parseRouteId(raw: string): number | null {
   const id = Number.parseInt(raw, 10);
@@ -83,6 +86,32 @@ function normalizeBatchIds(raw: unknown): number[] {
     if (ids.length >= 500) break;
   }
   return ids;
+}
+
+function resolvePolicyAfterDownstreamKeyRemoval(id: number) {
+  if (
+    config.downstreamErrorPolicy.mode !== 'cpa-hermes-resilient'
+    || !config.downstreamErrorPolicy.downstreamApiKeyIds.includes(id)
+  ) return null;
+  const remainingIds = config.downstreamErrorPolicy.downstreamApiKeyIds.filter((keyId) => keyId !== id);
+  return remainingIds.length > 0
+    ? parseDownstreamErrorPolicyConfig({ mode: 'cpa-hermes-resilient', downstreamApiKeyIds: remainingIds })
+    : parseDownstreamErrorPolicyConfig({ mode: 'off', downstreamApiKeyIds: [] });
+}
+
+async function deleteDownstreamApiKeyAndCleanupPolicy(id: number): Promise<void> {
+  const nextPolicy = resolvePolicyAfterDownstreamKeyRemoval(id);
+  await db.transaction(async (tx: typeof db) => {
+    await tx.delete(schema.downstreamApiKeys)
+      .where(eq(schema.downstreamApiKeys.id, id))
+      .run();
+    if (nextPolicy) {
+      await upsertSetting('downstream_error_policy', nextPolicy, tx);
+    }
+  });
+  if (nextPolicy) {
+    config.downstreamErrorPolicy = nextPolicy;
+  }
 }
 
 type DownstreamKeyRange = DownstreamKeyTrendRange;
@@ -676,9 +705,7 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
       return reply.code(404).send({ success: false, message: 'API key 不存在' });
     }
 
-    await db.delete(schema.downstreamApiKeys)
-      .where(eq(schema.downstreamApiKeys.id, id))
-      .run();
+    await deleteDownstreamApiKeyAndCleanupPolicy(id);
 
     return { success: true };
   });
@@ -731,9 +758,7 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
         }
 
         if (action === 'delete') {
-          await db.delete(schema.downstreamApiKeys)
-            .where(eq(schema.downstreamApiKeys.id, id))
-            .run();
+          await deleteDownstreamApiKeyAndCleanupPolicy(id);
         } else if (action === 'resetUsage') {
           await db.update(schema.downstreamApiKeys).set({
             usedCost: 0,

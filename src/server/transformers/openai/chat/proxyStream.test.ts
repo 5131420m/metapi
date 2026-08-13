@@ -39,6 +39,27 @@ function createSession(lines: string[], downstreamFormat: 'openai' | 'claude' = 
 }
 
 describe('createChatProxyStreamSession reader failures', () => {
+  it('preserves a top-level HTTP status from an error event', async () => {
+    const writes: string[] = [];
+    const session = createChatProxyStreamSession({
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.6',
+      successfulUpstreamPath: '/v1/chat/completions',
+      writeLines: (lines) => writes.push(...lines),
+      writeRaw: (chunk) => writes.push(chunk),
+    });
+    const reader = createScriptedReader([
+      'event: error\ndata: {"type":"error","status":429,"error":{"type":"rate_limit_error","message":"quota"}}\n\n',
+    ]);
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      failure: { status: 429, type: 'rate_limit_error', message: 'quota' },
+    });
+  });
+
   it('converts reader failures into an in-band upstream_error terminal', async () => {
     const lines: string[] = [];
     let ended = false;
@@ -54,9 +75,11 @@ describe('createChatProxyStreamSession reader failures', () => {
       },
     });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: 'failed',
       errorMessage: 'upstream stream interrupted',
+      failure: { status: 502, message: 'upstream stream interrupted' },
+      meaningfulOutputSeen: true,
     });
     expect(ended).toBe(true);
     const output = lines.join('');
@@ -127,5 +150,41 @@ describe('createChatProxyStreamSession reader failures', () => {
     expect(output).toContain('event: error');
     expect(output).toContain('claude upstream interrupted');
     expect(output).not.toContain('data: [DONE]');
+  });
+
+  it('marks a native Claude error event as a failed stream terminal', async () => {
+    const lines: string[] = [];
+    const session = createSession(lines, 'claude');
+    const reader = createScriptedReader([
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","code":"rate_limit_exceeded","status":429,"message":"upstream overloaded"}}\n\n',
+    ]);
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toEqual({
+      status: 'failed',
+      errorMessage: 'upstream overloaded',
+      failure: {
+        status: 429,
+        type: 'api_error',
+        code: 'rate_limit_exceeded',
+        message: 'upstream overloaded',
+        payload: {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            code: 'rate_limit_exceeded',
+            status: 429,
+            message: 'upstream overloaded',
+          },
+        },
+      },
+      meaningfulOutputSeen: false,
+    });
+    expect(lines).toEqual([]);
+    const output = lines.join('');
+    expect(output).not.toContain('event: error');
+    expect(output).not.toContain('upstream overloaded');
+    expect(output).not.toContain('event: message_stop');
   });
 });
