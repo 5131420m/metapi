@@ -3041,16 +3041,6 @@ export default function Accounts() {
                                   {actionLoading[`status-toggle-${a.id}`] ? <span className="spinner spinner-sm" /> : (a.status === "disabled" ? "启用" : "禁用")}
                                 </button>
                               )}
-                              {connectionMode === "apikey" && (
-                                <button
-                                  type="button"
-                                  onClick={() => void handleCheckModels(a.id)}
-                                  disabled={!!actionLoading[`models-${a.id}`]}
-                                  className="btn btn-link btn-link-info"
-                                >
-                                  {actionLoading[`models-${a.id}`] ? <span className="spinner spinner-sm" /> : "刷新模型"}
-                                </button>
-                              )}
                               {capabilities.canRefreshBalance && (
                                 <button
                                   onClick={() =>
@@ -3383,16 +3373,6 @@ export default function Accounts() {
                                   className="btn btn-link btn-link-primary"
                                 >
                                   {actionLoading[`status-toggle-${a.id}`] ? <span className="spinner spinner-sm" /> : (a.status === "disabled" ? "启用" : "禁用")}
-                                </button>
-                              )}
-                              {connectionMode === "apikey" && (
-                                <button
-                                  type="button"
-                                  onClick={() => void handleCheckModels(a.id)}
-                                  disabled={!!actionLoading[`models-${a.id}`]}
-                                  className="btn btn-link btn-link-info"
-                                >
-                                  {actionLoading[`models-${a.id}`] ? <span className="spinner spinner-sm" /> : "刷新模型"}
                                 </button>
                               )}
                               {capabilities.canRefreshBalance && (

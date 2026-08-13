@@ -206,4 +206,44 @@ describe('Accounts batch actions', () => {
       root?.unmount();
     }
   });
+
+  it('keeps API Key enable controls without a row model-refresh shortcut', async () => {
+    apiMock.getAccounts.mockResolvedValue([{
+      id: 2,
+      siteId: 1,
+      username: '',
+      accessToken: '',
+      apiToken: 'sk-apikey',
+      credentialMode: 'apikey',
+      status: 'active',
+      site: { id: 1, name: 'Site A', status: 'active', platform: 'new-api' },
+    }]);
+
+    let root!: WebTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter initialEntries={['/accounts?segment=apikey']}>
+            <ToastProvider><Accounts /></ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const row = root.root.find((node) => node.props['data-testid'] === 'account-row-2');
+      const rowButtonLabels = row
+        .findAll((node) => node.type === 'button')
+        .flatMap((node) => node.children)
+        .filter((child): child is string => typeof child === 'string');
+
+      expect(rowButtonLabels).toContain('禁用');
+      expect(rowButtonLabels).not.toContain('刷新模型');
+
+      const checkbox = root.root.find((node) => node.props['data-testid'] === 'account-select-2');
+      await act(async () => checkbox.props.onChange({ target: { checked: true } }));
+      expect(root.root.find((node) => node.props['data-testid'] === 'accounts-batch-refresh-models')).toBeTruthy();
+    } finally {
+      root?.unmount();
+    }
+  });
 });
