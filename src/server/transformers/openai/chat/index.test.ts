@@ -316,7 +316,7 @@ describe('openAiChatTransformer.outbound', () => {
     expect((normalized as any).citations).toEqual(['https://shared.example/citation']);
   });
 
-  it('maps final Responses payload terminal statuses to sub2api-like chat finish reasons', () => {
+  it('maps final Responses payload terminal statuses to chat finish reasons', () => {
     const incompleteStop = openAiChatTransformer.transformFinalResponse({
       id: 'resp_final_stop',
       object: 'response',
@@ -336,7 +336,7 @@ describe('openAiChatTransformer.outbound', () => {
       output: [],
     }, 'gpt-5');
 
-    const failedStop = openAiChatTransformer.transformFinalResponse({
+    const failedResponse = openAiChatTransformer.transformFinalResponse({
       id: 'resp_final_failed',
       object: 'response',
       model: 'gpt-5',
@@ -364,13 +364,13 @@ describe('openAiChatTransformer.outbound', () => {
       }],
     });
 
-    expect(openAiChatTransformer.serializeFinalResponse(failedStop, {
+    expect(openAiChatTransformer.serializeFinalResponse(failedResponse, {
       promptTokens: 1,
       completionTokens: 1,
       totalTokens: 2,
     })).toMatchObject({
       choices: [{
-        finish_reason: 'stop',
+        finish_reason: 'error',
       }],
     });
   });
@@ -620,7 +620,7 @@ describe('openAiChatTransformer.stream', () => {
     });
   });
 
-  it('serializes response.failed terminal events with stop finish_reason instead of error', () => {
+  it('does not serialize response.failed as a successful stop terminal', () => {
     const context = openAiChatTransformer.createStreamContext('gpt-5');
     const event = openAiChatTransformer.transformStreamEvent({
       type: 'response.failed',
@@ -635,9 +635,14 @@ describe('openAiChatTransformer.stream', () => {
       openAiChatTransformer.serializeStreamEvent(event, context, createClaudeDownstreamContext()),
     );
 
-    expect((payloads[0] as any).choices[0]).toMatchObject({
-      finish_reason: 'stop',
+    expect(payloads).toHaveLength(1);
+    expect(payloads[0]).toMatchObject({
+      error: {
+        type: 'upstream_error',
+        message: 'upstream stream failed',
+      },
     });
+    expect((payloads[0] as any).choices?.[0]?.finish_reason).not.toBe('stop');
   });
 
   it('serializes multi-choice stream chunks without collapsing choice-specific deltas', () => {

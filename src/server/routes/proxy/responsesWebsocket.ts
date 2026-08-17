@@ -22,6 +22,7 @@ import { applyOpenAiServiceTierPolicy } from '../../proxy-core/serviceTierPolicy
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { reportProxyAllFailed } from '../../services/alertService.js';
 import { markResponsesWebsocketBridgeRequest } from './responsesWebsocketBridgeContext.js';
+import { sanitizePostcommitFailureMessage } from '../../services/downstreamErrorPolicy.js';
 
 const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
@@ -284,8 +285,9 @@ function writeResponsesWebsocketError(
   status: number,
   message: string,
   errorPayload?: unknown,
+  downstreamApiKeyId: number | null = null,
 ) {
-  socket.send(JSON.stringify({
+  const payload = {
     type: 'error',
     status,
     error: isRecord(errorPayload) && isRecord(errorPayload.error)
@@ -294,7 +296,35 @@ function writeResponsesWebsocketError(
         type: status >= 500 ? 'server_error' : 'invalid_request_error',
         message,
       },
-  }));
+  };
+  socket.send(JSON.stringify(sanitizeResponsesWebsocketTerminalPayload(payload, downstreamApiKeyId)));
+}
+
+function sanitizeResponsesWebsocketTerminalPayload(
+  payload: unknown,
+  downstreamApiKeyId: number | null,
+): unknown {
+  if (!isRecord(payload)) return payload;
+  const type = asTrimmedString(payload.type);
+  if (type !== 'response.failed' && type !== 'error') return payload;
+  const response = isRecord(payload.response) ? payload.response : null;
+  const responseError = response && isRecord(response.error) ? response.error : null;
+  const topLevelError = isRecord(payload.error) ? payload.error : null;
+  const sourceError = responseError || topLevelError;
+  if (!sourceError || typeof sourceError.message !== 'string') return payload;
+  const message = sanitizePostcommitFailureMessage({
+    message: sourceError.message,
+    downstreamApiKeyId,
+    policy: config.downstreamErrorPolicy,
+  });
+  if (message === sourceError.message) return payload;
+  const cloned = cloneJsonObject(payload);
+  if (isRecord(cloned.response) && isRecord(cloned.response.error)) {
+    cloned.response.error = { ...cloned.response.error, message };
+  } else if (isRecord(cloned.error)) {
+    cloned.error = { ...cloned.error, message };
+  }
+  return cloned;
 }
 
 function synthesizePrewarmResponsePayloads(request: Record<string, unknown>) {
@@ -414,6 +444,7 @@ async function forwardResponsesRequestViaHttp(input: {
   payload: Record<string, unknown>;
   preserveIncrementalMode: boolean;
   authToken: string;
+  downstreamApiKeyId: number | null;
 }): Promise<unknown[] | null> {
   const injectHeaders: Record<string, string | string[]> = {
     ...buildInjectHeaders(input.request),
@@ -450,6 +481,7 @@ async function forwardResponsesRequestViaHttp(input: {
       response.statusCode,
       response.statusMessage || 'Upstream error',
       payload,
+      input.downstreamApiKeyId,
     );
     return null;
   }
@@ -462,30 +494,50 @@ async function forwardResponsesRequestViaHttp(input: {
       input.socket.send(JSON.stringify(payload));
       return output;
     } catch {
-      writeResponsesWebsocketError(input.socket, 502, 'Unexpected non-JSON websocket proxy response');
+      writeResponsesWebsocketError(
+        input.socket,
+        502,
+        'Unexpected non-JSON websocket proxy response',
+        undefined,
+        input.downstreamApiKeyId,
+      );
       return null;
     }
   }
 
   const pulled = openAiResponsesTransformer.pullSseEvents(response.body);
   const forwardedPayloads: unknown[] = [];
-  let sawTerminalPayload = false;
+  let terminalDelivered = false;
   for (const event of pulled.events) {
     if (event.data === '[DONE]') continue;
     try {
       const payload = JSON.parse(event.data);
+      if (terminalDelivered) break;
       forwardedPayloads.push(payload);
-      const type = isRecord(payload) ? asTrimmedString(payload.type) : '';
-      if (type === 'response.completed' || type === 'response.failed' || type === 'response.incomplete') {
-        sawTerminalPayload = true;
-      }
+      const eventType = asTrimmedString(event.event);
+      const payloadType = isRecord(payload) ? asTrimmedString(payload.type) : '';
+      const isTerminalEvent = eventType === 'response.completed'
+        || eventType === 'response.failed'
+        || eventType === 'response.incomplete'
+        || eventType === 'error';
+      const isTerminalPayload = payloadType === 'response.completed'
+        || payloadType === 'response.failed'
+        || payloadType === 'response.incomplete'
+        || payloadType === 'error';
       input.socket.send(JSON.stringify(payload));
+      terminalDelivered = isTerminalEvent || isTerminalPayload;
     } catch {
       // Ignore malformed SSE frames; the HTTP route already normalizes them.
     }
   }
-  if (!sawTerminalPayload) {
-    writeResponsesWebsocketError(input.socket, 408, 'stream closed before response.completed');
+  if (!terminalDelivered) {
+    writeResponsesWebsocketError(
+      input.socket,
+      408,
+      'stream closed before response.completed',
+      undefined,
+      input.downstreamApiKeyId,
+    );
   }
   return collectResponsesOutput(forwardedPayloads);
 }
@@ -751,7 +803,10 @@ async function handleResponsesWebsocketConnection(
               );
               lastResponseOutput = collectResponsesOutput(runtimeResult.events);
               for (const payload of runtimeResult.events) {
-                socket.send(JSON.stringify(payload));
+                socket.send(JSON.stringify(sanitizeResponsesWebsocketTerminalPayload(
+                  payload,
+                  authContext.source === 'managed' ? authContext.key?.id ?? null : null,
+                )));
               }
             } catch (error) {
               const runtimeError = unwrapCodexWebsocketRuntimeError(error);
@@ -763,6 +818,7 @@ async function handleResponsesWebsocketConnection(
                   payload: normalized.request,
                   preserveIncrementalMode: supportsIncrementalInput,
                   authToken: authContext.token,
+                  downstreamApiKeyId: authContext.source === 'managed' ? authContext.key?.id ?? null : null,
                 });
                 if (forwarded) {
                   lastResponseOutput = forwarded;
@@ -800,7 +856,10 @@ async function handleResponsesWebsocketConnection(
               void Promise.resolve(reportProxyAllFailed({ model: requestModel, reason: runtimeError.message })).catch(() => undefined);
               lastResponseOutput = collectResponsesOutput(runtimeError.events);
               for (const payload of runtimeError.events) {
-                socket.send(JSON.stringify(payload));
+                socket.send(JSON.stringify(sanitizeResponsesWebsocketTerminalPayload(
+                  payload,
+                  authContext.source === 'managed' ? authContext.key?.id ?? null : null,
+                )));
               }
               const emittedTerminalResponsesEvent = runtimeError.events.some((payload) => {
                 if (!isRecord(payload)) return false;
@@ -816,6 +875,7 @@ async function handleResponsesWebsocketConnection(
                   runtimeError.status || 408,
                   runtimeError.message,
                   runtimeError.payload,
+                  authContext.source === 'managed' ? authContext.key?.id ?? null : null,
                 );
               }
               try {
@@ -834,6 +894,7 @@ async function handleResponsesWebsocketConnection(
             payload: normalized.request,
             preserveIncrementalMode: supportsIncrementalInput,
             authToken: authContext.token,
+            downstreamApiKeyId: authContext.source === 'managed' ? authContext.key?.id ?? null : null,
           });
           if (forwarded) {
             lastResponseOutput = forwarded;

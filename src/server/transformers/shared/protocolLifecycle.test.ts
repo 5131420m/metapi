@@ -88,6 +88,95 @@ describe('createProxyStreamLifecycle', () => {
     expect(response.end).toHaveBeenCalledTimes(1);
   });
 
+  it('routes handler failures to onProcessingError before closing the response', async () => {
+    const events: string[] = [];
+    const onProcessingError = vi.fn(() => { events.push('processing'); });
+    const response = { end: vi.fn(() => { events.push('end'); }) };
+    let reads = 0;
+    const reader = {
+      async read() {
+        reads += 1;
+        return reads === 1
+          ? { done: false, value: new TextEncoder().encode('data: value\n\n') }
+          : { done: true };
+      },
+      async cancel() {},
+      releaseLock: vi.fn(),
+    };
+    const lifecycle = createProxyStreamLifecycle({
+      reader,
+      response,
+      pullEvents: () => ({ events: ['value'], rest: '' }),
+      handleEvent: () => {
+        throw new Error('handler failed');
+      },
+      onProcessingError,
+    } as any);
+
+    await lifecycle.run();
+
+    expect(onProcessingError).toHaveBeenCalledWith(expect.objectContaining({ message: 'handler failed' }));
+    expect(onProcessingError).toHaveBeenCalledTimes(1);
+    expect(response.end).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['processing', 'end']);
+  });
+  it('routes parser failures to onProcessingError before closing the response', async () => {
+    const events: string[] = [];
+    const onProcessingError = vi.fn(() => { events.push('processing'); });
+    const response = { end: vi.fn(() => { events.push('end'); }) };
+    const reader = {
+      async read() {
+        return { done: false, value: new TextEncoder().encode('data: value\n\n') };
+      },
+      async cancel() {},
+      releaseLock: vi.fn(),
+    };
+    const lifecycle = createProxyStreamLifecycle({
+      reader,
+      response,
+      pullEvents: () => {
+        throw new Error('parser failed');
+      },
+      handleEvent: () => {},
+      onProcessingError,
+    });
+
+    await lifecycle.run();
+
+    expect(onProcessingError).toHaveBeenCalledWith(expect.objectContaining({ message: 'parser failed' }));
+    expect(onProcessingError).toHaveBeenCalledTimes(1);
+    expect(response.end).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['processing', 'end']);
+  });
+
+  it('does not call onReadError for parser failures', async () => {
+    const onReadError = vi.fn();
+    const onProcessingError = vi.fn();
+    const response = { end: vi.fn() };
+    const reader = {
+      async read() {
+        return { done: false, value: new TextEncoder().encode('data: value\n\n') };
+      },
+      async cancel() {},
+      releaseLock: vi.fn(),
+    };
+    const lifecycle = createProxyStreamLifecycle({
+      reader,
+      response,
+      pullEvents: () => {
+        throw new Error('parser failed');
+      },
+      handleEvent: () => {},
+      onReadError,
+      onProcessingError,
+    });
+
+    await lifecycle.run();
+
+    expect(onReadError).not.toHaveBeenCalled();
+    expect(onProcessingError).toHaveBeenCalledTimes(1);
+  });
+
   it('rethrows reader failures when no onReadError handler is supplied', async () => {
     const response = { end: vi.fn() };
     const reader = {

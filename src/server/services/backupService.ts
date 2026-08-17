@@ -1610,7 +1610,7 @@ function detectImportMetadata(data: RawBackupData): {
   };
 }
 
-async function importAccountsSection(section: AccountsBackupSection): Promise<void> {
+async function importAccountsSection(section: AccountsBackupSection): Promise<Array<{ key: string; value: unknown }>> {
   const runtimeState = await collectCurrentRuntimeStateSnapshot();
   const persistedPolicyRow = await db.select({ value: schema.settings.value })
     .from(schema.settings)
@@ -1635,6 +1635,7 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<vo
   const shouldReplaceSiteDisabledModels = Array.isArray(section.siteDisabledModels);
   const shouldReplaceManualModels = Array.isArray(section.manualModels);
   const shouldReplaceDownstreamApiKeys = Array.isArray(section.downstreamApiKeys);
+  let appliedSettings: Array<{ key: string; value: unknown }> = [];
 
   await db.transaction(async (tx) => {
     if (shouldReplaceDownstreamApiKeys) {
@@ -1921,6 +1922,7 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<vo
           ? { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: remappedIds }
           : { mode: 'off', downstreamApiKeyIds: [] };
         await upsertSetting('downstream_error_policy', remappedPolicy, tx);
+        appliedSettings = [{ key: 'downstream_error_policy', value: remappedPolicy }];
       }
     }
 
@@ -1972,6 +1974,7 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<vo
       }).run();
     }
   });
+  return appliedSettings;
 }
 
 async function importPreferencesSection(section: PreferencesBackupSection): Promise<Array<{ key: string; value: unknown }>> {
@@ -2022,7 +2025,7 @@ export async function importBackup(data: RawBackupData): Promise<BackupImportRes
     if (!accountsSection) {
       throw new Error('导入数据格式错误：账号数据结构不正确');
     }
-    await importAccountsSection(accountsSection);
+    appliedSettings = await importAccountsSection(accountsSection);
     accountsImported = true;
   }
 
@@ -2030,7 +2033,7 @@ export async function importBackup(data: RawBackupData): Promise<BackupImportRes
     if (!preferencesSection) {
       throw new Error('导入数据格式错误：设置数据结构不正确');
     }
-    appliedSettings = await importPreferencesSection(preferencesSection);
+    appliedSettings = [...appliedSettings, ...(await importPreferencesSection(preferencesSection))];
     preferencesImported = true;
   }
 

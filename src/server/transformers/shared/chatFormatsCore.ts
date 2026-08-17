@@ -58,6 +58,7 @@ export type NormalizedStreamEvent = {
     argumentsDelta?: string;
   }>;
   finishReason?: string | null;
+  errorMessage?: string;
   done?: boolean;
 };
 
@@ -511,7 +512,7 @@ function responsesStatusToChatFinishReason(
     return reason === 'max_output_tokens' ? 'length' : 'stop';
   }
   if (normalizedStatus === 'failed') {
-    return 'stop';
+    return 'error';
   }
   return hasToolCalls ? 'tool_calls' : 'stop';
 }
@@ -1582,6 +1583,14 @@ export function normalizeUpstreamStreamEvent(
 
   if (type === 'response.incomplete' || type === 'response.failed' || type === 'error') {
     const responsePayload = isRecord((payload as any).response) ? (payload as any).response : null;
+    const errorPayload = isRecord((payload as any).error)
+      ? (payload as any).error
+      : (responsePayload && isRecord(responsePayload.error) ? responsePayload.error : null);
+    const errorMessage = (
+      isRecord(errorPayload) && isNonEmptyString(errorPayload.message)
+        ? errorPayload.message
+        : (isNonEmptyString((payload as any).message) ? (payload as any).message : 'upstream stream failed')
+    );
     let finishReason: string;
     if (type === 'response.incomplete') {
       finishReason = responsesStatusToChatFinishReason(
@@ -1600,6 +1609,7 @@ export function normalizeUpstreamStreamEvent(
     }
     return {
       finishReason,
+      ...(type === 'response.failed' || type === 'error' ? { errorMessage } : {}),
       done: true,
     };
   }
@@ -1912,6 +1922,14 @@ function buildOpenAiStreamChunk(
   context: StreamTransformContext,
   event: NormalizedStreamEvent,
 ): Record<string, unknown> | null {
+  if (event.finishReason === 'error') {
+    return {
+      error: {
+        message: event.errorMessage || 'upstream stream failed',
+        type: 'upstream_error',
+      },
+    };
+  }
   const normalizedContentDelta = event.contentDelta || '';
   const normalizedReasoningDelta = event.reasoningDelta || '';
   const delta: Record<string, unknown> = {};

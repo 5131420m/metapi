@@ -368,7 +368,7 @@ describe('chatFormatsCore inline think parsing', () => {
     });
   });
 
-  it('maps response.failed to a stop finish reason instead of inventing a chat error finish reason', () => {
+  it('maps response.failed to an error finish reason', () => {
     const context = createStreamTransformContext('gpt-test');
 
     expect(normalizeUpstreamStreamEvent({
@@ -376,9 +376,13 @@ describe('chatFormatsCore inline think parsing', () => {
       response: {
         id: 'resp_failed_stop',
         status: 'failed',
+        error: {
+          message: 'tool execution failed',
+        },
       },
-    }, context, 'gpt-test')).toEqual({
-      finishReason: 'stop',
+    }, context, 'gpt-test')).toMatchObject({
+      finishReason: 'error',
+      errorMessage: 'tool execution failed',
       done: true,
     });
   });
@@ -645,7 +649,7 @@ describe('chatFormatsCore inline think parsing', () => {
       status: 'failed',
       output: [],
     }, 'gpt-test')).toMatchObject({
-      finishReason: 'stop',
+      finishReason: 'error',
     });
   });
 });

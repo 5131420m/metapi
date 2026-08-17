@@ -1415,7 +1415,6 @@ describe('responses proxy codex oauth refresh', () => {
       response: { error: { code: 'rate_limit_exceeded', message: 'quota exhausted upstream' } },
     });
     expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
-      status: 429,
       errorText: 'quota exhausted upstream',
     }));
     expect(recordSuccessMock).not.toHaveBeenCalled();

@@ -5,6 +5,8 @@ import {
   extractResponsesWebSearchQuery,
   hasResponsesWebSearchOnlyRequest,
 } from './responsesPreflight.js';
+import { resolveNonStreamTerminalFailure } from './surfaces/nonStreamSurface.js';
+import { getProxyAuthContext } from '../middleware/auth.js';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -30,9 +32,7 @@ function findSearchTool(body: Record<string, unknown>): Record<string, unknown> 
       || type === 'google_search'
       || name === 'web_search'
       || name === 'google_search'
-    ) {
-      return tool;
-    }
+    ) return tool;
   }
   return null;
 }
@@ -47,15 +47,7 @@ function buildSearchInjectHeaders(request: FastifyRequest): Record<string, strin
   const headers: Record<string, string | string[]> = {};
   for (const [rawKey, rawValue] of Object.entries(request.headers as Record<string, string | string[]>)) {
     const key = rawKey.toLowerCase();
-    if (
-      key === 'host'
-      || key === 'content-length'
-      || key === 'content-type'
-      || key === 'connection'
-      || key === 'transfer-encoding'
-    ) {
-      continue;
-    }
+    if (key === 'host' || key === 'content-length' || key === 'content-type' || key === 'connection' || key === 'transfer-encoding') continue;
     if (rawValue === undefined) continue;
     headers[rawKey] = rawValue;
   }
@@ -66,20 +58,17 @@ function extractAnthropicSearchQuery(body: Record<string, unknown>): string {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (!isRecord(message)) continue;
-    if (asTrimmedString(message.role).toLowerCase() !== 'user') continue;
+    if (!isRecord(message) || asTrimmedString(message.role).toLowerCase() !== 'user') continue;
     const content = message.content;
     if (typeof content === 'string' && content.trim()) return content.trim();
     if (!Array.isArray(content)) continue;
-    const parts = content
-      .map((item) => {
-        if (typeof item === 'string') return item.trim();
-        if (!isRecord(item)) return '';
-        const type = asTrimmedString(item.type).toLowerCase();
-        if (type && type !== 'text' && type !== 'input_text') return '';
-        return asTrimmedString(item.text ?? item.content);
-      })
-      .filter((item) => item.length > 0);
+    const parts = content.map((item) => {
+      if (typeof item === 'string') return item.trim();
+      if (!isRecord(item)) return '';
+      const type = asTrimmedString(item.type).toLowerCase();
+      if (type && type !== 'text' && type !== 'input_text') return '';
+      return asTrimmedString(item.text ?? item.content);
+    }).filter((item) => item.length > 0);
     if (parts.length > 0) return parts.join('\n');
   }
   return '';
@@ -96,24 +85,11 @@ async function callLocalSearchRoute(input: {
     method: 'POST',
     url: '/v1/search',
     headers: buildSearchInjectHeaders(input.request),
-    payload: {
-      model: input.model,
-      query: input.query,
-      max_results: input.maxResults,
-    },
+    payload: { model: input.model, query: input.query, max_results: input.maxResults },
   });
-
   let payload: unknown = null;
-  try {
-    payload = JSON.parse(searchResponse.body);
-  } catch {
-    payload = searchResponse.body;
-  }
-
-  return {
-    statusCode: searchResponse.statusCode,
-    payload,
-  };
+  try { payload = JSON.parse(searchResponse.body); } catch { payload = searchResponse.body; }
+  return { statusCode: searchResponse.statusCode, payload };
 }
 
 function normalizeSearchResults(payload: unknown): unknown[] {
@@ -123,17 +99,12 @@ function normalizeSearchResults(payload: unknown): unknown[] {
   return data.length > 0 ? data : results;
 }
 
-function buildSyntheticResponsesPayload(input: {
-  body: Record<string, unknown>;
-  query: string;
-  searchPayload: unknown;
-}) {
+function buildSyntheticResponsesPayload(input: { body: Record<string, unknown>; query: string; searchPayload: unknown }) {
   const createdAt = Math.floor(Date.now() / 1000);
   const responseId = `resp_web_search_${randomUUID()}`;
   const searchCallId = `ws_${randomUUID()}`;
   const results = normalizeSearchResults(input.searchPayload);
   const outputText = results.length > 0 ? JSON.stringify(results) : '[]';
-
   return {
     id: responseId,
     object: 'response',
@@ -142,42 +113,37 @@ function buildSyntheticResponsesPayload(input: {
     status: 'completed',
     output_text: outputText,
     output: [
-      {
-        id: searchCallId,
-        type: 'web_search_call',
-        status: 'completed',
-        action: {
-          type: 'search',
-          query: input.query,
-        },
-      },
-      {
-        id: `msg_${searchCallId}`,
-        type: 'message',
-        role: 'assistant',
-        status: 'completed',
-        content: [{
-          type: 'output_text',
-          text: outputText,
-        }],
-      },
+      { id: searchCallId, type: 'web_search_call', status: 'completed', action: { type: 'search', query: input.query } },
+      { id: `msg_${searchCallId}`, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: outputText }] },
     ],
-    usage: {
-      input_tokens: 0,
-      output_tokens: 0,
-      total_tokens: 0,
-    },
+    usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 },
   };
 }
 
 function serializeResponsesSse(payload: Record<string, unknown>): string[] {
   return [
-    `event: response.completed\ndata: ${JSON.stringify({
-      type: 'response.completed',
-      response: payload,
-    })}\n\n`,
+    `event: response.completed\ndata: ${JSON.stringify({ type: 'response.completed', response: payload })}\n\n`,
     'data: [DONE]\n\n',
   ];
+}
+
+function resolveSearchSimulationFailure(input: {
+  request: FastifyRequest;
+  protocol: 'messages' | 'responses';
+  requestedModel: string;
+  search: { statusCode: number; payload: unknown };
+}) {
+  const message = isRecord(input.search.payload) && isRecord(input.search.payload.error)
+    ? asTrimmedString(input.search.payload.error.message) || 'Local search simulation failed'
+    : 'Local search simulation failed';
+  return resolveNonStreamTerminalFailure({
+    protocol: input.protocol,
+    requestedModel: input.requestedModel,
+    status: input.search.statusCode,
+    message,
+    originalPayload: input.search.payload,
+    downstreamApiKeyId: getProxyAuthContext(input.request)?.keyId ?? null,
+  });
 }
 
 async function sendAnthropicSearchSimulation(input: {
@@ -191,92 +157,41 @@ async function sendAnthropicSearchSimulation(input: {
   const tool = findSearchTool(input.searchBody) || findSearchTool(input.openAiBody);
   const query = extractAnthropicSearchQuery(input.body) || extractResponsesWebSearchQuery(input.openAiBody);
   if (!query) return false;
-
-  const search = await callLocalSearchRoute({
-    app: input.app,
-    request: input.request,
-    query,
-    model: SEARCH_SIMULATION_MODEL,
-    maxResults: toSearchMaxResults(tool),
-  });
+  const search = await callLocalSearchRoute({ app: input.app, request: input.request, query, model: SEARCH_SIMULATION_MODEL, maxResults: toSearchMaxResults(tool) });
   if (search.statusCode < 200 || search.statusCode >= 300) {
-    input.reply.code(search.statusCode).send(search.payload);
+    const terminal = resolveSearchSimulationFailure({ request: input.request, protocol: 'messages', requestedModel: asTrimmedString(input.openAiBody.model) || SEARCH_SIMULATION_MODEL, search });
+    input.reply.code(terminal.status).send(terminal.payload);
     return true;
   }
-
-  const responsesPayload = buildSyntheticResponsesPayload({
-    body: input.openAiBody,
-    query,
-    searchPayload: search.payload,
-  });
+  const responsesPayload = buildSyntheticResponsesPayload({ body: input.openAiBody, query, searchPayload: search.payload });
   if (input.body.stream === true) {
     const streamContext = anthropicMessagesTransformer.createStreamContext(asTrimmedString(input.body.model) || 'unknown');
     const claudeContext = anthropicMessagesTransformer.createDownstreamContext();
-    const lines = anthropicMessagesTransformer.serializeUpstreamFinalAsStream(
-      responsesPayload,
-      asTrimmedString(input.body.model) || 'unknown',
-      '',
-      streamContext,
-      claudeContext,
-    );
-    input.reply
-      .code(200)
-      .header('Content-Type', 'text/event-stream; charset=utf-8')
-      .header('Cache-Control', 'no-cache, no-transform')
-      .send(lines.join(''));
+    const lines = anthropicMessagesTransformer.serializeUpstreamFinalAsStream(responsesPayload, asTrimmedString(input.body.model) || 'unknown', '', streamContext, claudeContext);
+    input.reply.code(200).header('Content-Type', 'text/event-stream; charset=utf-8').header('Cache-Control', 'no-cache, no-transform').send(lines.join(''));
     return true;
   }
-
-  const normalized = anthropicMessagesTransformer.transformFinalResponse(
-    responsesPayload,
-    asTrimmedString(input.body.model) || 'unknown',
-    '',
-  );
-  input.reply.code(200).send(anthropicMessagesTransformer.serializeFinalResponse(normalized, {
-    promptTokens: 0,
-    completionTokens: 0,
-    totalTokens: 0,
-  }));
+  const normalized = anthropicMessagesTransformer.transformFinalResponse(responsesPayload, asTrimmedString(input.body.model) || 'unknown', '');
+  input.reply.code(200).send(anthropicMessagesTransformer.serializeFinalResponse(normalized, { promptTokens: 0, completionTokens: 0, totalTokens: 0 }));
   return true;
 }
 
-async function sendResponsesSearchSimulation(input: {
-  app: FastifyInstance;
-  request: FastifyRequest;
-  reply: FastifyReply;
-  body: Record<string, unknown>;
-}): Promise<boolean> {
+async function sendResponsesSearchSimulation(input: { app: FastifyInstance; request: FastifyRequest; reply: FastifyReply; body: Record<string, unknown> }): Promise<boolean> {
   if (!hasResponsesWebSearchOnlyRequest(input.body)) return false;
   const tool = findSearchTool(input.body);
   const query = extractResponsesWebSearchQuery(input.body);
   if (!query) return false;
-
-  const search = await callLocalSearchRoute({
-    app: input.app,
-    request: input.request,
-    query,
-    model: SEARCH_SIMULATION_MODEL,
-    maxResults: toSearchMaxResults(tool),
-  });
+  const search = await callLocalSearchRoute({ app: input.app, request: input.request, query, model: SEARCH_SIMULATION_MODEL, maxResults: toSearchMaxResults(tool) });
   if (search.statusCode < 200 || search.statusCode >= 300) {
-    input.reply.code(search.statusCode).send(search.payload);
+    const terminal = resolveSearchSimulationFailure({ request: input.request, protocol: 'responses', requestedModel: asTrimmedString(input.body.model) || SEARCH_SIMULATION_MODEL, search });
+    input.reply.code(terminal.status).send(terminal.payload);
     return true;
   }
-
-  const payload = buildSyntheticResponsesPayload({
-    body: input.body,
-    query,
-    searchPayload: search.payload,
-  });
+  const payload = buildSyntheticResponsesPayload({ body: input.body, query, searchPayload: search.payload });
   if (input.body.stream === true) {
-    input.reply
-      .code(200)
-      .header('Content-Type', 'text/event-stream; charset=utf-8')
-      .header('Cache-Control', 'no-cache, no-transform')
-      .send(serializeResponsesSse(payload).join(''));
+    input.reply.code(200).header('Content-Type', 'text/event-stream; charset=utf-8').header('Cache-Control', 'no-cache, no-transform').send(serializeResponsesSse(payload).join(''));
     return true;
   }
-
   input.reply.code(200).send(payload);
   return true;
 }
@@ -289,27 +204,12 @@ export async function maybeHandleWebSearchOnlySimulation(input: {
   body: Record<string, unknown>;
   openAiBody?: Record<string, unknown>;
 }): Promise<boolean> {
-  if (input.downstreamFormat === 'responses') {
-    return sendResponsesSearchSimulation({
-      app: input.app,
-      request: input.request,
-      reply: input.reply,
-      body: input.body,
-    });
-  }
-
+  if (input.downstreamFormat === 'responses') return sendResponsesSearchSimulation({ app: input.app, request: input.request, reply: input.reply, body: input.body });
   const openAiBody = input.openAiBody;
   const rawBodyHasSearchOnly = hasResponsesWebSearchOnlyRequest(input.body);
   const openAiBodyHasSearchOnly = !!openAiBody && hasResponsesWebSearchOnlyRequest(openAiBody);
   if (!openAiBody || (!rawBodyHasSearchOnly && !openAiBodyHasSearchOnly)) return false;
-  return sendAnthropicSearchSimulation({
-    app: input.app,
-    request: input.request,
-    reply: input.reply,
-    body: input.body,
-    openAiBody,
-    searchBody: rawBodyHasSearchOnly ? input.body : openAiBody,
-  });
+  return sendAnthropicSearchSimulation({ app: input.app, request: input.request, reply: input.reply, body: input.body, openAiBody, searchBody: rawBodyHasSearchOnly ? input.body : openAiBody });
 }
 
 export function isResponsesWebSearchOnlyRequest(body: Record<string, unknown>): boolean {

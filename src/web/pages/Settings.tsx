@@ -1544,7 +1544,7 @@ export default function Settings() {
           <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 12, marginTop: 4, marginBottom: 12 }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>下游终态错误策略</div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
-              仅在所有 Metapi 通道耗尽、响应尚未提交时生效。禁止伪造 2xx、assistant 文本和 tool call。
+              仅在通道尝试预算耗尽或无候选路由、且响应尚未提交时生效。禁止伪造 2xx、assistant 文本和 tool call。
             </div>
             <select
               value={runtime.downstreamErrorPolicy.mode}

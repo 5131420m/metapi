@@ -8,6 +8,7 @@ import { isTokenExpiredError } from '../../services/alertRules.js';
 import { estimateProxyCost } from '../../services/modelPricingService.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
+import { parseNonStreamOriginalPayload, resolveNonStreamTerminalFailure } from '../../proxy-core/surfaces/nonStreamSurface.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
@@ -66,9 +67,15 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: forcedChannelId ? noChannelMessage : 'No available channels after retries',
         });
-        return reply.code(503).send({
-          error: { message: noChannelMessage, type: 'server_error' },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: 503,
+          message: noChannelMessage,
+          downstreamApiKeyId,
+          cause: 'routing',
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
 
       excludeChannelIds.push(selected.channel.id);
@@ -143,9 +150,18 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             model: requestedModel,
             reason: data.message,
           });
-          return reply.code(502).send({
-            error: { message: data.message, type: 'upstream_error' },
+          const terminal = resolveNonStreamTerminalFailure({
+            protocol: 'openai',
+            requestedModel,
+            status: 502,
+            message: data.message,
+            downstreamApiKeyId,
+            originalPayload: parseNonStreamOriginalPayload(text),
+            terminalScope: 'attempt_budget_exhausted',
+            attemptedChannelCount: excludeChannelIds.length,
+            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
           });
+          return reply.code(terminal.status).send(terminal.payload);
         }
 
         const latency = Date.now() - startTime;
@@ -225,12 +241,20 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: errorText || 'network failure',
         });
-        return reply.code(status || 502).send({
-          error: {
-            message: status > 0 ? errorText : `Upstream error: ${errorText}`,
-            type: 'upstream_error',
-          },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: status || 502,
+          message: status > 0 ? errorText : `Upstream error: ${errorText}`,
+          downstreamApiKeyId,
+          originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+            ? 'attempt_budget_exhausted'
+            : 'attempt',
+          attemptedChannelCount: excludeChannelIds.length,
+          maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
     }
   });
@@ -277,9 +301,15 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: forcedChannelId ? noChannelMessage : 'No available channels after retries',
         });
-        return reply.code(503).send({
-          error: { message: noChannelMessage, type: 'server_error' },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: 503,
+          message: noChannelMessage,
+          downstreamApiKeyId,
+          cause: 'routing',
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
 
       excludeChannelIds.push(selected.channel.id);
@@ -369,9 +399,18 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             model: requestedModel,
             reason: data.message,
           });
-          return reply.code(502).send({
-            error: { message: data.message, type: 'upstream_error' },
+          const terminal = resolveNonStreamTerminalFailure({
+            protocol: 'openai',
+            requestedModel,
+            status: 502,
+            message: data.message,
+            downstreamApiKeyId,
+            originalPayload: parseNonStreamOriginalPayload(text),
+            terminalScope: 'attempt_budget_exhausted',
+            attemptedChannelCount: excludeChannelIds.length,
+            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
           });
+          return reply.code(terminal.status).send(terminal.payload);
         }
 
         const latency = Date.now() - startTime;
@@ -451,12 +490,20 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: errorText || 'network failure',
         });
-        return reply.code(status || 502).send({
-          error: {
-            message: status > 0 ? errorText : `Upstream error: ${errorText}`,
-            type: 'upstream_error',
-          },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: status || 502,
+          message: status > 0 ? errorText : `Upstream error: ${errorText}`,
+          downstreamApiKeyId,
+          originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+            ? 'attempt_budget_exhausted'
+            : 'attempt',
+          attemptedChannelCount: excludeChannelIds.length,
+          maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
     }
   });

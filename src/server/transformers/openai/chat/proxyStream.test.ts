@@ -24,6 +24,28 @@ function createScriptedReader(chunks: string[], failWith?: string) {
   };
 }
 
+it('uses a public-message sanitizer only for postcommit Chat terminal bytes', async () => {
+  const lines: string[] = [];
+  const session = createChatProxyStreamSession({
+    downstreamFormat: 'openai',
+    modelName: 'gpt-5',
+    successfulUpstreamPath: '/v1/chat/completions',
+    publicFailureMessage: () => 'sanitized postcommit failure',
+    writeLines: (nextLines) => lines.push(...nextLines),
+    writeRaw: (chunk) => lines.push(chunk),
+  });
+  const result = await session.run(
+    createScriptedReader([
+      'data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"partial"}}]}\n\n',
+    ], 'invalid api key sk-secret'),
+    { end() {} },
+  );
+
+  expect(result.errorMessage).toBe('invalid api key sk-secret');
+  expect(lines.join('')).toContain('sanitized postcommit failure');
+  expect(lines.join('')).not.toContain('sk-secret');
+});
+
 function createSession(lines: string[], downstreamFormat: 'openai' | 'claude' = 'openai') {
   return createChatProxyStreamSession({
     downstreamFormat,
@@ -39,6 +61,80 @@ function createSession(lines: string[], downstreamFormat: 'openai' | 'claude' = 
 }
 
 describe('createChatProxyStreamSession reader failures', () => {
+  it('keeps a reader failure before meaningful output uncommitted', async () => {
+    const lines: string[] = [];
+    const session = createSession(lines);
+    const reader = createScriptedReader([], 'upstream failed before output');
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorMessage: 'upstream failed before output',
+      failure: { status: 502, message: 'upstream failed before output' },
+      meaningfulOutputSeen: false,
+    });
+    expect(lines).toEqual([]);
+  });
+
+  it('keeps a response.failed event before meaningful output uncommitted', async () => {
+    const lines: string[] = [];
+    const session = createSession(lines);
+    const reader = createScriptedReader([
+      'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_fail","status":"in_progress","output":[]}}\n\n',
+      'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_fail","status":"failed","error":{"message":"tool execution failed"}}}\n\n',
+    ]);
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorMessage: 'tool execution failed',
+      meaningfulOutputSeen: false,
+    });
+    expect(lines).toEqual([]);
+  });
+
+  it('recognizes response.failed SSE event names even when payload type is missing', async () => {
+    const lines: string[] = [];
+    const session = createSession(lines);
+    const reader = createScriptedReader([
+      'event: response.failed\ndata: {"response":{"status":"failed","error":{"message":"named failure"}}}\n\n',
+    ]);
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorMessage: 'named failure',
+      meaningfulOutputSeen: false,
+    });
+    expect(lines).toEqual([]);
+  });
+  it('emits one explicit error terminal when response.failed follows meaningful output', async () => {
+    const lines: string[] = [];
+    const session = createSession(lines);
+    const reader = createScriptedReader([
+      'data: {"id":"chatcmpl-partial","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+      'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_partial","status":"failed","error":{"message":"tool execution failed"}}}\n\n',
+    ]);
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorMessage: 'tool execution failed',
+      meaningfulOutputSeen: true,
+    });
+    const output = lines.join('');
+    expect(output).toContain('partial');
+    expect(output).toContain('upstream_error');
+    expect(output).toContain('tool execution failed');
+    expect(output).not.toContain('"finish_reason":"stop"');
+    expect(output.match(/upstream_error/g)).toHaveLength(1);
+    expect(output.match(/data: \[DONE\]/g)).toHaveLength(1);
+  });
+
   it('preserves a top-level HTTP status from an error event', async () => {
     const writes: string[] = [];
     const session = createChatProxyStreamSession({
@@ -58,6 +154,24 @@ describe('createChatProxyStreamSession reader failures', () => {
       status: 'failed',
       failure: { status: 429, type: 'rate_limit_error', message: 'quota' },
     });
+  });
+
+  it('keeps a non-SSE response.failed payload from becoming a successful chat response', () => {
+    const lines: string[] = [];
+    const session = createSession(lines);
+    const result = session.consumeUpstreamFinalPayload({
+      type: 'response.failed',
+      response: {
+        status: 'failed',
+        error: { message: 'final failure' },
+      },
+    }, '', { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorMessage: 'final failure',
+    });
+    expect(lines).toEqual([]);
   });
 
   it('converts reader failures into an in-band upstream_error terminal', async () => {
@@ -88,6 +202,33 @@ describe('createChatProxyStreamSession reader failures', () => {
     expect(output).toContain('upstream stream interrupted');
     expect(output).toContain('data: [DONE]');
   });
+
+  it('keeps local processing failures distinct from upstream reader failures', async () => {
+    const lines: string[] = [];
+    const session = createChatProxyStreamSession({
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5',
+      successfulUpstreamPath: '/v1/chat/completions',
+      writeLines: (nextLines) => lines.push(...nextLines),
+      writeRaw: (chunk) => lines.push(chunk),
+      onParsedPayload: () => {
+        throw new Error('local callback failed');
+      },
+    });
+    const reader = createScriptedReader([
+      'data: {"id":"chatcmpl-local","choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+    ]);
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorMessage: 'stream processing failed',
+      failure: { type: 'server_error', message: 'stream processing failed' },
+    });
+    expect(lines.join('')).not.toContain('local callback failed');
+  });
+
 
   it('does not emit a second terminal when the reader fails after a clean [DONE]', async () => {
     const lines: string[] = [];
@@ -134,7 +275,7 @@ describe('createChatProxyStreamSession reader failures', () => {
     expect(output.match(/data: \[DONE\]/g)).toHaveLength(1);
   });
 
-  it('emits a claude-shaped error event for claude downstream reader failures', async () => {
+  it('keeps a Claude reader failure before meaningful output uncommitted', async () => {
     const lines: string[] = [];
     const session = createSession(lines, 'claude');
     const reader = createScriptedReader(
@@ -146,10 +287,34 @@ describe('createChatProxyStreamSession reader failures', () => {
 
     expect(result.status).toBe('failed');
     expect(result.errorMessage).toBe('claude upstream interrupted');
+    expect(result).toMatchObject({
+      meaningfulOutputSeen: false,
+      failure: { status: 502, message: 'claude upstream interrupted' },
+    });
+    expect(lines).toEqual([]);
+  });
+
+  it('emits one Claude error terminal when a reader failure follows meaningful output', async () => {
+    const lines: string[] = [];
+    const session = createSession(lines, 'claude');
+    const reader = createScriptedReader(
+      [
+        'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_2","model":"claude","content":[]}}\n\n',
+        'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}\n\n',
+      ],
+      'claude failed after output',
+    );
+
+    const result = await session.run(reader, { end() {} });
+
+    expect(result).toMatchObject({ status: 'failed', meaningfulOutputSeen: true });
     const output = lines.join('');
+    expect(output).toContain('partial');
     expect(output).toContain('event: error');
-    expect(output).toContain('claude upstream interrupted');
-    expect(output).not.toContain('data: [DONE]');
+    expect(output).toContain('claude failed after output');
+    expect(output).not.toContain('event: message_stop');
+    expect(output.match(/event: error/g)).toHaveLength(1);
   });
 
   it('marks a native Claude error event as a failed stream terminal', async () => {
@@ -161,9 +326,10 @@ describe('createChatProxyStreamSession reader failures', () => {
 
     const result = await session.run(reader, { end() {} });
 
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       status: 'failed',
       errorMessage: 'upstream overloaded',
+      failureSource: 'upstream',
       failure: {
         status: 429,
         type: 'api_error',

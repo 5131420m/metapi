@@ -679,6 +679,7 @@ describe('selectSurfaceChannelForAttempt', () => {
         modelName: 'claude-sonnet',
         status: 401,
         message: 'expired upstream token',
+        terminalScope: 'attempt_budget_exhausted',
       })).toEqual({
         action: 'respond',
         status: 503,
@@ -717,6 +718,7 @@ describe('selectSurfaceChannelForAttempt', () => {
         modelName: 'claude-sonnet',
         status: 401,
         message: 'expired upstream token',
+        terminalScope: 'attempt_budget_exhausted',
       })).toMatchObject({
         status: 503,
         payload: {
@@ -752,6 +754,7 @@ describe('selectSurfaceChannelForAttempt', () => {
         modelName: 'gpt-5.2',
         status: 401,
         message: 'expired upstream token',
+        terminalScope: 'attempt_budget_exhausted',
       })).toEqual({
         action: 'respond',
         status: 401,
@@ -1084,6 +1087,40 @@ describe('selectSurfaceChannelForAttempt', () => {
     });
   });
 
+  it('does not penalize the upstream channel for local stream processing failures', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+
+    const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+    const toolkit = createSurfaceFailureToolkit({
+      warningScope: 'responses',
+      downstreamPath: '/v1/responses',
+      maxRetries: 2,
+      clientContext: null,
+      downstreamApiKeyId: null,
+    });
+
+    await toolkit.recordStreamFailure({
+      selected: {
+        channel: { id: 11, routeId: 22 },
+        account: { id: 33, username: 'oauth-user' },
+        site: { name: 'Codex OAuth' },
+        actualModel: 'upstream-model',
+      },
+      requestedModel: 'gpt-5.2',
+      modelName: 'upstream-model',
+      errorMessage: 'stream processing failed',
+      latencyMs: 450,
+      retryCount: 1,
+      failureSource: 'processing',
+      runtimeFailureStatus: null,
+    });
+
+    expect(recordFailureMock).not.toHaveBeenCalled();
+    expect(insertProxyLogMock).toHaveBeenCalled();
+  });
+
   it('keeps pre-commit stream failures marked as pre-commit in canonical aggregation', async () => {
     composeProxyLogMessageMock.mockReturnValue('normalized error');
     formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
@@ -1130,6 +1167,7 @@ describe('selectSurfaceChannelForAttempt', () => {
         message: 'upstream token expired',
         isStream: true,
         phase: 'precommit',
+        terminalScope: 'attempt_budget_exhausted',
       })).toMatchObject({
         status: 503,
         payload: {

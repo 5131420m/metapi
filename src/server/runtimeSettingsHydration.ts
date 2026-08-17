@@ -39,7 +39,11 @@ function toStringList(value: unknown): string[] {
   return [];
 }
 
-export function applyRuntimeSettings(settingsMap: Map<string, string>) {
+export function applyRuntimeSettings(
+  settingsMap: Map<string, string>,
+  options: { existingDownstreamApiKeyIds?: Set<number> } = {},
+): { normalizedSettings: Array<{ key: string; value: unknown }> } {
+  const normalizedSettings: Array<{ key: string; value: unknown }> = [];
   const authToken = parseSettingFromMap<string>(settingsMap, 'auth_token');
   if (typeof authToken === 'string' && authToken) config.authToken = authToken;
 
@@ -87,7 +91,20 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
   const downstreamErrorPolicy = parseSettingFromMap<unknown>(settingsMap, 'downstream_error_policy');
   if (downstreamErrorPolicy !== undefined) {
     try {
-      config.downstreamErrorPolicy = parseDownstreamErrorPolicyConfig(downstreamErrorPolicy);
+      const parsed = parseDownstreamErrorPolicyConfig(downstreamErrorPolicy);
+      const existingIds = options.existingDownstreamApiKeyIds;
+      if (parsed.mode === 'cpa-hermes-resilient' && existingIds) {
+        const downstreamApiKeyIds = parsed.downstreamApiKeyIds.filter((id) => existingIds.has(id));
+        const normalized = downstreamApiKeyIds.length > 0
+          ? { mode: 'cpa-hermes-resilient' as const, downstreamApiKeyIds }
+          : { mode: 'off' as const, downstreamApiKeyIds: [] };
+        config.downstreamErrorPolicy = normalized;
+        if (downstreamApiKeyIds.length !== parsed.downstreamApiKeyIds.length) {
+          normalizedSettings.push({ key: 'downstream_error_policy', value: normalized });
+        }
+      } else {
+        config.downstreamErrorPolicy = parsed;
+      }
     } catch {
       // Invalid persisted values leave the safe current policy unchanged.
     }
@@ -314,4 +331,5 @@ export function applyRuntimeSettings(settingsMap: Map<string, string>) {
   if (adminIpAllowlist !== undefined) {
     config.adminIpAllowlist = toStringList(adminIpAllowlist);
   }
+  return { normalizedSettings };
 }

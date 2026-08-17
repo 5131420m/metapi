@@ -5,8 +5,10 @@ import {
   buildCanonicalUpstreamFailure,
   buildCanonicalRoutingFailure,
   parseDownstreamErrorPolicyConfig,
+  resolveAggregatedPublicTerminalFailure,
   resolvePublicTerminalFailure,
   serializePublicTerminalFailure,
+  sanitizePostcommitFailureMessage,
 } from './downstreamErrorPolicy.js';
 
 const resilientPolicy = parseDownstreamErrorPolicyConfig({
@@ -23,10 +25,88 @@ function failure(status: number, message: string, downstreamApiKeyId: number | n
     upstreamModel: 'gpt-5.6-sol',
     channelId: 99,
     downstreamApiKeyId,
+    terminalScope: 'attempt_budget_exhausted',
   });
 }
 
-describe('downstream error policy', () => {
+describe('downstream terminal error policy', () => {
+  it('sanitizes scoped postcommit upstream errors without changing operational details', () => {
+    const policy = {
+      mode: 'cpa-hermes-resilient' as const,
+      downstreamApiKeyIds: [12],
+    };
+    expect(sanitizePostcommitFailureMessage({
+      message: 'invalid api key sk-secret from upstream vendor',
+      downstreamApiKeyId: 12,
+      policy,
+    })).toBe('The upstream stream failed after output began.');
+    expect(sanitizePostcommitFailureMessage({
+      message: 'invalid api key sk-secret from upstream vendor',
+      downstreamApiKeyId: 13,
+      policy,
+    })).toBe('invalid api key sk-secret from upstream vendor');
+  });
+  it('does not rewrite an attempt-level upstream failure', () => {
+    const failure = {
+      ...buildCanonicalUpstreamFailure({
+        status: 401,
+        message: 'expired upstream token',
+        protocol: 'responses',
+        requestedModel: 'gpt-5',
+        downstreamApiKeyId: 12,
+      }),
+      terminalScope: 'attempt' as const,
+    };
+
+    expect(resolvePublicTerminalFailure(failure, resilientPolicy)).toMatchObject({
+      status: 401,
+      rewritten: false,
+      message: 'expired upstream token',
+    });
+  });
+
+  it('rewrites an attempt-budget-exhausted upstream auth failure', () => {
+    const failure = {
+      ...buildCanonicalUpstreamFailure({
+        status: 401,
+        message: 'expired upstream token',
+        protocol: 'responses',
+        requestedModel: 'gpt-5',
+        downstreamApiKeyId: 12,
+      }),
+      terminalScope: 'attempt_budget_exhausted' as const,
+    };
+
+    expect(resolvePublicTerminalFailure(failure, resilientPolicy)).toMatchObject({
+      status: 503,
+      rewritten: true,
+      code: 'metapi_upstream_auth_exhausted',
+    });
+  });
+
+  it.each([
+    [400, 'invalid parameter value'],
+    [413, 'payload too large'],
+    [422, 'semantic validation failed'],
+  ])('preserves deterministic HTTP %i request failures after attempt exhaustion', (status, message) => {
+    const failure = {
+      ...buildCanonicalUpstreamFailure({
+        status,
+        message,
+        protocol: 'responses',
+        requestedModel: 'gpt-5',
+        downstreamApiKeyId: 12,
+      }),
+      terminalScope: 'attempt_budget_exhausted' as const,
+    };
+
+    expect(resolvePublicTerminalFailure(failure, resilientPolicy)).toMatchObject({
+      status,
+      rewritten: false,
+      message,
+    });
+  });
+
   it('requires a dedicated downstream key scope for resilient mode', () => {
     expect(() => parseDownstreamErrorPolicyConfig({
       mode: 'cpa-hermes-resilient',
@@ -116,6 +196,7 @@ describe('downstream error policy', () => {
         protocol,
         requestedModel: 'gpt-5.6',
         downstreamApiKeyId: 12,
+        terminalScope: 'attempt_budget_exhausted',
       });
 
       expect(canonical.cause).toBe('upstream_model_unavailable');
@@ -152,6 +233,93 @@ describe('downstream error policy', () => {
     });
   });
 
+  it('preserves a deterministic terminal fallback instead of aggregating it into a transient pool failure', () => {
+    const priorRetryableFailure = failure(401, 'expired upstream token');
+    const deterministicPayload = {
+      error: {
+        type: 'invalid_request_error',
+        code: 'invalid_parameter',
+        message: 'invalid parameter value',
+        param: 'input',
+      },
+    };
+    const deterministicFailure = {
+      ...buildCanonicalUpstreamFailure({
+        status: 400,
+        message: 'invalid parameter value',
+        protocol: 'responses',
+        requestedModel: 'gpt-5.6',
+        downstreamApiKeyId: 12,
+        originalPayload: deterministicPayload,
+      }),
+      terminalScope: 'attempt_budget_exhausted' as const,
+    };
+
+    const decision = resolveAggregatedPublicTerminalFailure(
+      [priorRetryableFailure],
+      deterministicFailure,
+      resilientPolicy,
+    );
+
+    expect(decision).toMatchObject({
+      status: 400,
+      rewritten: false,
+      message: 'invalid parameter value',
+      originalPayload: deterministicPayload,
+    });
+    expect(serializePublicTerminalFailure(decision, 'responses')).toEqual(deterministicPayload);
+  });
+
+  it('preserves a Responses previous-response 404 when earlier channel failures exist', () => {
+    const priorRetryableFailure = failure(401, 'expired upstream token');
+    const continuationFailure = buildCanonicalUpstreamFailure({
+      status: 404,
+      message: 'previous_response_not_found',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      originalPayload: {
+        error: {
+          type: 'invalid_request_error',
+          code: 'previous_response_not_found',
+          message: 'previous_response_not_found',
+        },
+      },
+      terminalScope: 'attempt_budget_exhausted',
+    });
+
+    const decision = resolveAggregatedPublicTerminalFailure(
+      [priorRetryableFailure],
+      continuationFailure,
+      resilientPolicy,
+    );
+
+    expect(decision).toMatchObject({
+      status: 404,
+      code: 'previous_response_not_found',
+      rewritten: true,
+    });
+  });
+
+  it('retains attempt-budget evidence on the canonical failure used for public aggregation', () => {
+    const canonical = buildCanonicalUpstreamFailure({
+      status: 401,
+      message: 'expired upstream token',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      terminalScope: 'attempt_budget_exhausted',
+      attemptedChannelCount: 3,
+      maxChannelAttempts: 3,
+    });
+
+    expect(canonical).toMatchObject({
+      terminalScope: 'attempt_budget_exhausted',
+      attemptedChannelCount: 3,
+      maxChannelAttempts: 3,
+    });
+  });
+
   it('preserves the original upstream response outside the dedicated downstream key scope', () => {
     expect(resolvePublicTerminalFailure(failure(401, 'expired upstream token', 13), resilientPolicy)).toEqual({
       status: 401,
@@ -160,6 +328,22 @@ describe('downstream error policy', () => {
       message: 'expired upstream token',
       rewritten: false,
     });
+  });
+
+  it('preserves a non-JSON original payload when rewriting is disabled', () => {
+    const canonical = buildCanonicalUpstreamFailure({
+      status: 502,
+      message: '<html>upstream unavailable</html>',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 13,
+      originalPayload: '<html>upstream unavailable</html>',
+      terminalScope: 'attempt_budget_exhausted',
+    });
+    const decision = resolvePublicTerminalFailure(canonical, resilientPolicy);
+
+    expect(decision.rewritten).toBe(false);
+    expect(serializePublicTerminalFailure(decision, 'responses')).toBe('<html>upstream unavailable</html>');
   });
 
   it('does not collapse mixed failures outside the dedicated downstream key scope', async () => {
@@ -220,7 +404,7 @@ describe('downstream error policy', () => {
     });
   });
 
-  it('preserves non-empty original payload fields while filling missing error metadata outside scope', () => {
+  it('preserves original payload fields outside scope', () => {
     const canonical = buildCanonicalUpstreamFailure({
       status: 502,
       message: 'Upstream returned empty content',

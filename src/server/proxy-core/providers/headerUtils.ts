@@ -127,6 +127,7 @@ export function buildCodexRuntimeHeaders(input: {
   codexBetaFeatures?: string | null;
   codexTurnState?: string | null;
   codexTurnMetadata?: string | null;
+  codexWindowId?: string | null;
   timingMetrics?: string | null;
   openAiBeta?: string | null;
 }): Record<string, string> {
@@ -151,6 +152,7 @@ export function buildCodexRuntimeHeaders(input: {
   const codexBetaFeatures = input.codexBetaFeatures || null;
   const codexTurnState = input.codexTurnState || null;
   const codexTurnMetadata = input.codexTurnMetadata || null;
+  const codexWindowId = input.codexWindowId || null;
   const timingMetrics = input.timingMetrics || null;
   const openAiBeta = input.openAiBeta || null;
   const explicitSessionId = asTrimmedString(input.explicitSessionId);
@@ -178,6 +180,7 @@ export function buildCodexRuntimeHeaders(input: {
     ...(codexBetaFeatures ? { 'x-codex-beta-features': codexBetaFeatures } : {}),
     ...(codexTurnState ? { 'x-codex-turn-state': codexTurnState } : {}),
     ...(codexTurnMetadata ? { 'x-codex-turn-metadata': codexTurnMetadata } : {}),
+    ...(codexWindowId ? { 'x-codex-window-id': codexWindowId } : {}),
     ...(timingMetrics ? { 'x-responsesapi-include-timing-metrics': timingMetrics } : {}),
     ...(openAiBeta ? { 'OpenAI-Beta': openAiBeta } : {}),
     Session_id: sessionId,

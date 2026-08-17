@@ -322,6 +322,51 @@ describe('upstreamRequestBuilder', () => {
     expect(request.headers['x-test-header']).toBeUndefined();
   });
 
+  it('normalizes header casing before the controlled credential overrides provider headers', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.2',
+      stream: true,
+      tokenValue: 'controlled-token',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      openaiBody: { model: 'gpt-5.2', input: 'hello' },
+      downstreamFormat: 'responses',
+      providerHeaders: {
+        authorization: 'Bearer stale-provider-token',
+        'CONTENT-TYPE': 'application/provider+json',
+      },
+      downstreamHeaders: {
+        accept: 'application/json',
+      },
+    });
+
+    expect(request.headers.Authorization).toBe('Bearer controlled-token');
+    expect(request.headers.authorization).toBeUndefined();
+    expect(request.headers['Content-Type']).toBe('application/json');
+    expect(request.headers['CONTENT-TYPE']).toBeUndefined();
+  });
+
+  it('preserves x-codex-window-id through the native Codex provider final header builder', () => {
+    const request = buildUpstreamEndpointRequest({
+      endpoint: 'responses',
+      modelName: 'gpt-5.2',
+      stream: true,
+      tokenValue: 'oauth-token',
+      sitePlatform: 'codex',
+      siteUrl: 'https://chatgpt.com/backend-api/codex',
+      openaiBody: { model: 'gpt-5.2', input: 'hello' },
+      downstreamFormat: 'responses',
+      downstreamHeaders: {
+        'x-codex-window-id': 'window-native:0',
+        'x-client-request-id': 'drop-me',
+      },
+    });
+
+    expect(request.headers['x-codex-window-id']).toBe('window-native:0');
+    expect(request.headers['x-client-request-id']).toBeUndefined();
+  });
+
   it('forwards x-codex-* headers on responses→chat fallback', () => {
     const request = buildUpstreamEndpointRequest({
       endpoint: 'chat',

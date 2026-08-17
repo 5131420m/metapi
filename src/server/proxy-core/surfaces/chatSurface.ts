@@ -2,6 +2,7 @@ import { TextDecoder } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
 import { config } from '../../config.js';
+import { sanitizePostcommitFailureMessage } from '../../services/downstreamErrorPolicy.js';
 import { tokenRouter } from '../../services/tokenRouter.js';
 import { reportProxyAllFailed } from '../../services/alertService.js';
 import { hasProxyUsagePayload, mergeProxyUsage, parseProxyUsage } from '../../services/proxyUsageParser.js';
@@ -520,6 +521,9 @@ export async function handleChatSurfaceRequest(
         modelName,
         status: 503,
         message: busyMessage,
+        terminalScope: 'attempt_budget_exhausted',
+        attemptedChannelCount: excludeChannelIds.length,
+        maxChannelAttempts: maxRetries + 1,
       });
       await finalizeDebugFailure(terminalFailure.status, terminalFailure.payload);
       return reply.code(terminalFailure.status).send(terminalFailure.payload);
@@ -637,6 +641,11 @@ export async function handleChatSurfaceRequest(
               parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(payload));
             }
           },
+          publicFailureMessage: (message) => sanitizePostcommitFailureMessage({
+            message,
+            downstreamApiKeyId,
+            policy: config.downstreamErrorPolicy,
+          }),
           writeLines,
           writeRaw: (chunk) => {
             if (!chunk) return;
@@ -671,9 +680,13 @@ export async function handleChatSurfaceRequest(
                 completionTokens: parsedUsage.completionTokens,
                 totalTokens: parsedUsage.totalTokens,
                 upstreamPath: successfulUpstreamPath,
-                runtimeFailureStatus: streamFailureStatus,
                 originalPayload: streamResult.failure?.payload,
+                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failureSource: streamResult.failureSource,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+                attemptedChannelCount: excludeChannelIds.length,
+                maxChannelAttempts: maxRetries + 1,
               });
               await finalizeDebugFailure(streamFailureStatus, {
                 error: {
@@ -690,7 +703,12 @@ export async function handleChatSurfaceRequest(
                   message: streamResult.errorMessage || 'stream processing failed',
                   isStream,
                   originalPayload: streamResult.failure?.payload,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failureSource: streamResult.failureSource,
+                  phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                  terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+                  attemptedChannelCount: excludeChannelIds.length,
+                  maxChannelAttempts: maxRetries + 1,
                 });
                 return reply.code(terminalFailure.status).send(terminalFailure.payload);
               }
@@ -740,6 +758,12 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
+              originalPayload: fallbackData
+                && typeof fallbackData === 'object'
+                && !Array.isArray(fallbackData)
+                && 'error' in fallbackData
+                ? fallbackData
+                : undefined,
             });
             const terminalFailureOutcome = failureOutcome.action === 'retry'
               ? (canRetryChannelSelection(retryCount, forcedChannelId)
@@ -783,10 +807,12 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              runtimeFailureStatus: streamFailureStatus,
               originalPayload: streamResult.failure?.payload,
               phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-            });
+              terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+              attemptedChannelCount: excludeChannelIds.length,
+              maxChannelAttempts: maxRetries + 1,
+              });
             await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
@@ -802,7 +828,12 @@ export async function handleChatSurfaceRequest(
                 message: streamResult.errorMessage || 'stream processing failed',
                 isStream,
                 originalPayload: streamResult.failure?.payload,
+                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failureSource: streamResult.failureSource,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+                attemptedChannelCount: excludeChannelIds.length,
+                maxChannelAttempts: maxRetries + 1,
               });
               return reply.code(terminalFailure.status).send(terminalFailure.payload);
             }
@@ -866,10 +897,12 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              runtimeFailureStatus: streamFailureStatus,
               originalPayload: streamResult.failure?.payload,
               phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-            });
+              terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+              attemptedChannelCount: excludeChannelIds.length,
+              maxChannelAttempts: maxRetries + 1,
+              });
             await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
@@ -885,7 +918,12 @@ export async function handleChatSurfaceRequest(
                 message: streamResult.errorMessage || 'stream processing failed',
                 isStream,
                 originalPayload: streamResult.failure?.payload,
+                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failureSource: streamResult.failureSource,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+                attemptedChannelCount: excludeChannelIds.length,
+                maxChannelAttempts: maxRetries + 1,
               });
               return reply.code(terminalFailure.status).send(terminalFailure.payload);
             }
@@ -1357,6 +1395,9 @@ export async function handleClaudeCountTokensSurfaceRequest(
         modelName,
         status: 503,
         message: busyMessage,
+        terminalScope: 'attempt_budget_exhausted',
+        attemptedChannelCount: excludeChannelIds.length,
+        maxChannelAttempts: maxRetries + 1,
       });
       await finalizeDebugFailure(terminalFailure.status, terminalFailure.payload);
       return reply.code(terminalFailure.status).send(terminalFailure.payload);

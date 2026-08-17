@@ -9,6 +9,7 @@ import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageFallbackService.js';
 import { parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
+import { parseNonStreamOriginalPayload, resolveNonStreamTerminalFailure } from '../../proxy-core/surfaces/nonStreamSurface.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
@@ -69,7 +70,15 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: forcedChannelId ? noChannelMessage : 'No available channels after retries',
         });
-        return reply.code(503).send({ error: { message: noChannelMessage, type: 'server_error' } });
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: 503,
+          message: noChannelMessage,
+          downstreamApiKeyId,
+          cause: 'routing',
+        });
+        return reply.code(terminal.status).send(terminal.payload);
       }
       excludeChannelIds.push(selected.channel.id);
       const upstreamModel = selected.actualModel || requestedModel;
@@ -126,8 +135,38 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           };
         }, { requestScopeId: siteApiEndpointRequestScopeId });
 
-        let data: any = {};
-        try { data = JSON.parse(text); } catch { data = {}; }
+        let data: any;
+        try {
+          data = JSON.parse(text);
+        } catch {
+          const errorText = 'Upstream returned malformed embedding JSON';
+          await recordTokenRouterEventBestEffort('record malformed upstream response', () => tokenRouter.recordFailure(selected.channel.id, {
+            status: 502,
+            errorText,
+            modelName: upstreamModel,
+          }));
+          logProxy(
+            selected, requestedModel, 'failed', 502, Date.now() - startTime, errorText, retryCount, downstreamApiKeyId,
+            0, 0, 0, 0, null, clientContext, downstreamPath, null, false, firstByteLatencyMs,
+          );
+          if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+            retryCount++;
+            continue;
+          }
+          await reportProxyAllFailed({ model: requestedModel, reason: errorText });
+          const terminal = resolveNonStreamTerminalFailure({
+            protocol: 'openai',
+            requestedModel,
+            status: 502,
+            message: errorText,
+            downstreamApiKeyId,
+            originalPayload: parseNonStreamOriginalPayload(text),
+            terminalScope: 'attempt_budget_exhausted',
+            attemptedChannelCount: excludeChannelIds.length,
+            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+          });
+          return reply.code(terminal.status).send(terminal.payload);
+        }
         const latency = Date.now() - startTime;
         const parsedUsage = parseProxyUsage(data);
         const resolvedUsage = await resolveProxyUsageWithSelfLogFallback({
@@ -211,12 +250,20 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: errorText || 'network failure',
         });
-        return reply.code(status || 502).send({
-          error: {
-            message: status > 0 ? errorText : `Upstream error: ${errorText}`,
-            type: 'upstream_error',
-          },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: status || 502,
+          message: status > 0 ? errorText : `Upstream error: ${errorText}`,
+          downstreamApiKeyId,
+          originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+            ? 'attempt_budget_exhausted'
+            : 'attempt',
+          attemptedChannelCount: excludeChannelIds.length,
+          maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
     }
   });

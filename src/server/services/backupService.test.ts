@@ -272,6 +272,13 @@ describe('backupService', () => {
 
     expect(result.allImported).toBe(true);
     expect(result.sections.accounts).toBe(true);
+    expect(result.appliedSettings).toContainEqual({
+      key: 'downstream_error_policy',
+      value: {
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [expect.any(Number)],
+      },
+    });
     expect(result.summary).toBeUndefined();
     expect(result.warnings).toBeUndefined();
 

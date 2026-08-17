@@ -1976,7 +1976,6 @@ describe('chat proxy stream behavior', () => {
       error: { code: 'rate_limit_exceeded', message: 'claude quota exhausted' },
     });
     expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
-      status: 429,
       errorText: 'claude quota exhausted',
     }));
     expect(recordSuccessMock).not.toHaveBeenCalled();
@@ -4708,7 +4707,7 @@ describe('chat proxy stream behavior', () => {
     expect(matches.length).toBe(1);
   });
 
-  it('emits finish_reason stop when /v1/chat/completions receives response.failed from /v1/responses upstream', async () => {
+  it('returns a non-2xx terminal when /v1/chat/completions receives response.failed before output', async () => {
     fetchModelPricingCatalogMock.mockResolvedValue({
       models: [
         {
@@ -4744,9 +4743,10 @@ describe('chat proxy stream behavior', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('"finish_reason":"stop"');
-    expect(response.body).toContain('[DONE]');
+    expect(response.statusCode).toBe(502);
+    expect(response.body).toContain('tool execution failed');
+    expect(response.body).not.toContain('"finish_reason":"stop"');
+    expect(response.body).not.toContain('[DONE]');
     expect(recordSuccessMock).not.toHaveBeenCalled();
     expect(recordFailureMock).toHaveBeenCalledTimes(1);
   });

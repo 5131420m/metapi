@@ -8,6 +8,7 @@ const fetchMock = vi.fn();
 const fetchWithObservedFirstByteMock = vi.fn();
 const getObservedResponseMetaMock = vi.fn();
 const selectChannelMock = vi.fn();
+const selectNextChannelMock = vi.fn();
 const recordSuccessMock = vi.fn();
 const recordFailureMock = vi.fn();
 const refreshModelsAndRebuildRoutesMock = vi.fn();
@@ -33,6 +34,7 @@ vi.mock('../../proxy-core/firstByteTimeout.js', () => ({
 vi.mock('../../services/tokenRouter.js', () => ({
   tokenRouter: {
     selectChannel: (...args: unknown[]) => selectChannelMock(...args),
+    selectNextChannel: (...args: unknown[]) => selectNextChannelMock(...args),
     recordSuccess: (...args: unknown[]) => recordSuccessMock(...args),
     recordFailure: (...args: unknown[]) => recordFailureMock(...args),
   },
@@ -95,6 +97,7 @@ describe('/v1/embeddings usage source logging', () => {
     fetchWithObservedFirstByteMock.mockReset();
     getObservedResponseMetaMock.mockReset();
     selectChannelMock.mockReset();
+    selectNextChannelMock.mockReset();
     recordSuccessMock.mockReset();
     recordFailureMock.mockReset();
     refreshModelsAndRebuildRoutesMock.mockReset();
@@ -116,6 +119,7 @@ describe('/v1/embeddings usage source logging', () => {
       estimatedCost: 0,
       billingDetails: null,
     });
+    selectNextChannelMock.mockReturnValue(null);
 
     await db.delete(schema.proxyLogs).run();
     await db.delete(schema.routeChannels).run();
@@ -203,5 +207,35 @@ describe('/v1/embeddings usage source logging', () => {
       status: 'success',
       errorMessage: expect.stringContaining('[usage:self-log]'),
     }));
+  });
+
+  it('rejects a malformed successful embedding body instead of recording success', async () => {
+    const selected = {
+      channel: { id: 11, routeId: 22 },
+      site: { id: 44, name: 'usage-site', url: 'https://console.example.com', platform: 'openai' },
+      account: { id: 33, username: 'usage-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-usage',
+      actualModel: 'text-embedding-3-large',
+    };
+    selectChannelMock.mockResolvedValue(selected);
+    fetchMock.mockResolvedValue(new Response('not-json', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/embeddings',
+      headers: { authorization: 'Bearer «redacted:sk-…»' },
+      payload: { model: 'text-embedding-3-large', input: 'hello' },
+    });
+
+    expect(response.statusCode, response.body).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: { type: 'server_error' },
+    });
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
   });
 });

@@ -58,6 +58,7 @@ import {
   stopUsageAggregationProjectorScheduler,
 } from './services/usageAggregationService.js';
 import { reloadBackupWebdavScheduler } from './services/backupService.js';
+import { upsertSetting } from './db/upsertSetting.js';
 import { ensureRuntimeDatabaseReady } from './runtimeDatabaseBootstrap.js';
 import { isPublicApiRoute, registerDesktopRoutes } from './desktop.js';
 import { existsSync } from 'fs';
@@ -67,6 +68,8 @@ import {
   applyRuntimeSettings,
   parseSettingFromMap,
 } from './runtimeSettingsHydration.js';
+import { commitRuntimeSettingsHydration } from './runtimeSettingsHydrationPlan.js';
+import { parseDownstreamErrorPolicyConfig } from './services/downstreamErrorPolicy.js';
 import { normalizeLogCleanupRetentionDays } from './shared/logCleanupRetentionDays.js';
 import {
   db,
@@ -178,7 +181,19 @@ try {
   await ensureProxyLogDownstreamApiKeyIdColumn();
   const finalRows = await db.select().from(schema.settings).all();
   const finalMap = toSettingsMap(finalRows);
-  applyRuntimeSettings(finalMap);
+  const downstreamKeyRows = await db.select({ id: schema.downstreamApiKeys.id })
+    .from(schema.downstreamApiKeys)
+    .all();
+  const existingDownstreamApiKeyIds = new Set<number>(downstreamKeyRows.map((row: { id: number }) => Number(row.id)));
+  await commitRuntimeSettingsHydration({
+    settingsMap: finalMap,
+    existingDownstreamApiKeyIds,
+    parseDownstreamErrorPolicyConfig,
+    persist: (normalized) => upsertSetting(normalized.key, normalized.value),
+    publish: (settingsMap) => {
+      applyRuntimeSettings(settingsMap, { existingDownstreamApiKeyIds });
+    },
+  });
   config.logCleanupConfigured = hasExplicitLogCleanupSettings(finalMap);
   if (!config.logCleanupConfigured && config.proxyLogRetentionDays > 0) {
     config.logCleanupUsageLogsEnabled = true;

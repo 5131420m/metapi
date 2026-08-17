@@ -919,6 +919,47 @@ describe('settings and auth events', () => {
     expect(persistedRows).toHaveLength(0);
   });
 
+  it('rejects invalid late runtime fields before applying earlier schedule settings', async () => {
+    const previousMode = config.checkinScheduleMode;
+    const previousIntervalHours = config.checkinIntervalHours;
+
+    for (const lateSibling of [
+      { notifyCooldownSec: -1 },
+      { proxySessionChannelConcurrencyLimit: -1 },
+      { proxySessionChannelQueueWaitMs: -1 },
+      { proxyDebugRetentionHours: 0 },
+      { proxyDebugMaxBodyBytes: 100 },
+      { proxyErrorKeywords: { invalid: true } },
+      { adminIpAllowlist: ['definitely-not-an-ip'] },
+      { routingFallbackUnitCost: 0 },
+      { proxyFirstByteTimeoutSec: -1 },
+      { tokenRouterFailureCooldownMaxSec: 0 },
+    ]) {
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/api/settings/runtime',
+        payload: {
+          checkinScheduleMode: 'interval',
+          checkinIntervalHours: 8,
+          ...lateSibling,
+        },
+      });
+
+      expect(response.statusCode).toBe(400);
+      expect(config.checkinScheduleMode).toBe(previousMode);
+      expect(config.checkinIntervalHours).toBe(previousIntervalHours);
+    }
+
+    const persistedRows = await db.select()
+      .from(schema.settings)
+      .where(inArray(schema.settings.key, [
+        'checkin_schedule_mode',
+        'checkin_interval_hours',
+      ]))
+      .all();
+    expect(persistedRows).toHaveLength(0);
+  });
+
   it('rejects resilient policy without a dedicated downstream key', async () => {
     const response = await app.inject({
       method: 'PUT',

@@ -5,9 +5,10 @@ export const DOWNSTREAM_ERROR_POLICY_MODES = [
 ] as const;
 
 export type DownstreamErrorPolicyMode = typeof DOWNSTREAM_ERROR_POLICY_MODES[number];
-export type CanonicalFailureProtocol = 'chat' | 'responses' | 'messages' | 'gemini';
+export type CanonicalFailureProtocol = 'openai' | 'chat' | 'responses' | 'messages' | 'gemini';
 export type CanonicalFailureTransport = 'http' | 'sse' | 'websocket';
 export type CanonicalFailurePhase = 'precommit' | 'postcommit';
+export type CanonicalFailureTerminalScope = 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
 export type CanonicalFailureOrigin =
   | 'downstream_request'
   | 'downstream_auth'
@@ -39,6 +40,10 @@ export type CanonicalProxyFailure = {
   protocol: CanonicalFailureProtocol;
   transport: CanonicalFailureTransport;
   phase: CanonicalFailurePhase;
+  terminalScope: CanonicalFailureTerminalScope;
+  attemptedChannelCount?: number;
+  maxChannelAttempts?: number;
+  eligibleChannelCount?: number;
   originalStatus?: number;
   originalType?: string;
   originalCode?: string;
@@ -63,6 +68,21 @@ export const DEFAULT_DOWNSTREAM_ERROR_POLICY: DownstreamErrorPolicyConfig = {
   mode: 'off',
   downstreamApiKeyIds: [],
 };
+
+export function sanitizePostcommitFailureMessage(input: {
+  message: string;
+  downstreamApiKeyId?: number | null;
+  policy: DownstreamErrorPolicyConfig;
+}): string {
+  if (
+    input.policy.mode !== 'cpa-hermes-resilient'
+    || typeof input.downstreamApiKeyId !== 'number'
+    || !input.policy.downstreamApiKeyIds.includes(input.downstreamApiKeyId)
+  ) {
+    return input.message;
+  }
+  return 'The upstream stream failed after output began.';
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -134,6 +154,7 @@ export function inferCanonicalFailureCause(
   )) {
     return 'request_scoped_not_found';
   }
+  if (status === 400 || status === 413 || status === 422) return 'request_invalid';
   if (status === 404) return 'upstream_model_unavailable';
   return 'internal_error';
 }
@@ -144,6 +165,11 @@ export function buildCanonicalUpstreamFailure(input: {
   protocol: CanonicalFailureProtocol;
   transport?: CanonicalFailureTransport;
   phase?: CanonicalFailurePhase;
+  terminalScope?: CanonicalFailureTerminalScope;
+  runtimeFailureStatus?: number | null;
+  attemptedChannelCount?: number;
+  maxChannelAttempts?: number;
+  eligibleChannelCount?: number;
   requestedModel: string;
   upstreamModel?: string;
   channelId?: number;
@@ -158,7 +184,11 @@ export function buildCanonicalUpstreamFailure(input: {
     protocol: input.protocol,
     transport: input.transport ?? 'http',
     phase: input.phase ?? 'precommit',
-    originalStatus: input.status,
+    terminalScope: input.terminalScope ?? 'attempt',
+    attemptedChannelCount: input.attemptedChannelCount,
+    maxChannelAttempts: input.maxChannelAttempts,
+    eligibleChannelCount: input.eligibleChannelCount,
+    originalStatus: input.runtimeFailureStatus ?? input.status,
     originalType: input.originalType,
     originalCode: input.originalCode,
     originalMessage: input.message,
@@ -184,6 +214,7 @@ export function buildCanonicalRoutingFailure(input: {
     protocol: input.protocol,
     transport: input.transport ?? 'http',
     phase: input.phase ?? 'precommit',
+    terminalScope: 'route_exhausted',
     originalStatus: 503,
     originalType: 'server_error',
     originalMessage: input.message || 'No available channels after retries',
@@ -202,6 +233,7 @@ export function aggregateCanonicalFailures(
       protocol: 'responses',
       transport: 'http',
       phase: 'precommit',
+      terminalScope: 'route_exhausted',
       originalStatus: 503,
       originalMessage: 'No available channels after retries',
       requestedModel: '',
@@ -217,6 +249,7 @@ export function aggregateCanonicalFailures(
     ...lastPrecommitFailure,
     origin: 'routing',
     cause: 'upstream_pool_exhausted',
+    terminalScope: 'attempt_budget_exhausted',
     originalStatus: 503,
     originalType: undefined,
     originalCode: undefined,
@@ -224,7 +257,7 @@ export function aggregateCanonicalFailures(
   };
 }
 
-function isPolicyInScope(
+function isPolicyTarget(
   failure: CanonicalProxyFailure,
   policy: DownstreamErrorPolicyConfig,
 ): boolean {
@@ -237,6 +270,13 @@ function isPolicyInScope(
     && policy.downstreamApiKeyIds.includes(downstreamApiKeyId);
 }
 
+function isPolicyInScope(
+  failure: CanonicalProxyFailure,
+  policy: DownstreamErrorPolicyConfig,
+): boolean {
+  return failure.terminalScope !== 'attempt' && isPolicyTarget(failure, policy);
+}
+
 export function resolvePublicTerminalFailure(
   failure: CanonicalProxyFailure,
   policy: DownstreamErrorPolicyConfig,
@@ -244,6 +284,22 @@ export function resolvePublicTerminalFailure(
   if (!isPolicyInScope(failure, policy)) {
     return {
       status: failure.originalStatus || 502,
+      type: failure.originalType === 'server_error' ? 'server_error' : 'upstream_error',
+      code: failure.originalCode,
+      message: failure.originalMessage,
+      rewritten: false,
+      originalPayload: failure.originalPayload,
+    };
+  }
+
+  if (
+    failure.cause === 'request_invalid'
+    || failure.originalStatus === 400
+    || failure.originalStatus === 413
+    || failure.originalStatus === 422
+  ) {
+    return {
+      status: failure.originalStatus || 400,
       type: failure.originalType === 'server_error' ? 'server_error' : 'upstream_error',
       code: failure.originalCode,
       message: failure.originalMessage,
@@ -334,20 +390,17 @@ export function resolvePublicTerminalFailure(
 export function serializePublicTerminalFailure(
   decision: PublicFailureDecision,
   protocol: CanonicalFailureProtocol = 'chat',
-): Record<string, unknown> {
-  if (!decision.rewritten && decision.originalPayload && isRecord(decision.originalPayload)) {
-    const payload = structuredClone(decision.originalPayload);
-    if (isRecord(payload.error)) {
-      if (!asTrimmedString(payload.error.message)) {
-        payload.error.message = decision.message;
+): unknown {
+  if (!decision.rewritten && decision.originalPayload !== undefined) {
+    if (isRecord(decision.originalPayload)) {
+      const payload = structuredClone(decision.originalPayload);
+      if (protocol !== 'openai' && isRecord(payload.error)) {
+        if (!asTrimmedString(payload.error.message)) payload.error.message = decision.message;
+        if (!asTrimmedString(payload.error.type)) payload.error.type = decision.type;
       }
-      if (!asTrimmedString(payload.error.type)) {
-        payload.error.type = decision.type;
-      }
-    } else if (!isRecord(payload.error) && !asTrimmedString(payload.message)) {
-      payload.message = decision.message;
+      return payload;
     }
-    return payload;
+    return structuredClone(decision.originalPayload);
   }
   if (protocol === 'messages' && decision.rewritten) {
     return {
@@ -372,12 +425,19 @@ export function resolveAggregatedPublicTerminalFailure(
   fallback: CanonicalProxyFailure,
   policy: DownstreamErrorPolicyConfig,
 ): PublicFailureDecision {
-  const scopedFailures = failures.filter((failure) => isPolicyInScope(failure, policy));
-  if (scopedFailures.length === 0) {
+  const targetedFailures = failures.filter((failure) => isPolicyTarget(failure, policy));
+  if (targetedFailures.length === 0) {
     return resolvePublicTerminalFailure(fallback, policy);
   }
   if (!isPolicyInScope(fallback, policy)) {
     return resolvePublicTerminalFailure(fallback, policy);
   }
-  return resolvePublicTerminalFailure(aggregateCanonicalFailures(scopedFailures), policy);
+  if (fallback.cause === 'request_invalid' || fallback.cause === 'request_scoped_not_found') {
+    return resolvePublicTerminalFailure(fallback, policy);
+  }
+  const aggregate = aggregateCanonicalFailures(targetedFailures);
+  return resolvePublicTerminalFailure({
+    ...aggregate,
+    terminalScope: fallback.terminalScope,
+  }, policy);
 }

@@ -27,7 +27,7 @@ describe('applyRuntimeSettings', () => {
       ['serverchan_enabled', JSON.stringify(false)],
       ['global_allowed_models', JSON.stringify(['gpt-5.4', ' claude-3.7-sonnet '])],
       ['downstream_error_policy', JSON.stringify({ mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [17] })],
-    ]));
+    ]), { existingDownstreamApiKeyIds: new Set([17]) });
 
     expect(config.disableCrossProtocolFallback).toBe(true);
     expect(config.responsesCompactFallbackToResponsesEnabled).toBe(true);
@@ -36,6 +36,34 @@ describe('applyRuntimeSettings', () => {
     expect(config.serverChanEnabled).toBe(false);
     expect(config.globalAllowedModels).toEqual(['gpt-5.4', 'claude-3.7-sonnet']);
     expect(config.downstreamErrorPolicy).toEqual({ mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [17] });
+  });
+
+  it('drops stale downstream key references and disables an empty resilient policy', () => {
+    config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
+
+    const result = applyRuntimeSettings(new Map([
+      ['downstream_error_policy', JSON.stringify({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [17, 18],
+      })],
+    ]), { existingDownstreamApiKeyIds: new Set([18]) });
+
+    expect(config.downstreamErrorPolicy).toEqual({
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [18],
+    });
+    expect(result.normalizedSettings).toContainEqual({
+      key: 'downstream_error_policy',
+      value: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [18] },
+    });
+
+    applyRuntimeSettings(new Map([
+      ['downstream_error_policy', JSON.stringify({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [17],
+      })],
+    ]), { existingDownstreamApiKeyIds: new Set() });
+    expect(config.downstreamErrorPolicy).toEqual({ mode: 'off', downstreamApiKeyIds: [] });
   });
 
   it('normalizes smtpPort to a positive integer during hydration', () => {

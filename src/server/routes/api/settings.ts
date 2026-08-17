@@ -993,6 +993,92 @@ export async function settingsRoutes(app: FastifyInstance) {
         });
       }
     }
+    if (body.checkinCron !== undefined && !cron.validate(body.checkinCron)) {
+      return reply.code(400).send({ success: false, message: '签到 Cron 表达式无效' });
+    }
+    if (body.checkinScheduleMode !== undefined && body.checkinScheduleMode !== 'cron' && body.checkinScheduleMode !== 'interval') {
+      return reply.code(400).send({ success: false, message: '签到方式无效：仅支持 cron 或 interval' });
+    }
+    if (body.checkinIntervalHours !== undefined) {
+      const intervalHours = Number(body.checkinIntervalHours);
+      if (!Number.isFinite(intervalHours) || intervalHours < 1 || intervalHours > 24) {
+        return reply.code(400).send({ success: false, message: '签到间隔必须是 1 到 24 的整数小时' });
+      }
+    }
+    if (body.balanceRefreshCron !== undefined && !cron.validate(body.balanceRefreshCron)) {
+      return reply.code(400).send({ success: false, message: '余额刷新 Cron 表达式无效' });
+    }
+    if (body.smtpPort !== undefined) {
+      const smtpPort = Number(body.smtpPort);
+      if (!Number.isFinite(smtpPort) || smtpPort <= 0) {
+        return reply.code(400).send({ success: false, message: 'SMTP 端口无效' });
+      }
+    }
+    if (body.notifyCooldownSec !== undefined) {
+      const notifyCooldownSec = Number(body.notifyCooldownSec);
+      if (!Number.isFinite(notifyCooldownSec) || notifyCooldownSec < 0) {
+        return reply.code(400).send({ success: false, message: '告警冷静期必须是大于等于 0 的数字（秒）' });
+      }
+    }
+    if (body.proxySessionChannelConcurrencyLimit !== undefined) {
+      const limit = Number(body.proxySessionChannelConcurrencyLimit);
+      if (!Number.isFinite(limit) || limit < 0) {
+        return reply.code(400).send({ success: false, message: '会话通道并发上限必须是大于等于 0 的整数' });
+      }
+    }
+    if (body.proxySessionChannelQueueWaitMs !== undefined) {
+      const queueWaitMs = Number(body.proxySessionChannelQueueWaitMs);
+      if (!Number.isFinite(queueWaitMs) || queueWaitMs < 0) {
+        return reply.code(400).send({ success: false, message: '会话通道排队等待时间必须是大于等于 0 的整数毫秒' });
+      }
+    }
+    if (body.proxyDebugRetentionHours !== undefined) {
+      const retentionHours = Number(body.proxyDebugRetentionHours);
+      if (!Number.isFinite(retentionHours) || retentionHours < 1) {
+        return reply.code(400).send({ success: false, message: '代理调试保留时长必须是大于等于 1 的整数小时' });
+      }
+    }
+    if (body.proxyDebugMaxBodyBytes !== undefined) {
+      const maxBodyBytes = Number(body.proxyDebugMaxBodyBytes);
+      if (!Number.isFinite(maxBodyBytes) || maxBodyBytes < 1024) {
+        return reply.code(400).send({ success: false, message: '代理调试抓取体积上限必须是大于等于 1024 的整数字节' });
+      }
+    }
+    if (body.proxyErrorKeywords !== undefined) {
+      try {
+        parseProxyErrorKeywords(body.proxyErrorKeywords);
+      } catch (err: any) {
+        return reply.code(400).send({ success: false, message: err?.message || '上游错误关键词格式无效' });
+      }
+    }
+    if (body.adminIpAllowlist !== undefined) {
+      const nextAllowlist = toStringList(body.adminIpAllowlist);
+      const invalidAllowlistEntries = findInvalidIpAllowlistEntries(nextAllowlist);
+      if (invalidAllowlistEntries.length > 0) {
+        return reply.code(400).send({
+          success: false,
+          message: `保存失败：IP 白名单包含无效条目：${invalidAllowlistEntries.join(', ')}。请使用单个 IP 或 IPv4 CIDR 网段（例如 192.168.1.10 或 192.168.1.0/24）。`,
+        });
+      }
+    }
+    if (body.routingFallbackUnitCost !== undefined) {
+      const unitCost = Number(body.routingFallbackUnitCost);
+      if (!Number.isFinite(unitCost) || unitCost <= 0) {
+        return reply.code(400).send({ success: false, message: '无价模型默认单价必须是大于 0 的数字' });
+      }
+    }
+    if (body.proxyFirstByteTimeoutSec !== undefined) {
+      const timeoutSec = Number(body.proxyFirstByteTimeoutSec);
+      if (!Number.isFinite(timeoutSec) || timeoutSec < 0) {
+        return reply.code(400).send({ success: false, message: '首字超时必须是大于等于 0 的数字（秒）' });
+      }
+    }
+    if (
+      body.tokenRouterFailureCooldownMaxSec !== undefined
+      && normalizeTokenRouterFailureCooldownMaxSec(body.tokenRouterFailureCooldownMaxSec) == null
+    ) {
+      return reply.code(400).send({ success: false, message: '路由失败冷却上限必须是大于 0 的数字（秒）' });
+    }
 
     const webhookTouched = body.webhookUrl !== undefined || body.webhookEnabled !== undefined;
     const nextWebhookUrl = body.webhookUrl !== undefined
