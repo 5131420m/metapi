@@ -33,6 +33,22 @@ function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function mergeHeaderSourcesCaseInsensitive(
+  sources: Array<Record<string, string> | undefined>,
+): Record<string, string> {
+  const merged = new Map<string, { key: string; value: string }>();
+  for (const source of sources) {
+    if (!source) continue;
+    for (const [key, value] of Object.entries(source)) {
+      const normalizedKey = key.toLowerCase();
+      const previous = merged.get(normalizedKey);
+      if (previous) merged.delete(normalizedKey);
+      merged.set(normalizedKey, { key, value });
+    }
+  }
+  return Object.fromEntries(Array.from(merged.values(), ({ key, value }) => [key, value]));
+}
+
 function resolveRequestedModelForPayloadRules(input: {
   modelName: string;
   openaiBody: Record<string, unknown>;
@@ -461,6 +477,8 @@ export function buildUpstreamEndpointRequest(input: {
   codexIdentityMode?: CodexIdentityMode;
   codexIdentityScopeKey?: string | null;
   codexIdentityTurnKey?: string | null;
+  responsesWebsocketTransport?: boolean;
+  preserveWebsocketIncrementalMode?: boolean;
 }): {
   path: string;
   headers: Record<string, string>;
@@ -529,13 +547,16 @@ export function buildUpstreamEndpointRequest(input: {
   const codexPassthroughHeaders = sitePlatform === 'codex'
     ? extractCodexPassthroughHeaders(input.downstreamHeaders)
     : {};
-  const commonHeaders: Record<string, string> = {
-    ...passthroughHeaders,
-    ...codexPassthroughHeaders,
-    'Content-Type': 'application/json',
-    ...(input.providerHeaders || {}),
-  };
+  const commonHeaders = mergeHeaderSourcesCaseInsensitive([
+    { 'Content-Type': 'application/json' },
+    input.providerHeaders,
+    passthroughHeaders,
+    codexPassthroughHeaders,
+  ]);
   if (!isClaudeUpstream) {
+    for (const key of Object.keys(commonHeaders)) {
+      if (key.toLowerCase() === 'authorization') delete commonHeaders[key];
+    }
     commonHeaders.Authorization = `Bearer ${input.tokenValue}`;
   }
 
@@ -685,12 +706,8 @@ export function buildUpstreamEndpointRequest(input: {
   }
 
   if (input.endpoint === 'responses') {
-    const responsesWebsocketTransport = getInputHeader(
-      input.downstreamHeaders,
-      'x-metapi-responses-websocket-transport',
-    ) === '1';
-    const websocketMode = Object.entries(input.downstreamHeaders || {}).find(([rawKey]) => rawKey.trim().toLowerCase() === 'x-metapi-responses-websocket-mode');
-    const preserveWebsocketIncrementalMode = asTrimmedString(websocketMode?.[1]).toLowerCase() === 'incremental';
+    const responsesWebsocketTransport = input.responsesWebsocketTransport === true;
+    const preserveWebsocketIncrementalMode = input.preserveWebsocketIncrementalMode === true;
     const responsesHeaders = input.downstreamFormat === 'responses'
       ? extractResponsesPassthroughHeaders(input.downstreamHeaders)
       : {};
@@ -837,7 +854,7 @@ export function buildClaudeCountTokensUpstreamRequest(input: {
       .filter(Boolean),
     ...betas,
   ];
-  const effectiveClaudeHeaders = {
+  const effectiveClaudeHeaders: Record<string, string> = {
     ...claudeHeaders,
     ...(mergedBetas.length > 0
       ? { 'anthropic-beta': Array.from(new Set(mergedBetas)).join(',') }

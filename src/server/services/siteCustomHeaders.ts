@@ -111,12 +111,9 @@ export function mergeHeadersWithSiteCustomHeaders(
     return requestHeaders;
   }
 
-  const merged = new Headers(normalizedSiteHeaders);
-  if (requestHeaders) {
-    const explicitHeaders = new Headers(requestHeaders);
-    explicitHeaders.forEach((value, key) => {
-      merged.set(key, value);
-    });
+  const merged = new Headers(requestHeaders || {});
+  for (const [key, value] of Object.entries(normalizedSiteHeaders)) {
+    merged.set(key, value);
   }
   return merged;
 }

@@ -1113,9 +1113,8 @@ describe('buildUpstreamEndpointRequest', () => {
         messages: [{ role: 'user', content: 'hello codex' }],
       },
       downstreamFormat: 'openai',
-      downstreamHeaders: {
-        'x-metapi-responses-websocket-transport': '1',
-      },
+      downstreamHeaders: {},
+      responsesWebsocketTransport: true,
       providerHeaders: {
         Originator: 'codex_cli_rs',
       },
@@ -1138,10 +1137,10 @@ describe('buildUpstreamEndpointRequest', () => {
       },
       downstreamFormat: 'openai',
       downstreamHeaders: {
-        'x-metapi-responses-websocket-transport': '1',
         'user-agent': 'client-ua/2.0',
         'x-codex-beta-features': 'client-beta',
       },
+      responsesWebsocketTransport: true,
       providerHeaders: {
         Originator: 'codex_cli_rs',
       },
@@ -1191,9 +1190,9 @@ describe('buildUpstreamEndpointRequest', () => {
       },
       downstreamFormat: 'openai',
       downstreamHeaders: {
-        'x-metapi-responses-websocket-transport': '1',
         'x-metapi-tester-forced-channel-id': '77',
       },
+      responsesWebsocketTransport: true,
       providerHeaders: {
         Originator: 'codex_cli_rs',
       },

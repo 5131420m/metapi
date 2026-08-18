@@ -82,6 +82,10 @@ type RuntimeSettings = {
   systemProxyUrl: string;
   proxyErrorKeywords: string[];
   proxyEmptyContentFailEnabled: boolean;
+  downstreamErrorPolicy: {
+    mode: 'off' | 'passthrough' | 'cpa-hermes-resilient';
+    downstreamApiKeyIds: number[];
+  };
   proxyTokenMasked?: string;
   adminIpAllowlist?: string[];
   currentAdminIp?: string;
@@ -365,9 +369,11 @@ export default function Settings() {
     systemProxyUrl: '',
     proxyErrorKeywords: [],
     proxyEmptyContentFailEnabled: false,
+    downstreamErrorPolicy: { mode: 'off', downstreamApiKeyIds: [] },
   });
   const [proxyTokenSuffix, setProxyTokenSuffix] = useState('');
   const [proxyErrorKeywordsText, setProxyErrorKeywordsText] = useState('');
+  const [downstreamApiKeys, setDownstreamApiKeys] = useState<Array<{ id: number; name: string; keyMasked?: string }>>([]);
   const [maskedToken, setMaskedToken] = useState('');
   const [loading, setLoading] = useState(true);
   const [savingSchedule, setSavingSchedule] = useState(false);
@@ -656,11 +662,13 @@ export default function Settings() {
   const loadSettings = async () => {
     setLoading(true);
     try {
-      const [authInfo, runtimeInfo, runtimeDatabaseInfo] = await Promise.all([
+      const [authInfo, runtimeInfo, runtimeDatabaseInfo, downstreamKeyInfo] = await Promise.all([
         api.getAuthInfo(),
         api.getRuntimeSettings(),
         api.getRuntimeDatabaseConfig(),
+        api.getDownstreamApiKeys().catch(() => ({ items: [] })),
       ]);
+      setDownstreamApiKeys(Array.isArray(downstreamKeyInfo?.items) ? downstreamKeyInfo.items : []);
       setMaskedToken(authInfo.masked || '****');
       const routeCooldownInput = resolveRouteCooldownInput(runtimeInfo.tokenRouterFailureCooldownMaxSec);
       setRuntime({
@@ -704,6 +712,14 @@ export default function Settings() {
           ? runtimeInfo.proxyErrorKeywords.filter((item: unknown) => typeof item === 'string')
           : [],
         proxyEmptyContentFailEnabled: !!runtimeInfo.proxyEmptyContentFailEnabled,
+        downstreamErrorPolicy: runtimeInfo.downstreamErrorPolicy?.mode
+          ? {
+            mode: runtimeInfo.downstreamErrorPolicy.mode,
+            downstreamApiKeyIds: Array.isArray(runtimeInfo.downstreamErrorPolicy.downstreamApiKeyIds)
+              ? runtimeInfo.downstreamErrorPolicy.downstreamApiKeyIds.filter((item: unknown) => Number.isInteger(item))
+              : [],
+          }
+          : { mode: 'off', downstreamApiKeyIds: [] },
         proxyTokenMasked: runtimeInfo.proxyTokenMasked || '',
         adminIpAllowlist: Array.isArray(runtimeInfo.adminIpAllowlist)
           ? runtimeInfo.adminIpAllowlist.filter((item: unknown) => typeof item === 'string')
@@ -954,6 +970,7 @@ export default function Settings() {
       const res = await api.updateRuntimeSettings({
         proxyErrorKeywords: keywords,
         proxyEmptyContentFailEnabled: runtime.proxyEmptyContentFailEnabled,
+        downstreamErrorPolicy: runtime.downstreamErrorPolicy,
       });
       const nextKeywords = Array.isArray(res?.proxyErrorKeywords)
         ? res.proxyErrorKeywords
@@ -964,6 +981,7 @@ export default function Settings() {
         proxyEmptyContentFailEnabled: typeof res?.proxyEmptyContentFailEnabled === 'boolean'
           ? res.proxyEmptyContentFailEnabled
           : prev.proxyEmptyContentFailEnabled,
+        downstreamErrorPolicy: res?.downstreamErrorPolicy || prev.downstreamErrorPolicy,
       }));
       setProxyErrorKeywordsText(nextKeywords.join('\n'));
       toast.success('代理失败规则已保存');
@@ -1523,6 +1541,52 @@ export default function Settings() {
             />
             空内容（completion=0，即使 prompt 有 token 也算）判定失败
           </label>
+          <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 12, marginTop: 4, marginBottom: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>下游终态错误策略</div>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
+              仅在通道尝试预算耗尽或无候选路由、且响应尚未提交时生效。禁止伪造 2xx、assistant 文本和 tool call。
+            </div>
+            <select
+              value={runtime.downstreamErrorPolicy.mode}
+              onChange={(e) => setRuntime((prev) => ({
+                ...prev,
+                downstreamErrorPolicy: {
+                  ...prev.downstreamErrorPolicy,
+                  mode: e.target.value as typeof prev.downstreamErrorPolicy.mode,
+                },
+              }))}
+              style={{ ...inputStyle, marginBottom: 8 }}
+            >
+              <option value="off">关闭</option>
+              <option value="passthrough">原样透传</option>
+              <option value="cpa-hermes-resilient">CPA/Hermes 韧性模式</option>
+            </select>
+            {runtime.downstreamErrorPolicy.mode === 'cpa-hermes-resilient' && (
+              <div style={{ display: 'grid', gap: 6 }}>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>专用下游 API Key（可多选）</div>
+                {downstreamApiKeys.length === 0 ? (
+                  <div style={{ fontSize: 12, color: 'var(--color-warning)' }}>暂无已管理的下游 API Key，请先在下游 API Keys 页面创建专用 Key。</div>
+                ) : downstreamApiKeys.map((item) => (
+                  <label key={item.id} style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={runtime.downstreamErrorPolicy.downstreamApiKeyIds.includes(item.id)}
+                      onChange={(e) => setRuntime((prev) => ({
+                        ...prev,
+                        downstreamErrorPolicy: {
+                          ...prev.downstreamErrorPolicy,
+                          downstreamApiKeyIds: e.target.checked
+                            ? [...prev.downstreamErrorPolicy.downstreamApiKeyIds, item.id]
+                            : prev.downstreamErrorPolicy.downstreamApiKeyIds.filter((id) => id !== item.id),
+                        },
+                      }))}
+                    />
+                    {item.name} {item.keyMasked ? `(${item.keyMasked})` : ''}
+                  </label>
+                ))}
+              </div>
+            )}
+          </div>
           <div>
             <button onClick={saveProxyFailureRules} disabled={savingProxyFailureRules} className="btn btn-primary">
               {savingProxyFailureRules ? <><span className="spinner spinner-sm" style={{ borderTopColor: 'white', borderColor: 'rgba(255,255,255,0.3)' }} /> 保存中...</> : '保存失败规则'}

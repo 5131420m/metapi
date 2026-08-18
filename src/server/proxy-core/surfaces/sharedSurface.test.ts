@@ -604,6 +604,305 @@ describe('selectSurfaceChannelForAttempt', () => {
     });
   });
 
+  it('rewrites an exhausted upstream auth failure only for the configured downstream key', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+    shouldRetryProxyRequestMock.mockReturnValue(false);
+    isTokenExpiredErrorMock.mockReturnValue(false);
+    recordOauthQuotaResetHintMock.mockResolvedValue(null);
+
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [44],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'responses',
+        downstreamPath: '/v1/responses',
+        maxRetries: 2,
+        clientContext: null,
+        downstreamApiKeyId: 44,
+      });
+
+      await expect(toolkit.handleUpstreamFailure({
+        selected: {
+          channel: { id: 11, routeId: 22 },
+          account: { id: 33, username: 'oauth-user' },
+          site: { name: 'Codex OAuth' },
+          actualModel: 'upstream-model',
+        },
+        requestedModel: 'gpt-5.2',
+        modelName: 'upstream-model',
+        status: 401,
+        errText: 'expired token',
+        rawErrText: 'expired token',
+        latencyMs: 900,
+        retryCount: 2,
+      })).resolves.toMatchObject({
+        action: 'respond',
+        status: 503,
+        payload: {
+          error: {
+            type: 'server_error',
+            code: 'metapi_upstream_auth_exhausted',
+          },
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('uses Anthropic error shape for scoped Claude Messages terminal failures', async () => {
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [44],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'chat',
+        downstreamPath: '/v1/messages',
+        maxRetries: 2,
+        clientContext: null,
+        downstreamApiKeyId: 44,
+      });
+
+      expect(toolkit.resolveTerminalFailure({
+        requestedModel: 'claude-sonnet',
+        modelName: 'claude-sonnet',
+        status: 401,
+        message: 'expired upstream token',
+        terminalScope: 'attempt_budget_exhausted',
+      })).toEqual({
+        action: 'respond',
+        status: 503,
+        payload: {
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: 'All configured upstream channels are currently unavailable.',
+          },
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('uses Anthropic error shape for scoped Claude count_tokens terminal failures', async () => {
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [44],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'chat',
+        downstreamPath: '/v1/messages/count_tokens',
+        maxRetries: 2,
+        clientContext: null,
+        downstreamApiKeyId: 44,
+      });
+
+      expect(toolkit.resolveTerminalFailure({
+        requestedModel: 'claude-sonnet',
+        modelName: 'claude-sonnet',
+        status: 401,
+        message: 'expired upstream token',
+        terminalScope: 'attempt_budget_exhausted',
+      })).toMatchObject({
+        status: 503,
+        payload: {
+          type: 'error',
+          error: { type: 'api_error' },
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('does not rewrite an internal websocket HTTP bridge request', async () => {
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [44],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'responses',
+        downstreamPath: '/v1/responses',
+        maxRetries: 2,
+        clientContext: null,
+        downstreamApiKeyId: 44,
+        downstreamTransport: 'websocket',
+      });
+
+      expect(toolkit.resolveTerminalFailure({
+        requestedModel: 'gpt-5.2',
+        modelName: 'gpt-5.2',
+        status: 401,
+        message: 'expired upstream token',
+        terminalScope: 'attempt_budget_exhausted',
+      })).toEqual({
+        action: 'respond',
+        status: 401,
+        payload: {
+          error: {
+            message: 'expired upstream token',
+            type: 'upstream_error',
+          },
+        },
+      });
+
+      expect(toolkit.resolveRoutingFailure({
+        requestedModel: 'gpt-5.2',
+        message: 'No available channels for this model',
+      })).toEqual({
+        action: 'respond',
+        status: 503,
+        payload: {
+          error: {
+            message: 'No available channels for this model',
+            type: 'server_error',
+          },
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('preserves the original upstream JSON payload outside policy scope', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+    shouldRetryProxyRequestMock.mockReturnValue(false);
+    isTokenExpiredErrorMock.mockReturnValue(false);
+    recordOauthQuotaResetHintMock.mockResolvedValue(null);
+
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [44],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'responses',
+        downstreamPath: '/v1/responses',
+        maxRetries: 0,
+        clientContext: null,
+        downstreamApiKeyId: 45,
+      });
+      const originalPayload = {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          code: 'provider_specific_code',
+          message: 'provider-specific failure',
+          details: { retry_after_ms: 1250 },
+        },
+        request_id: 'req_provider_1',
+      };
+
+      await expect(toolkit.handleUpstreamFailure({
+        selected: {
+          channel: { id: 11, routeId: 22 },
+          account: { id: 33, username: 'oauth-user' },
+          site: { name: 'Codex OAuth' },
+          actualModel: 'upstream-model',
+        },
+        requestedModel: 'gpt-5.2',
+        modelName: 'upstream-model',
+        status: 429,
+        errText: 'provider-specific failure',
+        rawErrText: JSON.stringify(originalPayload),
+        originalPayload,
+        latencyMs: 100,
+        retryCount: 0,
+      })).resolves.toEqual({
+        action: 'respond',
+        status: 429,
+        payload: originalPayload,
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('aggregates mixed exhausted channel failures instead of exposing only the last cause', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    isTokenExpiredErrorMock.mockReturnValue(false);
+    recordOauthQuotaResetHintMock.mockResolvedValue(null);
+
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [44],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'responses',
+        downstreamPath: '/v1/responses',
+        maxRetries: 1,
+        clientContext: null,
+        downstreamApiKeyId: 44,
+      });
+      const firstSelected = {
+        channel: { id: 11, routeId: 22 },
+        account: { id: 33, username: 'oauth-user' },
+        site: { name: 'Codex OAuth' },
+        actualModel: 'upstream-model',
+      };
+
+      await expect(toolkit.handleUpstreamFailure({
+        selected: firstSelected,
+        requestedModel: 'gpt-5.2',
+        modelName: 'upstream-model',
+        status: 401,
+        errText: 'expired token',
+        latencyMs: 100,
+        retryCount: 0,
+      })).resolves.toEqual({ action: 'retry' });
+
+      await expect(toolkit.handleUpstreamFailure({
+        selected: { ...firstSelected, channel: { id: 12, routeId: 22 } },
+        requestedModel: 'gpt-5.2',
+        modelName: 'upstream-model',
+        status: 504,
+        errText: 'upstream timed out',
+        latencyMs: 200,
+        retryCount: 1,
+      })).resolves.toMatchObject({
+        action: 'respond',
+        status: 503,
+        payload: {
+          error: { code: 'metapi_upstream_pool_exhausted' },
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
   it('returns terminal failures even when final alerting throws', async () => {
     composeProxyLogMessageMock.mockReturnValue('normalized error');
     formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
@@ -786,6 +1085,98 @@ describe('selectSurfaceChannelForAttempt', () => {
       errorText: 'stream exploded',
       modelName: 'upstream-model',
     });
+  });
+
+  it('does not penalize the upstream channel for local stream processing failures', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+
+    const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+    const toolkit = createSurfaceFailureToolkit({
+      warningScope: 'responses',
+      downstreamPath: '/v1/responses',
+      maxRetries: 2,
+      clientContext: null,
+      downstreamApiKeyId: null,
+    });
+
+    await toolkit.recordStreamFailure({
+      selected: {
+        channel: { id: 11, routeId: 22 },
+        account: { id: 33, username: 'oauth-user' },
+        site: { name: 'Codex OAuth' },
+        actualModel: 'upstream-model',
+      },
+      requestedModel: 'gpt-5.2',
+      modelName: 'upstream-model',
+      errorMessage: 'stream processing failed',
+      latencyMs: 450,
+      retryCount: 1,
+      failureSource: 'processing',
+      runtimeFailureStatus: null,
+    });
+
+    expect(recordFailureMock).not.toHaveBeenCalled();
+    expect(insertProxyLogMock).toHaveBeenCalled();
+  });
+
+  it('keeps pre-commit stream failures marked as pre-commit in canonical aggregation', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [12],
+    };
+    try {
+      const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+      const toolkit = createSurfaceFailureToolkit({
+        warningScope: 'responses',
+        downstreamPath: '/v1/responses',
+        maxRetries: 2,
+        clientContext: null,
+        downstreamApiKeyId: 12,
+      });
+      const selected = {
+        channel: { id: 11, routeId: 22 },
+        account: { id: 33, username: 'oauth-user' },
+        site: { name: 'Codex OAuth' },
+        actualModel: 'upstream-model',
+      };
+
+      await toolkit.recordStreamFailure({
+        selected,
+        requestedModel: 'gpt-5.2',
+        modelName: 'upstream-model',
+        errorMessage: 'upstream token expired',
+        latencyMs: 450,
+        retryCount: 1,
+        runtimeFailureStatus: 401,
+        phase: 'precommit',
+      });
+
+      expect(toolkit.resolveTerminalFailure({
+        selected,
+        requestedModel: 'gpt-5.2',
+        modelName: 'upstream-model',
+        status: 401,
+        message: 'upstream token expired',
+        isStream: true,
+        phase: 'precommit',
+        terminalScope: 'attempt_budget_exhausted',
+      })).toMatchObject({
+        status: 503,
+        payload: {
+          error: { code: 'metapi_upstream_auth_exhausted' },
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
   });
 
   it('refreshes oauth tokens through the shared recover helper and retries the rebuilt request', async () => {

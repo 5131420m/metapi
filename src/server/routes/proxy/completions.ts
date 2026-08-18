@@ -9,6 +9,7 @@ import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageFallbackService.js';
 import { mergeProxyUsage, parseProxyUsage, pullSseDataEvents } from '../../services/proxyUsageParser.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
+import { parseNonStreamOriginalPayload, resolveNonStreamTerminalFailure } from '../../proxy-core/surfaces/nonStreamSurface.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
@@ -28,6 +29,7 @@ import {
   getTesterForcedChannelId,
   selectProxyChannelForAttempt,
 } from '../../proxy-core/channelSelection.js';
+import { pipeLegacyCompletionsStream } from '../../proxy-core/surfaces/legacyCompletionsStream.js';
 
 export async function completionsProxyRoute(app: FastifyInstance) {
   app.post('/v1/completions', async (request: FastifyRequest, reply: FastifyReply) => {
@@ -71,9 +73,15 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: forcedChannelId ? noChannelMessage : 'No available channels after retries',
         });
-        return reply.code(503).send({
-          error: { message: noChannelMessage, type: 'server_error' },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: 503,
+          message: noChannelMessage,
+          downstreamApiKeyId,
+          cause: 'routing',
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
 
       excludeChannelIds.push(selected.channel.id);
@@ -118,56 +126,51 @@ export async function completionsProxyRoute(app: FastifyInstance) {
         }, { requestScopeId: siteApiEndpointRequestScopeId });
 
         if (isStream) {
-          reply.raw.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          });
-
           const reader = upstream.body?.getReader();
           if (!reader) {
-            reply.raw.end();
-            return;
+            throw new Error('upstream completion stream has no readable body');
           }
-
-          const decoder = new TextDecoder();
-          let parsedUsage: ReturnType<typeof parseProxyUsage> = {
-            promptTokens: 0,
-            completionTokens: 0,
-            totalTokens: 0,
-            cacheReadTokens: 0,
-            cacheCreationTokens: 0,
-            promptTokensIncludeCache: null,
-          };
-          let sseBuffer = '';
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              const chunk = decoder.decode(value, { stream: true });
-              reply.raw.write(chunk);
-
-              sseBuffer += chunk;
-              const pulled = pullSseDataEvents(sseBuffer);
-              sseBuffer = pulled.rest;
-              for (const eventPayload of pulled.events) {
-                try {
-                  parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(JSON.parse(eventPayload)));
-                } catch {}
-              }
-            }
-            if (sseBuffer.trim().length > 0) {
-              const pulled = pullSseDataEvents(`${sseBuffer}\n\n`);
-              for (const eventPayload of pulled.events) {
-                try {
-                  parsedUsage = mergeProxyUsage(parsedUsage, parseProxyUsage(JSON.parse(eventPayload)));
-                } catch {}
-              }
-            }
-          } finally {
-            reader.releaseLock();
+          const streamResult = await pipeLegacyCompletionsStream({
+            reader,
+            commit: () => reply.raw.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+            }),
+            write: (chunk) => reply.raw.write(chunk),
+          });
+          if (streamResult.committed && !reply.raw.writableEnded && !reply.raw.destroyed) {
             reply.raw.end();
           }
+          if (streamResult.status === 'failed') {
+            const errorText = streamResult.errorMessage || 'completion stream failed';
+            await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
+              status: 502,
+              errorText,
+              modelName: upstreamModel,
+            }));
+            logProxy(
+              selected, requestedModel, 'failed', 502, Date.now() - startTime, errorText, retryCount, downstreamApiKeyId,
+              0, 0, 0, 0, null, clientContext, downstreamPath, null, true, firstByteLatencyMs,
+            );
+            if (streamResult.committed) return;
+            if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+              retryCount++;
+              continue;
+            }
+            const terminal = resolveNonStreamTerminalFailure({
+              protocol: 'openai',
+              requestedModel,
+              status: 502,
+              message: errorText,
+              downstreamApiKeyId,
+              terminalScope: 'attempt_budget_exhausted',
+              attemptedChannelCount: excludeChannelIds.length,
+              maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+            });
+            return reply.code(terminal.status).send(terminal.payload);
+          }
+          const parsedUsage = streamResult.usage;
 
           const latency = Date.now() - startTime;
           const resolvedUsage = await resolveProxyUsageWithSelfLogFallback({
@@ -267,9 +270,20 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             reason: failure.reason,
           });
 
-          return reply.code(failure.status).send({
-            error: { message: errText, type: 'upstream_error' },
+          const terminal = resolveNonStreamTerminalFailure({
+            protocol: 'openai',
+            requestedModel,
+            status: failure.status,
+            message: errText,
+            downstreamApiKeyId,
+            originalPayload: data,
+            terminalScope: shouldRetryProxyRequest(failure.status, errText)
+              ? 'attempt_budget_exhausted'
+              : 'attempt',
+            attemptedChannelCount: excludeChannelIds.length,
+            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
           });
+          return reply.code(terminal.status).send(terminal.payload);
         }
 
         const resolvedUsage = await resolveProxyUsageWithSelfLogFallback({
@@ -368,9 +382,20 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           model: requestedModel,
           reason: errorText || 'network failure',
         });
-        return reply.code(status || 502).send({
-          error: { message: status > 0 ? errorText : `Upstream error: ${errorText}`, type: 'upstream_error' },
+        const terminal = resolveNonStreamTerminalFailure({
+          protocol: 'openai',
+          requestedModel,
+          status: status || 502,
+          message: status > 0 ? errorText : `Upstream error: ${errorText}`,
+          downstreamApiKeyId,
+          originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+            ? 'attempt_budget_exhausted'
+            : 'attempt',
+          attemptedChannelCount: excludeChannelIds.length,
+          maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });
+        return reply.code(terminal.status).send(terminal.payload);
       }
     }
   });

@@ -16,18 +16,32 @@ type ProxyStreamLifecycleInput<TEvent> = {
   handleEvent(event: TEvent): Promise<boolean | void> | boolean | void;
   onEof?: () => Promise<void> | void;
   onReadError?: (error: unknown) => Promise<void> | void;
+  onProcessingError?: (error: unknown) => Promise<void> | void;
 };
 
 export function createProxyStreamLifecycle<TEvent>(input: ProxyStreamLifecycleInput<TEvent>) {
   const flushBuffer = async (buffer: string): Promise<{ rest: string; stop: boolean }> => {
-    const pulled = input.pullEvents(buffer);
-    for (const event of pulled.events) {
-      if (await input.handleEvent(event)) {
-        return {
-          rest: pulled.rest,
-          stop: true,
-        };
+    let pulled: PulledEventBatch<TEvent>;
+    try {
+      pulled = input.pullEvents(buffer);
+    } catch (error) {
+      if (!input.onProcessingError) throw error;
+      await input.onProcessingError(error);
+      return { rest: '', stop: true };
+    }
+    try {
+      for (const event of pulled.events) {
+        if (await input.handleEvent(event)) {
+          return {
+            rest: pulled.rest,
+            stop: true,
+          };
+        }
       }
+    } catch (error) {
+      if (!input.onProcessingError) throw error;
+      await input.onProcessingError(error);
+      return { rest: pulled.rest, stop: true };
     }
 
     return {

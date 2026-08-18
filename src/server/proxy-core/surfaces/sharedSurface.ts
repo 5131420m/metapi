@@ -20,6 +20,14 @@ import { refreshOauthAccessTokenSingleflight } from '../../services/oauth/refres
 import { proxyChannelCoordinator } from '../../services/proxyChannelCoordinator.js';
 import { readRuntimeResponseText } from '../executors/types.js';
 import { selectProxyChannelForAttempt } from '../channelSelection.js';
+import { config } from '../../config.js';
+import {
+  buildCanonicalRoutingFailure,
+  buildCanonicalUpstreamFailure,
+  resolveAggregatedPublicTerminalFailure,
+  resolvePublicTerminalFailure,
+  serializePublicTerminalFailure,
+} from '../../services/downstreamErrorPolicy.js';
 
 type SelectedChannel = Awaited<ReturnType<typeof tokenRouter.selectChannel>>;
 type SurfaceWarningScope = 'chat' | 'responses';
@@ -34,12 +42,7 @@ type SurfaceSelectedChannel = {
 type SurfaceFailureResponse = {
   action: 'respond';
   status: number;
-  payload: {
-    error: {
-      message: string;
-      type: 'upstream_error';
-    };
-  };
+  payload: unknown;
 };
 
 type SurfaceFailureOutcome =
@@ -475,7 +478,10 @@ export function createSurfaceFailureToolkit(input: {
   maxRetries: number;
   clientContext?: DownstreamClientContext | null;
   downstreamApiKeyId?: number | null;
+  downstreamTransport?: 'http' | 'websocket';
 }) {
+  const downstreamErrorPolicy = structuredClone(config.downstreamErrorPolicy);
+  const terminalFailures: ReturnType<typeof buildCanonicalUpstreamFailure>[] = [];
   const log = async (args: {
     selected: SurfaceSelectedChannel;
     modelRequested: string;
@@ -522,6 +528,61 @@ export function createSurfaceFailureToolkit(input: {
     ? { action: 'retry' as const }
     : null;
 
+  const parseOriginalFailurePayload = (raw: string | null | undefined): unknown => {
+    if (!raw?.trim()) return undefined;
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const resolveTerminalResponse = (args: {
+    status: number;
+    message: string;
+    requestedModel: string;
+    modelName: string;
+    selected?: SurfaceSelectedChannel;
+    transport?: 'http' | 'sse' | 'websocket';
+    phase?: 'precommit' | 'postcommit';
+    runtimeFailureStatus?: number | null;
+    failureSource?: 'upstream' | 'processing';
+    terminalScope?: 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
+    attemptedChannelCount?: number;
+    maxChannelAttempts?: number;
+    eligibleChannelCount?: number;
+    originalPayload?: unknown;
+  }): SurfaceFailureResponse => {
+    const protocol = input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat';
+    const failure = buildCanonicalUpstreamFailure({
+      status: args.status,
+      message: args.message,
+      protocol,
+      transport: args.transport,
+      runtimeFailureStatus: args.runtimeFailureStatus,
+      phase: args.phase,
+      terminalScope: args.terminalScope,
+      attemptedChannelCount: args.attemptedChannelCount,
+      maxChannelAttempts: args.maxChannelAttempts,
+      eligibleChannelCount: args.eligibleChannelCount,
+      requestedModel: args.requestedModel,
+      upstreamModel: args.modelName,
+      channelId: args.selected?.channel.id,
+      downstreamApiKeyId: input.downstreamApiKeyId,
+      originalPayload: args.originalPayload,
+    });
+    const decision = resolveAggregatedPublicTerminalFailure(
+      terminalFailures,
+      failure,
+      downstreamErrorPolicy,
+    );
+    return {
+      action: 'respond',
+      status: decision.status,
+      payload: serializePublicTerminalFailure(decision, protocol),
+    };
+  };
+
   const runBestEffort = (label: string, fn: () => Promise<unknown>) => {
     void Promise.resolve()
       .then(fn)
@@ -532,6 +593,50 @@ export function createSurfaceFailureToolkit(input: {
 
   return {
     log,
+    resolveRoutingFailure(args: {
+      requestedModel: string;
+      message?: string;
+    }): SurfaceFailureResponse {
+      const protocol = input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat';
+      const failure = buildCanonicalRoutingFailure({
+        protocol,
+        requestedModel: args.requestedModel,
+        downstreamApiKeyId: input.downstreamApiKeyId,
+        message: args.message,
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : 'http',
+      });
+      const decision = resolvePublicTerminalFailure(failure, downstreamErrorPolicy);
+      return {
+        action: 'respond',
+        status: decision.status,
+        payload: serializePublicTerminalFailure(decision, protocol),
+      };
+    },
+    resolveTerminalFailure(args: {
+      selected?: SurfaceSelectedChannel;
+      requestedModel: string;
+      modelName: string;
+      status: number;
+      message: string;
+      isStream?: boolean | null;
+      runtimeFailureStatus?: number | null;
+      failureSource?: 'upstream' | 'processing';
+      phase?: 'precommit' | 'postcommit';
+      terminalScope?: 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
+      attemptedChannelCount?: number;
+      maxChannelAttempts?: number;
+      eligibleChannelCount?: number;
+      originalPayload?: unknown;
+    }): SurfaceFailureResponse {
+      return resolveTerminalResponse({
+        ...args,
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        terminalScope: args.terminalScope,
+        attemptedChannelCount: args.attemptedChannelCount,
+        maxChannelAttempts: args.maxChannelAttempts,
+        eligibleChannelCount: args.eligibleChannelCount,
+      });
+    },
     async handleUpstreamFailure(args: {
       selected: SurfaceSelectedChannel;
       requestedModel: string;
@@ -540,12 +645,24 @@ export function createSurfaceFailureToolkit(input: {
       errText: string;
       rawErrText?: string | null;
       failureKind?: 'first-byte-timeout' | null;
+      originalPayload?: unknown;
       isStream?: boolean | null;
       firstByteLatencyMs?: number | null;
       latencyMs: number;
       retryCount: number;
     }): Promise<SurfaceFailureOutcome> {
       const rawErrText = args.rawErrText || args.errText;
+      terminalFailures.push(buildCanonicalUpstreamFailure({
+        status: args.status,
+        message: args.errText,
+        protocol: input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat',
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        requestedModel: args.requestedModel,
+        upstreamModel: args.modelName,
+        channelId: args.selected.channel.id,
+        downstreamApiKeyId: input.downstreamApiKeyId,
+        originalPayload: args.originalPayload ?? parseOriginalFailurePayload(rawErrText),
+      }));
       await tokenRouter.recordFailure(args.selected.channel.id, {
         status: args.status,
         errorText: rawErrText,
@@ -588,16 +705,18 @@ export function createSurfaceFailureToolkit(input: {
         reason: `upstream returned HTTP ${args.status}`,
       }));
 
-      return {
-        action: 'respond',
+      return resolveTerminalResponse({
         status: args.status,
-        payload: {
-          error: {
-            message: args.errText,
-            type: 'upstream_error',
-          },
-        },
-      };
+        message: args.errText,
+        requestedModel: args.requestedModel,
+        modelName: args.modelName,
+        selected: args.selected,
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        terminalScope: args.retryCount >= input.maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+        attemptedChannelCount: terminalFailures.length,
+        maxChannelAttempts: input.maxRetries + 1,
+        originalPayload: args.originalPayload ?? parseOriginalFailurePayload(rawErrText),
+      });
     },
 
     async handleDetectedFailure(args: {
@@ -613,7 +732,19 @@ export function createSurfaceFailureToolkit(input: {
       completionTokens?: number | null;
       totalTokens?: number | null;
       upstreamPath?: string | null;
+      originalPayload?: unknown;
     }): Promise<SurfaceFailureOutcome> {
+      terminalFailures.push(buildCanonicalUpstreamFailure({
+        status: args.failure.status,
+        message: args.failure.reason,
+        protocol: input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat',
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        requestedModel: args.requestedModel,
+        upstreamModel: args.modelName,
+        channelId: args.selected.channel.id,
+        downstreamApiKeyId: input.downstreamApiKeyId,
+        originalPayload: args.originalPayload,
+      }));
       await tokenRouter.recordFailure(args.selected.channel.id, {
         status: args.failure.status,
         errorText: args.failure.reason,
@@ -645,16 +776,18 @@ export function createSurfaceFailureToolkit(input: {
         reason: args.failure.reason,
       }));
 
-      return {
-        action: 'respond',
+      return resolveTerminalResponse({
         status: args.failure.status,
-        payload: {
-          error: {
-            message: args.failure.reason,
-            type: 'upstream_error',
-          },
-        },
-      };
+        message: args.failure.reason,
+        requestedModel: args.requestedModel,
+        modelName: args.modelName,
+        selected: args.selected,
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        terminalScope: args.retryCount >= input.maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+        attemptedChannelCount: terminalFailures.length,
+        maxChannelAttempts: input.maxRetries + 1,
+        originalPayload: args.originalPayload,
+      });
     },
 
     async handleExecutionError(args: {
@@ -667,6 +800,16 @@ export function createSurfaceFailureToolkit(input: {
       latencyMs: number;
       retryCount: number;
     }): Promise<SurfaceFailureOutcome> {
+      terminalFailures.push(buildCanonicalUpstreamFailure({
+        status: 502,
+        message: `Upstream error: ${args.errorMessage || 'network failure'}`,
+        protocol: input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat',
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        requestedModel: args.requestedModel,
+        upstreamModel: args.modelName,
+        channelId: args.selected.channel.id,
+        downstreamApiKeyId: input.downstreamApiKeyId,
+      }));
       await tokenRouter.recordFailure(args.selected.channel.id, {
         errorText: args.errorMessage,
         modelName: args.modelName,
@@ -691,16 +834,17 @@ export function createSurfaceFailureToolkit(input: {
         reason: args.errorMessage || 'network failure',
       }));
 
-      return {
-        action: 'respond',
+      return resolveTerminalResponse({
         status: 502,
-        payload: {
-          error: {
-            message: `Upstream error: ${args.errorMessage || 'network failure'}`,
-            type: 'upstream_error',
-          },
-        },
-      };
+        message: `Upstream error: ${args.errorMessage || 'network failure'}`,
+        requestedModel: args.requestedModel,
+        modelName: args.modelName,
+        selected: args.selected,
+        transport: input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http',
+        terminalScope: args.retryCount >= input.maxRetries ? 'attempt_budget_exhausted' : 'attempt',
+        attemptedChannelCount: terminalFailures.length,
+        maxChannelAttempts: input.maxRetries + 1,
+      });
     },
 
     async recordStreamFailure(args: {
@@ -718,8 +862,49 @@ export function createSurfaceFailureToolkit(input: {
       upstreamPath?: string | null;
       httpStatus?: number;
       runtimeFailureStatus?: number | null;
+      failureSource?: 'upstream' | 'processing';
+      originalPayload?: unknown;
+      phase?: 'precommit' | 'postcommit';
+      terminalScope?: 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
+      attemptedChannelCount?: number;
+      maxChannelAttempts?: number;
+      eligibleChannelCount?: number;
     }) {
       const errorMessage = args.errorMessage || 'stream processing failed';
+      if (args.failureSource === 'processing') {
+        await log({
+          selected: args.selected,
+          modelRequested: args.requestedModel,
+          status: 'failed',
+          httpStatus: args.httpStatus ?? 200,
+          isStream: args.isStream ?? null,
+          firstByteLatencyMs: args.firstByteLatencyMs ?? null,
+          latencyMs: args.latencyMs,
+          errorMessage,
+          retryCount: args.retryCount,
+          promptTokens: args.promptTokens,
+          completionTokens: args.completionTokens,
+          totalTokens: args.totalTokens,
+          upstreamPath: args.upstreamPath,
+        });
+        return;
+      }
+      terminalFailures.push(buildCanonicalUpstreamFailure({
+        status: args.runtimeFailureStatus ?? args.httpStatus ?? 502,
+        message: errorMessage,
+        protocol: input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat',
+        transport: 'sse',
+        phase: args.phase ?? 'postcommit',
+        terminalScope: args.terminalScope,
+        attemptedChannelCount: args.attemptedChannelCount,
+        maxChannelAttempts: args.maxChannelAttempts,
+        eligibleChannelCount: args.eligibleChannelCount,
+        requestedModel: args.requestedModel,
+        upstreamModel: args.modelName,
+        channelId: args.selected.channel.id,
+        downstreamApiKeyId: input.downstreamApiKeyId,
+        originalPayload: args.originalPayload,
+      }));
       if (typeof args.runtimeFailureStatus === 'number') {
         await tokenRouter.recordFailure(args.selected.channel.id, {
           status: args.runtimeFailureStatus,

@@ -3,6 +3,13 @@ import { describe, expect, it } from 'vitest';
 import { buildConfig, buildFastifyOptions } from './config.js';
 
 describe('buildConfig', () => {
+  it('defaults the downstream terminal error policy to the safe disabled mode', () => {
+    expect(buildConfig({}).downstreamErrorPolicy).toEqual({
+      mode: 'off',
+      downstreamApiKeyIds: [],
+    });
+  });
+
   it('defaults to external listen host for server deployments', () => {
     const config = buildConfig({});
 

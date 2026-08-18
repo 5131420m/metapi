@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { config } from '../../config.js';
 
 const fetchMock = vi.fn();
 const selectChannelMock = vi.fn();
@@ -133,6 +134,7 @@ describe('claude count_tokens proxy route', () => {
   });
 
   beforeEach(() => {
+    config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
     fetchMock.mockReset();
     selectChannelMock.mockReset();
     selectNextChannelMock.mockReset();

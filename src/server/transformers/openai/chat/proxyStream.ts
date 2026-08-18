@@ -8,6 +8,7 @@ import {
 } from './responseBridge.js';
 import { openAiChatStream } from './streamBridge.js';
 import { config } from '../../../config.js';
+import { extractTypedStreamFailure, type TypedStreamFailure } from '../../shared/streamFailure.js';
 
 type StreamReader = {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -20,6 +21,7 @@ type ChatProxyStreamSessionInput = {
   modelName: string;
   successfulUpstreamPath: string;
   onParsedPayload?: (payload: unknown) => void;
+  publicFailureMessage?: (message: string) => string;
   writeLines: (lines: string[]) => void;
   writeRaw: (chunk: string) => void;
 };
@@ -31,6 +33,10 @@ type ResponseSink = {
 type ChatProxyStreamResult = {
   status: 'completed' | 'failed';
   errorMessage: string | null;
+  failureSource?: 'upstream' | 'processing';
+  internalErrorMessage?: string;
+  failure?: TypedStreamFailure;
+  meaningfulOutputSeen?: boolean;
 };
 
 export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput) {
@@ -56,6 +62,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
   let terminalNormalizedFinal: ReturnType<typeof normalizeOpenAiChatFinalToNormalized> | null = null;
   let forwardedDownstreamOutput = false;
   const pendingWrites: string[] = [];
+  const toPublicFailureMessage = (message: string) => input.publicFailureMessage?.(message) ?? message;
 
   const extractFailureMessage = (payload: unknown, fallback = 'upstream stream failed'): string => {
     if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -77,9 +84,13 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
   };
 
   const markFailed = (payload: unknown, fallbackMessage?: string) => {
+    const failure = extractTypedStreamFailure(payload, fallbackMessage);
     terminalResult = {
       status: 'failed',
-      errorMessage: extractFailureMessage(payload, fallbackMessage),
+      errorMessage: failure.message,
+      failureSource: 'upstream',
+      failure,
+      meaningfulOutputSeen: forwardedDownstreamOutput,
     };
   };
 
@@ -87,16 +98,46 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
     if (finalized) return;
     finalized = true;
     const errorMessage = error instanceof Error ? error.message : String(error);
+    const publicErrorMessage = toPublicFailureMessage(errorMessage);
     markFailed({ error: { message: errorMessage } }, 'upstream stream failed');
+    if (!forwardedDownstreamOutput) {
+      pendingWrites.length = 0;
+      return;
+    }
     if (input.downstreamFormat === 'openai') {
       input.writeLines([
-        `data: ${JSON.stringify({ error: { message: errorMessage, type: 'upstream_error' } })}\n\n`,
+        `data: ${JSON.stringify({ error: { message: publicErrorMessage, type: 'upstream_error' } })}\n\n`,
         ...downstreamTransformer.serializeDone(streamContext, claudeContext),
       ]);
       return;
     }
     input.writeLines([
-      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: errorMessage } })}\n\n`,
+      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: publicErrorMessage } })}\n\n`,
+    ]);
+  };
+
+  const failProcessing = (error: unknown) => {
+    if (finalized) return;
+    finalized = true;
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    markFailed({ error: { type: 'server_error', message: 'stream processing failed' } }, 'stream processing failed');
+    terminalResult = {
+      ...terminalResult,
+      errorMessage: 'stream processing failed',
+      failureSource: 'processing',
+      internalErrorMessage: errorMessage,
+    };
+    pendingWrites.length = 0;
+    if (!forwardedDownstreamOutput) return;
+    if (input.downstreamFormat === 'openai') {
+      input.writeLines([
+        `data: ${JSON.stringify({ error: { message: 'stream processing failed', type: 'server_error' } })}\n\n`,
+        ...downstreamTransformer.serializeDone(streamContext, claudeContext),
+      ]);
+      return;
+    }
+    input.writeLines([
+      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'server_error', message: 'stream processing failed' } })}\n\n`,
     ]);
   };
 
@@ -135,10 +176,6 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
 
   const emitLines = (lines: string[], options?: { meaningful?: boolean; force?: boolean }) => {
     if (lines.length <= 0) return;
-    if (input.downstreamFormat !== 'openai') {
-      input.writeLines(lines);
-      return;
-    }
     if (forwardedDownstreamOutput) {
       input.writeLines(lines);
       return;
@@ -150,9 +187,9 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       return;
     }
     if (options?.meaningful) {
-      forwardedDownstreamOutput = true;
       flushPendingWrites();
       input.writeLines(lines);
+      forwardedDownstreamOutput = true;
       return;
     }
     pendingWrites.push(...lines);
@@ -160,7 +197,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
 
   const emitRaw = (chunk: string, options?: { meaningful?: boolean; force?: boolean }) => {
     if (!chunk) return;
-    if (input.downstreamFormat !== 'openai') {
+    if (input.downstreamFormat !== 'openai' && forwardedDownstreamOutput) {
       input.writeRaw(chunk);
       return;
     }
@@ -175,9 +212,9 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       return;
     }
     if (options?.meaningful) {
-      forwardedDownstreamOutput = true;
       flushPendingWrites();
       input.writeRaw(chunk);
+      forwardedDownstreamOutput = true;
       return;
     }
     pendingWrites.push(chunk);
@@ -200,6 +237,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       markFailed({
         error: {
           message: 'Upstream returned empty content',
+          type: 'upstream_error',
         },
       }, 'Upstream returned empty content');
       return;
@@ -265,10 +303,29 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
         input.onParsedPayload?.(parsedPayload);
       }
       if (consumed.handled) {
-        input.writeLines(consumed.lines);
+        const payloadType = parsedPayload && typeof parsedPayload === 'object'
+          && typeof (parsedPayload as Record<string, unknown>).type === 'string'
+          ? String((parsedPayload as Record<string, unknown>).type)
+          : '';
+        if (eventBlock.event === 'error' || eventBlock.event === 'response.failed' || payloadType === 'error' || payloadType === 'response.failed') {
+          markFailed(parsedPayload);
+          if (!forwardedDownstreamOutput) {
+            pendingWrites.length = 0;
+            return true;
+          }
+        }
+        const convertedMeaningful = consumed.lines.some((line) => (
+          line.includes('event: content_block_start')
+          || line.includes('event: content_block_delta')
+        ));
+        emitLines(consumed.lines, {
+          meaningful: convertedMeaningful,
+          force: payloadType === 'error',
+        });
         return consumed.done;
       }
-    } else {
+    }
+    if (parsedPayload === null) {
       try {
         parsedPayload = JSON.parse(eventBlock.data);
       } catch {
@@ -283,19 +340,50 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
       const payloadType = typeof (parsedPayload as Record<string, unknown>).type === 'string'
         ? String((parsedPayload as Record<string, unknown>).type)
         : '';
-      const isFailurePayload = payloadType === 'response.failed' || payloadType === 'error';
+      const isFailurePayload = eventBlock.event === 'response.failed'
+        || eventBlock.event === 'error'
+        || payloadType === 'response.failed'
+        || payloadType === 'error';
       if (isFailurePayload) {
         markFailed(parsedPayload);
+        if (!forwardedDownstreamOutput) {
+          pendingWrites.length = 0;
+          return true;
+        }
+        if (input.downstreamFormat === 'openai') {
+          const publicErrorMessage = toPublicFailureMessage(terminalResult.errorMessage || 'upstream stream failed');
+          input.writeLines([
+            `data: ${JSON.stringify({ error: { message: publicErrorMessage, type: 'upstream_error' } })}\n\n`,
+            ...downstreamTransformer.serializeDone(streamContext, claudeContext),
+          ]);
+          return true;
+        }
+        const publicErrorMessage = toPublicFailureMessage(terminalResult.errorMessage || 'upstream stream failed');
+        input.writeLines([
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: publicErrorMessage } })}\n\n`,
+        ]);
+        return true;
       }
       const normalizedEvent = downstreamTransformer.transformStreamEvent(parsedPayload, streamContext, input.modelName);
       if (input.downstreamFormat === 'openai' && chatAggregateState) {
         applyOpenAiChatStreamEvent(chatAggregateState, normalizedEvent);
       }
+      const serializedLines = downstreamTransformer.serializeStreamEvent(
+        normalizedEvent,
+        streamContext,
+        claudeContext,
+      );
+      const meaningfulOutput = input.downstreamFormat === 'openai'
+        ? hasMeaningfulChatAggregateOutput()
+        : serializedLines.some((line) => (
+          line.includes('event: content_block_start')
+          || line.includes('event: content_block_delta')
+        ));
       emitLines(
-        downstreamTransformer.serializeStreamEvent(normalizedEvent, streamContext, claudeContext),
+        serializedLines,
         {
-          meaningful: hasMeaningfulChatAggregateOutput(),
-          force: isFailurePayload,
+          meaningful: meaningfulOutput,
+          force: false,
         },
       );
       return input.downstreamFormat === 'claude' && claudeContext.doneSent;
@@ -324,6 +412,11 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
         if (payloadType === 'response.failed' || payloadType === 'error') {
           markFailed(payload);
         }
+      }
+      if (terminalResult.status === 'failed') {
+        pendingWrites.length = 0;
+        response?.end();
+        return terminalResult;
       }
       if (input.downstreamFormat === 'openai') {
         const normalizedFinal = normalizeOpenAiChatFinalToNormalized(payload, input.modelName, fallbackText);
@@ -360,6 +453,7 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
         handleEvent: handleEventBlock,
         onEof: finalize,
         onReadError: failReader,
+        onProcessingError: failProcessing,
       });
       await lifecycle.run();
       return terminalResult;

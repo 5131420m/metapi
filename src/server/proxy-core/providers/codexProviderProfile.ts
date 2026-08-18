@@ -27,6 +27,7 @@ export const codexProviderProfile: ProviderProfile = {
       codexBetaFeatures: getInputHeader(input.baseHeaders, 'x-codex-beta-features') || configuredBetaFeatures,
       codexTurnState: getInputHeader(input.baseHeaders, 'x-codex-turn-state'),
       codexTurnMetadata: getInputHeader(input.baseHeaders, 'x-codex-turn-metadata'),
+      codexWindowId: getInputHeader(input.baseHeaders, 'x-codex-window-id'),
       timingMetrics: getInputHeader(input.baseHeaders, 'x-responsesapi-include-timing-metrics'),
       openAiBeta: getInputHeader(input.baseHeaders, 'openai-beta')
         || (websocketTransport ? asTrimmedString(config.codexResponsesWebsocketBeta) : null),

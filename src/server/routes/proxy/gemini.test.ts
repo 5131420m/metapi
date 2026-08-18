@@ -2,6 +2,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { config } from '../../config.js';
 import { resetUpstreamEndpointRuntimeState } from '../../services/upstreamEndpointRuntimeMemory.js';
 
 const fetchMock = vi.fn();
@@ -787,6 +788,182 @@ describe('gemini native proxy routes', () => {
         type: 'server_error',
       },
     });
+  });
+
+  it('neutralizes an exhausted deep-upstream auth failure for a dedicated managed key', async () => {
+    const previousPolicy = structuredClone(config.downstreamErrorPolicy);
+    config.downstreamErrorPolicy = {
+      mode: 'cpa-hermes-resilient',
+      downstreamApiKeyIds: [91],
+    };
+    authorizeDownstreamTokenMock.mockResolvedValue({
+      ok: true,
+      source: 'managed',
+      token: '«redacted:sk-managed»',
+      key: { id: 91 },
+      policy: {},
+    });
+    selectNextChannelMock.mockReturnValue(null);
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({
+      error: { message: 'expired deep upstream token', type: 'authentication_error' },
+    }), {
+      status: 401,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1beta/models/gemini-2.5-flash:generateContent',
+        headers: { authorization: 'Bearer «redacted:sk-managed»' },
+        payload: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+      });
+
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          message: 'All configured upstream channels are currently unavailable.',
+          type: 'server_error',
+          code: 'metapi_upstream_auth_exhausted',
+        },
+      });
+      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 401 }));
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('rejects malformed native Gemini JSON instead of recording a successful request', async () => {
+    selectNextChannelMock.mockReturnValue(null);
+    fetchMock.mockResolvedValue(new Response('not-json', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1beta/models/gemini-2.5-flash:generateContent',
+      headers: { authorization: 'Bearer sk-gemini' },
+      payload: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { type: 'upstream_error' },
+    });
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
+  });
+
+  it('rejects malformed GeminiCLI countTokens JSON instead of recording success', async () => {
+    selectChannelMock.mockReturnValue({
+      channel: { id: 45, routeId: 22 },
+      site: { id: 81, name: 'gemini-cli-site', url: 'https://cloudcode-pa.googleapis.com', platform: 'gemini-cli' },
+      account: {
+        id: 41,
+        username: 'oauth-user',
+        accessToken: 'oauth-token',
+        extraConfig: JSON.stringify({
+          credentialMode: 'session',
+          oauth: {
+            provider: 'gemini-cli',
+            email: 'oauth-user@example.com',
+            projectId: 'project-1',
+          },
+        }),
+      },
+      tokenName: 'oauth',
+      tokenValue: 'oauth-token',
+      actualModel: 'gemini-2.5-pro',
+    });
+    selectNextChannelMock.mockReturnValue(null);
+    fetchMock.mockResolvedValue(new Response('not-json', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1internal:countTokens',
+      headers: { authorization: 'Bearer sk-gemini' },
+      payload: {
+        model: 'gemini-2.5-pro',
+        request: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+      },
+    });
+
+    expect(response.statusCode, response.body).toBe(502);
+    expect(response.json()).toMatchObject({ error: { type: 'upstream_error' } });
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledWith(45, expect.objectContaining({ status: 502 }));
+  });
+
+  it('rejects a successful Gemini SSE response without a readable body', async () => {
+    const bodylessResponse = {
+      ok: true,
+      status: 200,
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
+      text: async () => '',
+      body: null,
+    };
+    fetchMock.mockResolvedValue(bodylessResponse);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+      headers: { authorization: 'Bearer sk-gemini' },
+      payload: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    });
+
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({ error: { type: 'upstream_error' } });
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
+  });
+
+  it('emits one Gemini error terminal and does not retry after SSE output is committed', async () => {
+    const encoder = new TextEncoder();
+    let pulls = 0;
+    const upstreamBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(encoder.encode('data: {"candidates":[{"content":{"role":"model","parts":[{"text":"partial"}]}}]}\n\n'));
+          return;
+        }
+        controller.error(new Error('gemini stream interrupted'));
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(upstreamBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }));
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { id: 45, name: 'second-site', url: 'https://second.example.com', platform: 'gemini' },
+      account: { id: 34, username: 'second-user' },
+      tokenName: 'default',
+      tokenValue: 'second-key',
+      actualModel: 'gemini-2.5-flash',
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+      headers: { authorization: 'Bearer sk-gemini' },
+      payload: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('partial');
+    expect(response.body).toContain('event: error');
+    expect(response.body).toContain('gemini stream interrupted');
+    expect(response.body.match(/event: error/g)).toHaveLength(1);
+    expect(response.body.match(/\[DONE\]/g)).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(selectNextChannelMock).not.toHaveBeenCalled();
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
   });
 
   it('routes Gemini native generateContent requests to openai upstreams and serializes the response back to Gemini shape', async () => {

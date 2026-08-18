@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { eq } from 'drizzle-orm';
+import { config } from '../../config.js';
 
 type DbModule = typeof import('../../db/index.js');
 
@@ -30,6 +31,8 @@ describe('settings backup webdav api', () => {
   beforeEach(async () => {
     await db.delete(schema.settings).run();
     await db.delete(schema.events).run();
+    await db.delete(schema.downstreamApiKeys).run();
+    config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
   });
 
   afterAll(async () => {
@@ -108,6 +111,63 @@ describe('settings backup webdav api', () => {
       expect(body.success).toBe(true);
       expect(body.fileUrl).toBe('https://dav.example.com/backups/metapi.json');
       expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it('hot-applies a remapped downstream error policy after WebDAV import', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const backup = {
+      version: '2.1',
+      timestamp: Date.now(),
+      type: 'accounts',
+      accounts: {
+        sites: [],
+        siteApiEndpoints: [],
+        accounts: [],
+        accountTokens: [],
+        tokenRoutes: [],
+        routeChannels: [],
+        routeGroupSources: [],
+        downstreamApiKeys: [{ name: 'Imported CPA', key: 'sk-imported-cpa', enabled: true }],
+      },
+    };
+    fetchSpy.mockResolvedValue(new Response(JSON.stringify(backup), { status: 200 }));
+    try {
+      const existingKey = await db.insert(schema.downstreamApiKeys).values({
+        name: 'Existing CPA',
+        key: 'sk-imported-cpa',
+        enabled: true,
+      }).returning().get();
+      await db.insert(schema.settings).values({
+        key: 'backup_webdav_config_v1',
+        value: JSON.stringify({
+          enabled: true,
+          fileUrl: 'https://dav.example.com/backups/metapi.json',
+          username: 'alice',
+          password: 'secret-pass',
+          exportType: 'accounts',
+          autoSyncEnabled: false,
+          autoSyncCron: '0 * * * *',
+        }),
+      }).run();
+      await db.insert(schema.settings).values({
+        key: 'downstream_error_policy',
+        value: JSON.stringify({ mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [existingKey.id] }),
+      }).run();
+
+      const response = await app.inject({ method: 'POST', url: '/api/settings/backup/webdav/import' });
+
+      expect(response.statusCode, response.body).toBe(200);
+      const importedKey = await db.select().from(schema.downstreamApiKeys)
+        .where(eq(schema.downstreamApiKeys.key, 'sk-imported-cpa'))
+        .get();
+      expect(importedKey).toBeTruthy();
+      expect(config.downstreamErrorPolicy).toEqual({
+        mode: 'cpa-hermes-resilient',
+        downstreamApiKeyIds: [importedKey!.id],
+      });
     } finally {
       fetchSpy.mockRestore();
     }

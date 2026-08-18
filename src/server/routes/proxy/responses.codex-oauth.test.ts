@@ -1328,76 +1328,6 @@ describe('responses proxy codex oauth refresh', () => {
     });
   });
 
-  it('rebinds sticky channels after websocket transport fast-path successes', async () => {
-    config.proxyStickySessionEnabled = true;
-
-    const selected = {
-      channel: { id: 11, routeId: 22 },
-      site: { name: 'codex-site', url: 'https://chatgpt.com/backend-api/codex', platform: 'codex' },
-      account: {
-        id: 33,
-        username: 'codex-user@example.com',
-        extraConfig: JSON.stringify({
-          credentialMode: 'session',
-          oauth: {
-            provider: 'codex',
-            accountId: 'chatgpt-account-123',
-            email: 'codex-user@example.com',
-            planType: 'plus',
-          },
-        }),
-      },
-      tokenName: 'default',
-      tokenValue: 'expired-access-token',
-      actualModel: 'gpt-5.2-codex',
-    };
-    selectChannelMock.mockReturnValue(selected);
-    selectPreferredChannelMock.mockReturnValue(selected);
-
-    const stickyHeaders = {
-      'x-metapi-responses-websocket-transport': '1',
-      session_id: 'session-sticky-fast-path-1',
-    };
-    const ssePayload = createSseResponse([
-      'event: response.created\n',
-      'data: {"type":"response.created","response":{"id":"resp_codex_fast_path","model":"gpt-5.4","created_at":1706000000,"status":"in_progress","output":[]}}\n\n',
-      'event: response.completed\n',
-      'data: {"type":"response.completed","response":{"id":"resp_codex_fast_path","model":"gpt-5.4","status":"completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n',
-      'data: [DONE]\n\n',
-    ]);
-    fetchMock.mockResolvedValue(ssePayload);
-
-    const firstResponse = await app.inject({
-      method: 'POST',
-      url: '/v1/responses',
-      headers: stickyHeaders,
-      payload: {
-        model: 'gpt-5.4',
-        input: 'hello codex',
-        stream: true,
-      },
-    });
-
-    expect(firstResponse.statusCode).toBe(200);
-    expect(firstResponse.body).toContain('event: response.completed');
-    expect(selectPreferredChannelMock).not.toHaveBeenCalled();
-
-    const secondResponse = await app.inject({
-      method: 'POST',
-      url: '/v1/responses',
-      headers: stickyHeaders,
-      payload: {
-        model: 'gpt-5.4',
-        input: 'hello again',
-        stream: true,
-      },
-    });
-
-    expect(secondResponse.statusCode).toBe(200);
-    expect(selectPreferredChannelMock).toHaveBeenCalledTimes(1);
-    expect(selectPreferredChannelMock.mock.calls[0]?.[0]).toBe('gpt-5.4');
-    expect(selectPreferredChannelMock.mock.calls[0]?.[1]).toBe(11);
-  });
 
   it('decodes zstd-compressed codex responses SSE before relaying native downstream streams', async () => {
     fetchMock.mockResolvedValue(createCompressedSseResponse([
@@ -1465,7 +1395,32 @@ describe('responses proxy codex oauth refresh', () => {
     expect(secondBody.max_output_tokens).toBeUndefined();
   });
 
-  it('does not record success when a streaming responses request ends with response.failed', async () => {
+  it('returns an initial response.failed terminal as HTTP before committing Responses SSE', async () => {
+    fetchMock.mockResolvedValue(createSseResponse([
+      'event: response.failed\n',
+      'data: {"type":"response.failed","response":{"id":"resp_precommit_failed","status":"failed","error":{"status":429,"type":"rate_limit_error","code":"rate_limit_exceeded","message":"quota exhausted upstream"}}}\n\n',
+      'data: [DONE]\n\n',
+    ]));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/responses',
+      payload: { model: 'gpt-5.4', input: 'hello codex', stream: true },
+    });
+
+    expect(response.statusCode).toBe(429);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({
+      type: 'response.failed',
+      response: { error: { code: 'rate_limit_exceeded', message: 'quota exhausted upstream' } },
+    });
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      errorText: 'quota exhausted upstream',
+    }));
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+  });
+
+  it('returns a pre-commit HTTP failure and does not record success when a streaming responses request ends with response.failed', async () => {
     fetchMock.mockResolvedValue(createSseResponse([
       'event: response.created\n',
       'data: {"type":"response.created","response":{"id":"resp_codex_failed","model":"gpt-5.4","created_at":1706000000,"status":"in_progress","output":[]}}\n\n',
@@ -1484,8 +1439,12 @@ describe('responses proxy codex oauth refresh', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('response.failed');
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({
+      type: 'response.failed',
+      response: { error: { message: 'tool execution failed' } },
+    });
     expect(response.body).not.toContain('response.completed');
     expect(recordSuccessMock).not.toHaveBeenCalled();
     expect(recordFailureMock).toHaveBeenCalledTimes(1);
@@ -1529,7 +1488,7 @@ describe('responses proxy codex oauth refresh', () => {
     expect(String(insertedProxyLogs.at(-1)?.errorMessage || '')).toContain('stream closed before response.completed');
   });
 
-  it('does not record success when a native responses stream completes with empty content and empty usage while empty-content failure is enabled', async () => {
+  it('returns a pre-commit HTTP failure when a native responses stream completes empty while empty-content failure is enabled', async () => {
     config.proxyEmptyContentFailEnabled = true;
 
     fetchMock.mockResolvedValue(createSseResponse([
@@ -1550,8 +1509,9 @@ describe('responses proxy codex oauth refresh', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('event: response.failed');
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({ error: { message: 'Upstream returned empty content' } });
     expect(response.body).not.toContain('event: response.completed');
     expect(recordSuccessMock).not.toHaveBeenCalled();
     expect(recordFailureMock).toHaveBeenCalledTimes(1);
@@ -1562,7 +1522,7 @@ describe('responses proxy codex oauth refresh', () => {
     expect(String(insertedProxyLogs.at(-1)?.errorMessage || '')).toContain('empty content');
   });
 
-  it('does not record success when a native responses stream completes with prompt tokens only and no output', async () => {
+  it('returns a pre-commit HTTP failure when a native responses stream completes with prompt tokens only and no output', async () => {
     config.proxyEmptyContentFailEnabled = true;
 
     fetchMock.mockResolvedValue(createSseResponse([
@@ -1583,8 +1543,9 @@ describe('responses proxy codex oauth refresh', () => {
       },
     });
 
-    expect(response.statusCode).toBe(200);
-    expect(response.body).toContain('event: response.failed');
+    expect(response.statusCode).toBe(502);
+    expect(response.headers['content-type']).not.toContain('text/event-stream');
+    expect(response.json()).toMatchObject({ error: { message: 'Upstream returned empty content' } });
     expect(response.body).not.toContain('event: response.completed');
     expect(recordSuccessMock).not.toHaveBeenCalled();
     expect(recordFailureMock).toHaveBeenCalledTimes(1);

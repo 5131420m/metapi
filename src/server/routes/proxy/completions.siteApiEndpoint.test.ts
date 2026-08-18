@@ -4,6 +4,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { asc, eq } from 'drizzle-orm';
+import { config } from '../../config.js';
 
 const fetchMock = vi.fn();
 const selectChannelMock = vi.fn();
@@ -271,5 +272,59 @@ describe('/v1/completions site api endpoint rotation', () => {
       consecutiveFailureCount: 1,
       cooldownUntil: null,
     });
+  });
+
+  it('emits one error terminal and does not retry another channel after completion SSE bytes are committed', async () => {
+    const previousAttempts = config.proxyMaxChannelAttempts;
+    config.proxyMaxChannelAttempts = 3;
+    try {
+      const selected = {
+        channel: { id: 11, routeId: 22 },
+        site: { id: 44, name: 'stream-site', url: 'https://stream.example.com', platform: 'openai' },
+        account: { id: 33, username: 'stream-user' },
+        tokenName: 'default',
+        tokenValue: 'sk-stream',
+        actualModel: 'gpt-4o-mini',
+      };
+      selectChannelMock.mockResolvedValue(selected);
+      selectNextChannelMock.mockResolvedValue({
+        ...selected,
+        channel: { id: 12, routeId: 22 },
+      });
+      const encoder = new TextEncoder();
+      let pullCount = 0;
+      const upstreamBody = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pullCount += 1;
+          if (pullCount === 1) {
+            controller.enqueue(encoder.encode('data: {"id":"cmpl-stream","choices":[{"text":"partial"}]}\n\n'));
+            return;
+          }
+          controller.error(new Error('completion stream interrupted'));
+        },
+      });
+      fetchMock.mockResolvedValue(new Response(upstreamBody, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/completions',
+        headers: { authorization: 'Bearer «redacted:sk-…»' },
+        payload: { model: 'gpt-4o-mini', prompt: 'hello', stream: true },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('partial');
+      expect(response.body).toContain('completion stream interrupted');
+      expect(response.body.match(/\[DONE\]/g)).toHaveLength(1);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(selectNextChannelMock).not.toHaveBeenCalled();
+      expect(recordSuccessMock).not.toHaveBeenCalled();
+      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
+    } finally {
+      config.proxyMaxChannelAttempts = previousAttempts;
+    }
   });
 });

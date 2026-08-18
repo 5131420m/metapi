@@ -64,6 +64,7 @@ describe('provider header utils', () => {
       stream: false,
       continuityKey: 'cache-key-1',
       explicitSessionId: null,
+      codexWindowId: 'session-123:0',
     });
 
     expect(headers.Authorization).toBe('Bearer test');
@@ -72,6 +73,7 @@ describe('provider header utils', () => {
     expect(headers.Session_id).toMatch(/^[0-9a-f-]{36}$/);
     expect(headers.Conversation_id).toBe(headers.Session_id);
     expect(headers.Accept).toBe('application/json');
+    expect(headers['x-codex-window-id']).toBe('session-123:0');
   });
 
   it('builds claude runtime headers with merged betas and oauth bearer auth', async () => {

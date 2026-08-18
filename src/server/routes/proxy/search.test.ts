@@ -189,6 +189,29 @@ describe('/v1/search route', () => {
     expect(selectNextChannelMock).not.toHaveBeenCalled();
   });
 
+  it('rejects a malformed successful search body instead of fabricating an empty result', async () => {
+    fetchMock.mockResolvedValue(new Response('not-json', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/search',
+      headers: { authorization: 'Bearer sk-demo' },
+      payload: { query: 'axonhub' },
+    });
+
+    expect(response.statusCode, response.body).toBe(503);
+    expect(response.json()).toMatchObject({
+      error: {
+        type: 'server_error',
+      },
+    });
+    expect(recordSuccessMock).not.toHaveBeenCalled();
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 502 }));
+  });
+
   it('rejects max_results outside the allowed range', async () => {
     const response = await app.inject({
       method: 'POST',

@@ -171,7 +171,7 @@ describe('siteProxy', () => {
     }
   });
 
-  it('merges site custom headers by matched request url and keeps explicit headers authoritative', async () => {
+  it('merges site custom headers by matched request url and keeps site headers authoritative', async () => {
     await db.insert(schema.sites).values({
       name: 'headers-site',
       url: 'https://headers-site.example.com',
@@ -193,7 +193,7 @@ describe('siteProxy', () => {
     const headers = new Headers(requestInit.headers);
 
     expect(headers.get('cf-access-client-id')).toBe('site-client');
-    expect(headers.get('authorization')).toBe('Bearer request-token');
+    expect(headers.get('authorization')).toBe('Bearer site-default');
     expect(headers.get('x-trace-id')).toBe('trace-1');
   });
 

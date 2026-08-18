@@ -9,6 +9,7 @@ import {
   serializeResponsesUpstreamFinalAsStream,
 } from './streamBridge.js';
 import { config } from '../../../config.js';
+import { extractTypedStreamFailure, type TypedStreamFailure } from '../../shared/streamFailure.js';
 
 type StreamReader = {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -23,6 +24,10 @@ type ResponseSink = {
 type ResponsesProxyStreamResult = {
   status: 'completed' | 'failed';
   errorMessage: string | null;
+  failureSource?: 'upstream' | 'processing';
+  internalErrorMessage?: string;
+  failure?: TypedStreamFailure;
+  meaningfulOutputSeen?: boolean;
 };
 
 type ResponsesProxyStreamSessionInput = {
@@ -38,6 +43,7 @@ type ResponsesProxyStreamSessionInput = {
     promptTokensIncludeCache: boolean | null;
   };
   onParsedPayload?: (payload: unknown) => void;
+  publicFailureMessage?: (message: string) => string;
   writeLines: (lines: string[]) => void;
   writeRaw: (chunk: string) => void;
 };
@@ -95,9 +101,40 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
     || input.successfulUpstreamPath.endsWith('/responses/compact');
   let finalized = false;
   let terminalEventSeen = false;
+  let meaningfulOutputSeen = false;
+  const pendingWrites: string[] = [];
   let terminalResult: ResponsesProxyStreamResult = {
     status: 'completed',
     errorMessage: null,
+  };
+  const toPublicFailurePayload = (payload: unknown, message: string): unknown => {
+    const publicMessage = input.publicFailureMessage?.(message) ?? message;
+    if (publicMessage === message) return payload;
+    return {
+      type: 'response.failed',
+      error: { message: publicMessage, type: 'upstream_error' },
+    };
+  };
+
+  const flushPendingWrites = () => {
+    if (pendingWrites.length <= 0) return;
+    input.writeLines([...pendingWrites]);
+    pendingWrites.length = 0;
+  };
+
+  const writeLines = (lines: string[], meaningful = false) => {
+    if (lines.length <= 0) return;
+    if (meaningfulOutputSeen) {
+      input.writeLines(lines);
+      return;
+    }
+    if (meaningful) {
+      meaningfulOutputSeen = true;
+      flushPendingWrites();
+      input.writeLines(lines);
+      return;
+    }
+    pendingWrites.push(...lines);
   };
 
   const finalize = () => {
@@ -107,17 +144,57 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
       status: 'completed',
       errorMessage: null,
     };
-    input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+    writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()), true);
   };
 
   const fail = (payload: unknown, fallbackMessage?: string) => {
     if (finalized) return;
     finalized = true;
+    const failure = extractTypedStreamFailure(payload, fallbackMessage);
     terminalResult = {
       status: 'failed',
-      errorMessage: getResponsesStreamFailureMessage(payload, fallbackMessage),
+      errorMessage: failure.message,
+      failureSource: 'upstream',
+      failure,
+      meaningfulOutputSeen,
     };
-    input.writeLines(failResponsesStream(responsesState, streamContext, input.getUsage(), payload));
+    if (meaningfulOutputSeen) {
+      input.writeLines(failResponsesStream(
+        responsesState,
+        streamContext,
+        input.getUsage(),
+        toPublicFailurePayload(payload, failure.message),
+      ));
+    } else {
+      pendingWrites.length = 0;
+    }
+  };
+
+  const failProcessing = (error: unknown) => {
+    if (finalized) return;
+    finalized = true;
+    terminalResult = {
+      status: 'failed',
+      errorMessage: 'stream processing failed',
+      failureSource: 'processing',
+      internalErrorMessage: error instanceof Error ? error.message : String(error),
+      failure: extractTypedStreamFailure({
+        error: {
+          type: 'server_error',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      }, 'stream processing failed'),
+      meaningfulOutputSeen,
+    };
+    pendingWrites.length = 0;
+    if (!meaningfulOutputSeen) return;
+    input.writeLines(failResponsesStream(responsesState, streamContext, input.getUsage(), {
+      type: 'response.failed',
+      error: {
+        type: 'server_error',
+        message: 'stream processing failed',
+      },
+    }));
   };
 
   const complete = () => {
@@ -132,7 +209,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
   const closeOut = () => {
     if (finalized) {
       if (terminalEventSeen) {
-        input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+        writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()), true);
       }
       return;
     }
@@ -213,7 +290,9 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         }, 'Upstream returned empty content');
         return true;
       }
-      input.writeLines(convertedLines);
+      const meaningful = hasMeaningfulAggregateOutput(responsesState)
+        || (isRecord(parsedPayload.response) && hasMeaningfulResponsesPayloadOutput(parsedPayload.response));
+      writeLines(convertedLines, meaningful);
       if (eventBlock.event === 'response.completed' || payloadType === 'response.completed' || isIncompleteEvent) {
         terminalEventSeen = true;
         complete();
@@ -221,12 +300,12 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
       return false;
     }
 
-    input.writeLines(serializeConvertedResponsesEvents({
+    writeLines(serializeConvertedResponsesEvents({
       state: responsesState,
       streamContext,
       event: { contentDelta: eventBlock.data },
       usage: input.getUsage(),
-    }));
+    }), true);
     return false;
   };
 
@@ -241,6 +320,10 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         : '';
       if (payloadType === 'error' || payloadType === 'response.failed') {
         fail(payload);
+        response?.end();
+        return terminalResult;
+      }
+      if (terminalResult.status === 'failed') {
         response?.end();
         return terminalResult;
       }
@@ -275,7 +358,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         status: 'completed',
         errorMessage: null,
       };
-      input.writeLines(lines);
+      writeLines(lines, true);
       response?.end();
       return terminalResult;
     },
@@ -288,7 +371,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
         onEof: closeOut,
         onReadError: (error) => {
           if (terminalEventSeen || finalized) {
-            input.writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()));
+            writeLines(completeResponsesStream(responsesState, streamContext, input.getUsage()), true);
             return;
           }
           fail(
@@ -301,6 +384,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
             'upstream stream failed',
           );
         },
+        onProcessingError: failProcessing,
       });
       await lifecycle.run();
       return terminalResult;

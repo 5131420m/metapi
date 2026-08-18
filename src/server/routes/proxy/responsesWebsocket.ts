@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
-import type { IncomingMessage } from 'node:http';
+import { IncomingMessage } from 'node:http';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { createCodexWebsocketRuntime, CodexWebsocketRuntimeError } from '../../proxy-core/runtime/codexWebsocketRuntime.js';
@@ -19,11 +19,13 @@ import { openAiResponsesTransformer } from '../../transformers/openai/responses/
 import { buildUpstreamEndpointRequest } from './upstreamEndpoint.js';
 import { config } from '../../config.js';
 import { applyOpenAiServiceTierPolicy } from '../../proxy-core/serviceTierPolicy.js';
+import { insertProxyLog } from '../../services/proxyLogStore.js';
+import { reportProxyAllFailed } from '../../services/alertService.js';
+import { markResponsesWebsocketBridgeRequest } from './responsesWebsocketBridgeContext.js';
+import { sanitizePostcommitFailureMessage } from '../../services/downstreamErrorPolicy.js';
 
 const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
-const RESPONSES_WEBSOCKET_MODE_HEADER = 'x-metapi-responses-websocket-mode';
-const RESPONSES_WEBSOCKET_TRANSPORT_HEADER = 'x-metapi-responses-websocket-transport';
 const codexWebsocketRuntime = createCodexWebsocketRuntime();
 
 type SelectedChannel = NonNullable<Awaited<ReturnType<typeof tokenRouter.selectChannel>>>;
@@ -283,8 +285,9 @@ function writeResponsesWebsocketError(
   status: number,
   message: string,
   errorPayload?: unknown,
+  downstreamApiKeyId: number | null = null,
 ) {
-  socket.send(JSON.stringify({
+  const payload = {
     type: 'error',
     status,
     error: isRecord(errorPayload) && isRecord(errorPayload.error)
@@ -293,7 +296,35 @@ function writeResponsesWebsocketError(
         type: status >= 500 ? 'server_error' : 'invalid_request_error',
         message,
       },
-  }));
+  };
+  socket.send(JSON.stringify(sanitizeResponsesWebsocketTerminalPayload(payload, downstreamApiKeyId)));
+}
+
+function sanitizeResponsesWebsocketTerminalPayload(
+  payload: unknown,
+  downstreamApiKeyId: number | null,
+): unknown {
+  if (!isRecord(payload)) return payload;
+  const type = asTrimmedString(payload.type);
+  if (type !== 'response.failed' && type !== 'error') return payload;
+  const response = isRecord(payload.response) ? payload.response : null;
+  const responseError = response && isRecord(response.error) ? response.error : null;
+  const topLevelError = isRecord(payload.error) ? payload.error : null;
+  const sourceError = responseError || topLevelError;
+  if (!sourceError || typeof sourceError.message !== 'string') return payload;
+  const message = sanitizePostcommitFailureMessage({
+    message: sourceError.message,
+    downstreamApiKeyId,
+    policy: config.downstreamErrorPolicy,
+  });
+  if (message === sourceError.message) return payload;
+  const cloned = cloneJsonObject(payload);
+  if (isRecord(cloned.response) && isRecord(cloned.response.error)) {
+    cloned.response.error = { ...cloned.response.error, message };
+  } else if (isRecord(cloned.error)) {
+    cloned.error = { ...cloned.error, message };
+  }
+  return cloned;
 }
 
 function synthesizePrewarmResponsePayloads(request: Record<string, unknown>) {
@@ -413,11 +444,10 @@ async function forwardResponsesRequestViaHttp(input: {
   payload: Record<string, unknown>;
   preserveIncrementalMode: boolean;
   authToken: string;
+  downstreamApiKeyId: number | null;
 }): Promise<unknown[] | null> {
   const injectHeaders: Record<string, string | string[]> = {
     ...buildInjectHeaders(input.request),
-    [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
-    ...(input.preserveIncrementalMode ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
   };
   if (
     !headerValueToTrimmedString(injectHeaders.authorization)
@@ -427,11 +457,16 @@ async function forwardResponsesRequestViaHttp(input: {
     injectHeaders.authorization = `Bearer ${input.authToken}`;
   }
 
+  class ResponsesWebsocketBridgeRequest extends IncomingMessage {}
+  markResponsesWebsocketBridgeRequest(ResponsesWebsocketBridgeRequest, {
+    preserveIncrementalMode: input.preserveIncrementalMode,
+  });
   const response = await input.app.inject({
     method: 'POST',
     url: '/v1/responses',
     headers: injectHeaders,
     payload: input.payload,
+    Request: ResponsesWebsocketBridgeRequest,
   });
 
   if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -446,6 +481,7 @@ async function forwardResponsesRequestViaHttp(input: {
       response.statusCode,
       response.statusMessage || 'Upstream error',
       payload,
+      input.downstreamApiKeyId,
     );
     return null;
   }
@@ -458,30 +494,50 @@ async function forwardResponsesRequestViaHttp(input: {
       input.socket.send(JSON.stringify(payload));
       return output;
     } catch {
-      writeResponsesWebsocketError(input.socket, 502, 'Unexpected non-JSON websocket proxy response');
+      writeResponsesWebsocketError(
+        input.socket,
+        502,
+        'Unexpected non-JSON websocket proxy response',
+        undefined,
+        input.downstreamApiKeyId,
+      );
       return null;
     }
   }
 
   const pulled = openAiResponsesTransformer.pullSseEvents(response.body);
   const forwardedPayloads: unknown[] = [];
-  let sawTerminalPayload = false;
+  let terminalDelivered = false;
   for (const event of pulled.events) {
     if (event.data === '[DONE]') continue;
     try {
       const payload = JSON.parse(event.data);
+      if (terminalDelivered) break;
       forwardedPayloads.push(payload);
-      const type = isRecord(payload) ? asTrimmedString(payload.type) : '';
-      if (type === 'response.completed' || type === 'response.failed' || type === 'response.incomplete') {
-        sawTerminalPayload = true;
-      }
+      const eventType = asTrimmedString(event.event);
+      const payloadType = isRecord(payload) ? asTrimmedString(payload.type) : '';
+      const isTerminalEvent = eventType === 'response.completed'
+        || eventType === 'response.failed'
+        || eventType === 'response.incomplete'
+        || eventType === 'error';
+      const isTerminalPayload = payloadType === 'response.completed'
+        || payloadType === 'response.failed'
+        || payloadType === 'response.incomplete'
+        || payloadType === 'error';
       input.socket.send(JSON.stringify(payload));
+      terminalDelivered = isTerminalEvent || isTerminalPayload;
     } catch {
       // Ignore malformed SSE frames; the HTTP route already normalizes them.
     }
   }
-  if (!sawTerminalPayload) {
-    writeResponsesWebsocketError(input.socket, 408, 'stream closed before response.completed');
+  if (!terminalDelivered) {
+    writeResponsesWebsocketError(
+      input.socket,
+      408,
+      'stream closed before response.completed',
+      undefined,
+      input.downstreamApiKeyId,
+    );
   }
   return collectResponsesOutput(forwardedPayloads);
 }
@@ -690,8 +746,6 @@ async function handleResponsesWebsocketConnection(
           if (codexWebsocketChannel) {
             const downstreamHeaders: Record<string, unknown> = {
               ...(request.headers as Record<string, unknown>),
-              [RESPONSES_WEBSOCKET_TRANSPORT_HEADER]: '1',
-              ...(supportsIncrementalInput ? { [RESPONSES_WEBSOCKET_MODE_HEADER]: 'incremental' } : {}),
             };
             const providerHeaders = buildOauthProviderHeaders({
               account: codexWebsocketChannel.account,
@@ -726,6 +780,8 @@ async function handleResponsesWebsocketConnection(
                     codexIdentityMode: codexWebsocketChannel.site.codexIdentityMode as 'off' | 'synthesize' | undefined,
                     codexIdentityScopeKey: `site:${codexWebsocketChannel.site.id}`,
                     codexIdentityTurnKey: websocketSessionId,
+                    responsesWebsocketTransport: true,
+                    preserveWebsocketIncrementalMode: supportsIncrementalInput,
                   });
                   const requestUrl = `${target.baseUrl.replace(/\/+$/, '')}${prepared.path}`;
 
@@ -750,7 +806,10 @@ async function handleResponsesWebsocketConnection(
               );
               lastResponseOutput = collectResponsesOutput(runtimeResult.events);
               for (const payload of runtimeResult.events) {
-                socket.send(JSON.stringify(payload));
+                socket.send(JSON.stringify(sanitizeResponsesWebsocketTerminalPayload(
+                  payload,
+                  authContext.source === 'managed' ? authContext.key?.id ?? null : null,
+                )));
               }
             } catch (error) {
               const runtimeError = unwrapCodexWebsocketRuntimeError(error);
@@ -762,20 +821,56 @@ async function handleResponsesWebsocketConnection(
                   payload: normalized.request,
                   preserveIncrementalMode: supportsIncrementalInput,
                   authToken: authContext.token,
+                  downstreamApiKeyId: authContext.source === 'managed' ? authContext.key?.id ?? null : null,
                 });
                 if (forwarded) {
                   lastResponseOutput = forwarded;
                 }
                 return;
               }
+              selectedChannel = null;
+              runtimeSessionKeys.delete(websocketRuntimeSessionKey);
+              try {
+                await tokenRouter.recordFailure(codexWebsocketChannel.channel.id, {
+                  status: runtimeError.status || 502,
+                  errorText: runtimeError.message,
+                  modelName: asTrimmedString(codexWebsocketChannel.actualModel) || requestModel,
+                });
+              } catch {
+                // Failure delivery and channel reselection must not depend on cooldown bookkeeping.
+              }
+              try {
+                await insertProxyLog({
+                  routeId: codexWebsocketChannel.channel.routeId,
+                  channelId: codexWebsocketChannel.channel.id,
+                  accountId: codexWebsocketChannel.account.id,
+                  downstreamApiKeyId: authContext.source === 'managed' ? authContext.key?.id ?? null : null,
+                  modelRequested: requestModel,
+                  modelActual: asTrimmedString(codexWebsocketChannel.actualModel) || requestModel,
+                  status: 'failed',
+                  httpStatus: runtimeError.status || 502,
+                  isStream: true,
+                  errorMessage: runtimeError.message,
+                  retryCount: 0,
+                });
+              } catch {
+                // Failure delivery and channel release must not depend on observability storage.
+              }
+              void Promise.resolve(reportProxyAllFailed({ model: requestModel, reason: runtimeError.message })).catch(() => undefined);
               lastResponseOutput = collectResponsesOutput(runtimeError.events);
               for (const payload of runtimeError.events) {
-                socket.send(JSON.stringify(payload));
+                socket.send(JSON.stringify(sanitizeResponsesWebsocketTerminalPayload(
+                  payload,
+                  authContext.source === 'managed' ? authContext.key?.id ?? null : null,
+                )));
               }
               const emittedTerminalResponsesEvent = runtimeError.events.some((payload) => {
                 if (!isRecord(payload)) return false;
                 const type = asTrimmedString(payload.type);
-                return type === 'response.completed' || type === 'response.failed' || type === 'response.incomplete';
+                return type === 'response.completed'
+                  || type === 'response.failed'
+                  || type === 'response.incomplete'
+                  || type === 'error';
               });
               if (!emittedTerminalResponsesEvent) {
                 writeResponsesWebsocketError(
@@ -783,7 +878,13 @@ async function handleResponsesWebsocketConnection(
                   runtimeError.status || 408,
                   runtimeError.message,
                   runtimeError.payload,
+                  authContext.source === 'managed' ? authContext.key?.id ?? null : null,
                 );
+              }
+              try {
+                await codexWebsocketRuntime.closeSession(websocketRuntimeSessionKey);
+              } catch {
+                // The runtime already rejects response.failed and clears its active socket.
               }
             }
             return;
@@ -796,6 +897,7 @@ async function handleResponsesWebsocketConnection(
             payload: normalized.request,
             preserveIncrementalMode: supportsIncrementalInput,
             authToken: authContext.token,
+            downstreamApiKeyId: authContext.source === 'managed' ? authContext.key?.id ?? null : null,
           });
           if (forwarded) {
             lastResponseOutput = forwarded;

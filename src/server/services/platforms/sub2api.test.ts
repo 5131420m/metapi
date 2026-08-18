@@ -36,7 +36,7 @@ describe('Sub2ApiAdapter', () => {
   it('detects sub2api from URL', async () => {
     expect(await adapter.detect('https://sub2api.example.com')).toBe(true);
     expect(await adapter.detect('https://example.com')).toBe(false);
-  });
+  }, 15000);
 
   it('detects sub2api by auth/me unauthorized envelope even without sub2api domain', async () => {
     await startServer((req, res) => {

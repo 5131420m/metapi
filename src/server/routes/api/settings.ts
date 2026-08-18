@@ -1,6 +1,7 @@
 import { FastifyInstance } from 'fastify';
 import cron from 'node-cron';
 import { fetch } from 'undici';
+import { inArray } from 'drizzle-orm';
 import { config, normalizeTokenRouterFailureCooldownMaxSec } from '../../config.js';
 import { db, runtimeDbDialect, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
@@ -49,6 +50,7 @@ import {
   stopChannelRecoveryProbeScheduler,
 } from '../../services/channelRecoveryProbeService.js';
 import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
+import { parseDownstreamErrorPolicyConfig } from '../../services/downstreamErrorPolicy.js';
 
 type RoutingWeights = typeof config.routingWeights;
 
@@ -108,6 +110,7 @@ interface RuntimeSettingsBody {
   routingWeights?: Partial<RoutingWeights>;
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
+  downstreamErrorPolicy?: unknown;
   globalBlockedBrands?: string[];
   globalAllowedModels?: string[];
 }
@@ -312,6 +315,19 @@ function parseProxyErrorKeywords(value: unknown): string[] {
 function parseBooleanFlag(value: unknown, label: string): boolean {
   if (typeof value === 'boolean') return value;
   throw new Error(`${label}格式无效：需要 boolean`);
+}
+
+async function validateDownstreamErrorPolicyReferences(policy: ReturnType<typeof parseDownstreamErrorPolicyConfig>): Promise<void> {
+  if (policy.mode !== 'cpa-hermes-resilient') return;
+  const rows = await db.select({ id: schema.downstreamApiKeys.id })
+    .from(schema.downstreamApiKeys)
+    .where(inArray(schema.downstreamApiKeys.id, policy.downstreamApiKeyIds))
+    .all();
+  const existingIds = new Set(rows.map((row: { id: number }) => Number(row.id)));
+  const missingIds = policy.downstreamApiKeyIds.filter((id) => !existingIds.has(id));
+  if (missingIds.length > 0) {
+    throw new Error(`下游终态错误策略包含不存在的 API Key: ${missingIds.join(', ')}`);
+  }
 }
 
 function isValidHttpUrl(raw: string): boolean {
@@ -532,6 +548,14 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
     case 'proxy_empty_content_fail_enabled': {
       try {
         config.proxyEmptyContentFailEnabled = parseBooleanFlag(value, '空内容判定失败开关');
+      } catch {
+        return;
+      }
+      return;
+    }
+    case 'downstream_error_policy': {
+      try {
+        config.downstreamErrorPolicy = parseDownstreamErrorPolicyConfig(value);
       } catch {
         return;
       }
@@ -784,6 +808,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     payloadRules: config.payloadRules,
     proxyErrorKeywords: config.proxyErrorKeywords,
     proxyEmptyContentFailEnabled: config.proxyEmptyContentFailEnabled,
+    downstreamErrorPolicy: config.downstreamErrorPolicy,
     proxyTokenMasked: maskSecret(config.proxyToken),
     globalBlockedBrands: config.globalBlockedBrands,
     globalAllowedModels: config.globalAllowedModels,
@@ -926,6 +951,134 @@ export async function settingsRoutes(app: FastifyInstance) {
     const changedLabels: string[] = [];
     const currentRequestIp = extractClientIp(request.ip, request.headers['x-forwarded-for']);
     let pendingPayloadRules: typeof config.payloadRules | undefined;
+    let pendingDownstreamErrorPolicy: ReturnType<typeof parseDownstreamErrorPolicyConfig> | undefined;
+
+    if (body.systemProxyUrl !== undefined) {
+      const rawSystemProxyUrl = String(body.systemProxyUrl || '').trim();
+      if (rawSystemProxyUrl && !normalizeSiteProxyUrl(rawSystemProxyUrl)) {
+        return reply.code(400).send({ success: false, message: '系统代理地址无效，请填写合法的 http(s)/socks 代理 URL' });
+      }
+    }
+    if (body.payloadRules !== undefined) {
+      const parsedPayloadRules = parsePayloadRulesConfigInput(body.payloadRules);
+      if (!parsedPayloadRules.success) {
+        return reply.code(400).send({ success: false, message: parsedPayloadRules.message });
+      }
+      pendingPayloadRules = parsedPayloadRules.normalized;
+    }
+    if (body.adminIpAllowlist !== undefined) {
+      const nextAllowlist = toStringList(body.adminIpAllowlist);
+      if (nextAllowlist.length > 0 && !isIpAllowed(currentRequestIp, nextAllowlist)) {
+        return reply.code(400).send({
+          success: false,
+          message: `保存失败：当前请求 IP（${currentRequestIp || 'unknown'}）不在新白名单中。请至少保留当前 IP，避免把自己锁出后台。`,
+        });
+      }
+    }
+
+    if (body.globalBlockedBrands !== undefined && !Array.isArray(body.globalBlockedBrands)) {
+      return reply.code(400).send({ error: 'globalBlockedBrands must be an array of strings' });
+    }
+    if (body.globalAllowedModels !== undefined && !Array.isArray(body.globalAllowedModels)) {
+      return reply.code(400).send({ error: 'globalAllowedModels must be an array of strings' });
+    }
+    if (body.downstreamErrorPolicy !== undefined) {
+      try {
+        pendingDownstreamErrorPolicy = parseDownstreamErrorPolicyConfig(body.downstreamErrorPolicy);
+        await validateDownstreamErrorPolicyReferences(pendingDownstreamErrorPolicy);
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '下游终态错误策略格式无效',
+        });
+      }
+    }
+    if (body.checkinCron !== undefined && !cron.validate(body.checkinCron)) {
+      return reply.code(400).send({ success: false, message: '签到 Cron 表达式无效' });
+    }
+    if (body.checkinScheduleMode !== undefined && body.checkinScheduleMode !== 'cron' && body.checkinScheduleMode !== 'interval') {
+      return reply.code(400).send({ success: false, message: '签到方式无效：仅支持 cron 或 interval' });
+    }
+    if (body.checkinIntervalHours !== undefined) {
+      const intervalHours = Number(body.checkinIntervalHours);
+      if (!Number.isFinite(intervalHours) || intervalHours < 1 || intervalHours > 24) {
+        return reply.code(400).send({ success: false, message: '签到间隔必须是 1 到 24 的整数小时' });
+      }
+    }
+    if (body.balanceRefreshCron !== undefined && !cron.validate(body.balanceRefreshCron)) {
+      return reply.code(400).send({ success: false, message: '余额刷新 Cron 表达式无效' });
+    }
+    if (body.smtpPort !== undefined) {
+      const smtpPort = Number(body.smtpPort);
+      if (!Number.isFinite(smtpPort) || smtpPort <= 0) {
+        return reply.code(400).send({ success: false, message: 'SMTP 端口无效' });
+      }
+    }
+    if (body.notifyCooldownSec !== undefined) {
+      const notifyCooldownSec = Number(body.notifyCooldownSec);
+      if (!Number.isFinite(notifyCooldownSec) || notifyCooldownSec < 0) {
+        return reply.code(400).send({ success: false, message: '告警冷静期必须是大于等于 0 的数字（秒）' });
+      }
+    }
+    if (body.proxySessionChannelConcurrencyLimit !== undefined) {
+      const limit = Number(body.proxySessionChannelConcurrencyLimit);
+      if (!Number.isFinite(limit) || limit < 0) {
+        return reply.code(400).send({ success: false, message: '会话通道并发上限必须是大于等于 0 的整数' });
+      }
+    }
+    if (body.proxySessionChannelQueueWaitMs !== undefined) {
+      const queueWaitMs = Number(body.proxySessionChannelQueueWaitMs);
+      if (!Number.isFinite(queueWaitMs) || queueWaitMs < 0) {
+        return reply.code(400).send({ success: false, message: '会话通道排队等待时间必须是大于等于 0 的整数毫秒' });
+      }
+    }
+    if (body.proxyDebugRetentionHours !== undefined) {
+      const retentionHours = Number(body.proxyDebugRetentionHours);
+      if (!Number.isFinite(retentionHours) || retentionHours < 1) {
+        return reply.code(400).send({ success: false, message: '代理调试保留时长必须是大于等于 1 的整数小时' });
+      }
+    }
+    if (body.proxyDebugMaxBodyBytes !== undefined) {
+      const maxBodyBytes = Number(body.proxyDebugMaxBodyBytes);
+      if (!Number.isFinite(maxBodyBytes) || maxBodyBytes < 1024) {
+        return reply.code(400).send({ success: false, message: '代理调试抓取体积上限必须是大于等于 1024 的整数字节' });
+      }
+    }
+    if (body.proxyErrorKeywords !== undefined) {
+      try {
+        parseProxyErrorKeywords(body.proxyErrorKeywords);
+      } catch (err: any) {
+        return reply.code(400).send({ success: false, message: err?.message || '上游错误关键词格式无效' });
+      }
+    }
+    if (body.adminIpAllowlist !== undefined) {
+      const nextAllowlist = toStringList(body.adminIpAllowlist);
+      const invalidAllowlistEntries = findInvalidIpAllowlistEntries(nextAllowlist);
+      if (invalidAllowlistEntries.length > 0) {
+        return reply.code(400).send({
+          success: false,
+          message: `保存失败：IP 白名单包含无效条目：${invalidAllowlistEntries.join(', ')}。请使用单个 IP 或 IPv4 CIDR 网段（例如 192.168.1.10 或 192.168.1.0/24）。`,
+        });
+      }
+    }
+    if (body.routingFallbackUnitCost !== undefined) {
+      const unitCost = Number(body.routingFallbackUnitCost);
+      if (!Number.isFinite(unitCost) || unitCost <= 0) {
+        return reply.code(400).send({ success: false, message: '无价模型默认单价必须是大于 0 的数字' });
+      }
+    }
+    if (body.proxyFirstByteTimeoutSec !== undefined) {
+      const timeoutSec = Number(body.proxyFirstByteTimeoutSec);
+      if (!Number.isFinite(timeoutSec) || timeoutSec < 0) {
+        return reply.code(400).send({ success: false, message: '首字超时必须是大于等于 0 的数字（秒）' });
+      }
+    }
+    if (
+      body.tokenRouterFailureCooldownMaxSec !== undefined
+      && normalizeTokenRouterFailureCooldownMaxSec(body.tokenRouterFailureCooldownMaxSec) == null
+    ) {
+      return reply.code(400).send({ success: false, message: '路由失败冷却上限必须是大于 0 的数字（秒）' });
+    }
 
     const webhookTouched = body.webhookUrl !== undefined || body.webhookEnabled !== undefined;
     const nextWebhookUrl = body.webhookUrl !== undefined
@@ -1157,20 +1310,11 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
 
     if (body.payloadRules !== undefined) {
-      const parsedPayloadRules = parsePayloadRulesConfigInput(body.payloadRules);
-      if (!parsedPayloadRules.success) {
-        return reply.code(400).send({
-          success: false,
-          message: parsedPayloadRules.message,
-        });
-      }
-
       const previousRules = JSON.stringify(config.payloadRules);
-      const nextRules = JSON.stringify(parsedPayloadRules.normalized);
+      const nextRules = JSON.stringify(pendingPayloadRules);
       if (previousRules !== nextRules) {
         changedLabels.push('Payload 规则');
       }
-      pendingPayloadRules = parsedPayloadRules.normalized;
     }
 
     if (body.modelAvailabilityProbeEnabled !== undefined) {
@@ -1457,9 +1601,6 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
 
     if (body.globalBlockedBrands !== undefined) {
-      if (!Array.isArray(body.globalBlockedBrands)) {
-        return reply.code(400).send({ error: 'globalBlockedBrands must be an array of strings' });
-      }
       const nextBrands = body.globalBlockedBrands.filter((b): b is string => typeof b === 'string').map((b) => b.trim()).filter(Boolean);
       const uniqueBrands = Array.from(new Set(nextBrands));
       const prev = JSON.stringify(config.globalBlockedBrands);
@@ -1482,9 +1623,6 @@ export async function settingsRoutes(app: FastifyInstance) {
     }
 
     if (body.globalAllowedModels !== undefined) {
-      if (!Array.isArray(body.globalAllowedModels)) {
-        return reply.code(400).send({ error: 'globalAllowedModels must be an array of strings' });
-      }
       const nextModels = body.globalAllowedModels.filter((m): m is string => typeof m === 'string').map((m) => m.trim()).filter(Boolean);
       const uniqueModels = Array.from(new Set(nextModels));
       const prev = JSON.stringify(config.globalAllowedModels);
@@ -1759,6 +1897,15 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.tokenRouterFailureCooldownMaxSec = normalized;
       await upsertSetting('token_router_failure_cooldown_max_sec', normalized);
+    }
+
+    if (pendingDownstreamErrorPolicy !== undefined) {
+      const nextPolicy = pendingDownstreamErrorPolicy;
+      if (JSON.stringify(nextPolicy) !== JSON.stringify(config.downstreamErrorPolicy)) {
+        changedLabels.push('下游终态错误策略');
+      }
+      await upsertSetting('downstream_error_policy', nextPolicy);
+      config.downstreamErrorPolicy = nextPolicy;
     }
 
     if (pendingPayloadRules !== undefined) {
