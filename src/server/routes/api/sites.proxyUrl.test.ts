@@ -170,6 +170,24 @@ describe('sites proxy settings', () => {
     expect((response.json() as { error?: string }).error).toContain('Invalid globalWeight');
   });
 
+  it('rejects the removed legacy Codex identity mode', async () => {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sites',
+      payload: {
+        name: 'legacy-codex-identity-site',
+        url: 'https://legacy-codex-identity.example.com',
+        platform: 'new-api',
+        codexIdentityMode: 'passthrough',
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error?: string }).error).toContain(
+      'Expected "off", "synthesize", or null',
+    );
+  });
+
   it('rejects invalid external checkin url', async () => {
     const response = await app.inject({
       method: 'POST',

@@ -70,6 +70,7 @@ type SiteRow = {
   subscriptionSummary?: SiteSubscriptionSummary | null;
   createdAt?: string;
   forcedEndpoint?: string | null;
+  codexIdentityMode?: string | null;
   apiEndpointSiteFallbackEnabled?: boolean;
   apiEndpointSiteFallbackCooldownUntil?: string | null;
   apiEndpointSiteFallbackLastSelectedAt?: string | null;
@@ -778,6 +779,7 @@ export default function Sites() {
       customHeaders: serializedCustomHeaders.customHeaders,
       globalWeight: Number(parsedGlobalWeight.toFixed(3)),
       forcedEndpoint: form.forcedEndpoint || null,
+      codexIdentityMode: form.codexIdentityMode || 'off',
       apiEndpointSiteFallbackEnabled: form.apiEndpointSiteFallbackEnabled,
       postRefreshProbeEnabled: probeEnabled,
       postRefreshProbeModel: probeModel.trim(),
@@ -1994,6 +1996,22 @@ export default function Sites() {
             </select>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
               指定后，该站点的所有请求只走所选协议，不会自动切换或降级到其他协议。留空则按平台默认顺序自动选择。
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 12 }}>
+            <label style={{ fontSize: 12, color: 'var(--color-text-secondary)', fontWeight: 600 }}>
+              Codex 身份兼容模式
+            </label>
+            <select
+              value={form.codexIdentityMode}
+              onChange={(e) => setForm((prev) => ({ ...prev, codexIdentityMode: e.target.value }))}
+              style={formInputStyle}
+            >
+              <option value="off">不补全（保留原请求，默认）</option>
+              <option value="synthesize">补全 Header / client_metadata</option>
+            </select>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+              与固定上游协议独立。synthesize 仅补齐一致的 Codex 会话元数据，不重写工具或 Responses-Lite 请求结构。
             </div>
           </div>
         </CenteredModal>

@@ -573,6 +573,9 @@ export async function handleOpenAiResponsesSurfaceRequest(
             downstreamHeaders: request.headers as Record<string, unknown>,
             providerHeaders: buildProviderHeaders(),
             codexExplicitSessionId: codexSessionId || null,
+            codexIdentityMode: selected.site.codexIdentityMode as 'off' | 'synthesize' | undefined,
+            codexIdentityScopeKey: `site:${selected.site.id}`,
+            codexIdentityTurnKey: siteApiEndpointRequestScopeId,
           });
           const upstreamPath = (
             isCompactRequest && endpoint === 'responses'

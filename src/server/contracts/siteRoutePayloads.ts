@@ -17,6 +17,7 @@ const siteCreatePayloadSchema = z.object({
   sortOrder: unknownField,
   globalWeight: unknownField,
   forcedEndpoint: z.union([z.string(), z.null()]).optional(),
+  codexIdentityMode: z.union([z.string(), z.null()]).optional(),
 }).passthrough();
 
 const siteUpdatePayloadSchema = z.object({
@@ -32,6 +33,7 @@ const siteUpdatePayloadSchema = z.object({
   sortOrder: unknownField,
   globalWeight: unknownField,
   forcedEndpoint: z.union([z.string(), z.null()]).optional(),
+  codexIdentityMode: z.union([z.string(), z.null()]).optional(),
 }).passthrough();
 
 const siteBatchPayloadSchema = z.object({

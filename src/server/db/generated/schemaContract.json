@@ -2167,6 +2167,12 @@
           "notNull": false,
           "defaultValue": null,
           "primaryKey": false
+        },
+        "codex_identity_mode": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": "'off'",
+          "primaryKey": false
         }
       }
     },

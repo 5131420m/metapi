@@ -20,6 +20,7 @@ export const sites = sqliteTable('sites', {
   postRefreshProbeScope: text('post_refresh_probe_scope').default('single'),
   postRefreshProbeLatencyThresholdMs: integer('post_refresh_probe_latency_threshold_ms').default(0),
   forcedEndpoint: text('forced_endpoint'), // null | 'chat' | 'messages' | 'responses'
+  codexIdentityMode: text('codex_identity_mode').default('off'), // 'off' | 'synthesize'
   apiEndpointSiteFallbackEnabled: integer('api_endpoint_site_fallback_enabled', { mode: 'boolean' }).default(true),
   apiEndpointSiteFallbackCooldownUntil: text('api_endpoint_site_fallback_cooldown_until'),
   apiEndpointSiteFallbackLastSelectedAt: text('api_endpoint_site_fallback_last_selected_at'),

@@ -137,6 +137,8 @@ describe('buildSiteSaveAction', () => {
     expect(siteFormFromSite({
       proxyUrl: 'http://127.0.0.1:8080',
     }).proxyUrl).toBe('http://127.0.0.1:8080');
+    expect(siteFormFromSite({ codexIdentityMode: 'passthrough' }).codexIdentityMode).toBe('off');
+    expect(siteFormFromSite({ codexIdentityMode: 'synthesize' }).codexIdentityMode).toBe('synthesize');
     expect(siteFormFromSite({
       apiEndpointSiteFallbackEnabled: false,
       apiEndpointSiteFallbackCooldownUntil: '2026-04-01T00:05:00.000Z',

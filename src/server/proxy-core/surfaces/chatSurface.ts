@@ -389,6 +389,9 @@ export async function handleChatSurfaceRequest(
           downstreamHeaders: request.headers as Record<string, unknown>,
           providerHeaders: buildProviderHeaders(),
           codexSessionCacheKey,
+          codexIdentityMode: selected.site.codexIdentityMode as 'off' | 'synthesize' | undefined,
+          codexIdentityScopeKey: `site:${selected.site.id}`,
+          codexIdentityTurnKey: siteApiEndpointRequestScopeId,
         });
         return {
           endpoint,

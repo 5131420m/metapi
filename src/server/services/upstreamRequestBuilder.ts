@@ -9,6 +9,10 @@ import {
 } from '../transformers/openai/responses/conversion.js';
 import { normalizeCodexResponsesBodyForProxy } from '../transformers/openai/responses/codexCompatibility.js';
 import {
+  applyCodexIdentity,
+  type CodexIdentityMode,
+} from '../transformers/openai/responses/codexIdentity.js';
+import {
   convertOpenAiBodyToAnthropicMessagesBody,
   sanitizeAnthropicMessagesBody,
 } from '../transformers/anthropic/messages/conversion.js';
@@ -454,6 +458,9 @@ export function buildUpstreamEndpointRequest(input: {
   providerHeaders?: Record<string, string>;
   codexSessionCacheKey?: string | null;
   codexExplicitSessionId?: string | null;
+  codexIdentityMode?: CodexIdentityMode;
+  codexIdentityScopeKey?: string | null;
+  codexIdentityTurnKey?: string | null;
 }): {
   path: string;
   headers: Record<string, string>;
@@ -712,6 +719,26 @@ export function buildUpstreamEndpointRequest(input: {
       sitePlatform,
     );
 
+    const identityResult = applyCodexIdentity({
+      mode: input.codexIdentityMode || 'off',
+      body: configuredResponsesBody,
+      headers: {
+        ...commonHeaders,
+        ...responsesHeaders,
+      },
+      identityScopeKey: (
+        asTrimmedString(input.codexIdentityScopeKey)
+        || asTrimmedString(input.siteUrl)
+        || sitePlatform
+      ),
+      continuityKey: (
+        input.codexSessionCacheKey
+        || input.codexExplicitSessionId
+        || asTrimmedString(configuredResponsesBody.prompt_cache_key)
+      ),
+      turnKey: input.codexIdentityTurnKey,
+    });
+
     if (sitePlatform === 'codex') {
       if (providerProfile?.id !== 'codex') {
         throw new Error(`missing codex provider profile for platform: ${sitePlatform}`);
@@ -725,20 +752,18 @@ export function buildUpstreamEndpointRequest(input: {
         oauthProjectId: input.oauthProjectId,
         sitePlatform,
         baseHeaders: {
-          ...commonHeaders,
-          ...responsesHeaders,
+          ...identityResult.headers,
         },
         providerHeaders: input.providerHeaders,
         codexSessionCacheKey: input.codexSessionCacheKey,
         codexExplicitSessionId: input.codexExplicitSessionId,
         responsesWebsocketTransport,
-        body: configuredResponsesBody,
+        body: identityResult.body,
       });
     }
 
     const headers = ensureResponsesAcceptHeader({
-      ...commonHeaders,
-      ...responsesHeaders,
+      ...identityResult.headers,
     }, {
       stream: input.stream,
       sitePlatform,
@@ -746,7 +771,7 @@ export function buildUpstreamEndpointRequest(input: {
     return {
       path: resolveEndpointPath('responses'),
       headers,
-      body: configuredResponsesBody,
+      body: identityResult.body,
       runtime,
     };
   }

@@ -723,6 +723,9 @@ async function handleResponsesWebsocketConnection(
                     downstreamHeaders,
                     providerHeaders,
                     codexExplicitSessionId: deriveCodexExplicitSessionId(normalized.request, websocketSessionId),
+                    codexIdentityMode: codexWebsocketChannel.site.codexIdentityMode as 'off' | 'synthesize' | undefined,
+                    codexIdentityScopeKey: `site:${codexWebsocketChannel.site.id}`,
+                    codexIdentityTurnKey: websocketSessionId,
                   });
                   const requestUrl = `${target.baseUrl.replace(/\/+$/, '')}${prepared.path}`;
 

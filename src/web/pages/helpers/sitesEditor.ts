@@ -22,6 +22,7 @@ export type SiteForm = {
   customHeaders: SiteCustomHeaderField[];
   globalWeight: string;
   forcedEndpoint: string;
+  codexIdentityMode: string;
   apiEndpointSiteFallbackEnabled: boolean;
   apiEndpointSiteFallbackCooldownUntil: string | null;
   apiEndpointSiteFallbackLastSelectedAt: string | null;
@@ -49,6 +50,7 @@ export type SiteSavePayload = {
   customHeaders: string;
   globalWeight: number;
   forcedEndpoint?: string | null;
+  codexIdentityMode?: string | null;
   apiEndpointSiteFallbackEnabled?: boolean;
   postRefreshProbeEnabled?: boolean;
   postRefreshProbeModel?: string;
@@ -89,6 +91,7 @@ export function emptySiteForm(): SiteForm {
     customHeaders: [emptySiteCustomHeader()],
     globalWeight: '1',
     forcedEndpoint: '',
+    codexIdentityMode: 'off',
     apiEndpointSiteFallbackEnabled: true,
     apiEndpointSiteFallbackCooldownUntil: null,
     apiEndpointSiteFallbackLastSelectedAt: null,
@@ -145,7 +148,7 @@ function parseApiEndpointsForEditor(raw: unknown): SiteApiEndpointField[] {
   return ensureSiteApiEndpointRows(rows);
 }
 
-export function siteFormFromSite(site: Partial<Omit<SiteForm, 'apiEndpoints' | 'customHeaders' | 'globalWeight' | 'externalCheckinUrl' | 'proxyUrl' | 'useSystemProxy' | 'forcedEndpoint'>> & {
+export function siteFormFromSite(site: Partial<Omit<SiteForm, 'apiEndpoints' | 'customHeaders' | 'globalWeight' | 'externalCheckinUrl' | 'proxyUrl' | 'useSystemProxy' | 'forcedEndpoint' | 'codexIdentityMode'>> & {
   externalCheckinUrl?: string | null;
   proxyUrl?: string | null;
   useSystemProxy?: boolean | null;
@@ -158,6 +161,7 @@ export function siteFormFromSite(site: Partial<Omit<SiteForm, 'apiEndpoints' | '
   customHeaders?: string | null;
   globalWeight?: number | string | null;
   forcedEndpoint?: string | null;
+  codexIdentityMode?: string | null;
   apiEndpointSiteFallbackEnabled?: boolean | null;
   apiEndpointSiteFallbackCooldownUntil?: string | null;
   apiEndpointSiteFallbackLastSelectedAt?: string | null;
@@ -177,6 +181,7 @@ export function siteFormFromSite(site: Partial<Omit<SiteForm, 'apiEndpoints' | '
     customHeaders: parseCustomHeadersForEditor(site.customHeaders),
     globalWeight,
     forcedEndpoint: typeof site.forcedEndpoint === 'string' ? site.forcedEndpoint : '',
+    codexIdentityMode: site.codexIdentityMode === 'synthesize' ? 'synthesize' : 'off',
     apiEndpointSiteFallbackEnabled: site.apiEndpointSiteFallbackEnabled !== false,
     apiEndpointSiteFallbackCooldownUntil: site.apiEndpointSiteFallbackCooldownUntil ?? null,
     apiEndpointSiteFallbackLastSelectedAt: site.apiEndpointSiteFallbackLastSelectedAt ?? null,

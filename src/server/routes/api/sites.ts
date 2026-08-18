@@ -64,6 +64,14 @@ function normalizeForcedEndpoint(input: unknown): string | null {
   return null;
 }
 
+function normalizeCodexIdentityMode(input: unknown): 'off' | 'synthesize' | null {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'string') return null;
+  const trimmed = input.trim().toLowerCase();
+  if (trimmed === 'off' || trimmed === 'synthesize') return trimmed;
+  return null;
+}
+
 function normalizeGlobalWeight(input: unknown): number | null {
   if (input === undefined || input === null || input === '') return null;
   const parsed = Number(input);
@@ -490,6 +498,7 @@ export async function sitesRoutes(app: FastifyInstance) {
       sortOrder,
       globalWeight,
       forcedEndpoint,
+      codexIdentityMode,
       apiEndpointSiteFallbackEnabled,
       apiEndpoints,
     } = createBody;
@@ -543,6 +552,10 @@ export async function sitesRoutes(app: FastifyInstance) {
     if (forcedEndpoint !== undefined && forcedEndpoint !== null && normalizedForcedEndpoint === null) {
       return reply.code(400).send({ error: 'Invalid forcedEndpoint. Expected "chat", "messages", "responses", or null.' });
     }
+    const normalizedCodexIdentityMode = normalizeCodexIdentityMode(codexIdentityMode);
+    if (codexIdentityMode !== undefined && codexIdentityMode !== null && normalizedCodexIdentityMode === null) {
+      return reply.code(400).send({ error: 'Invalid codexIdentityMode. Expected "off", "synthesize", or null.' });
+    }
 
     const existingSites = await db.select().from(schema.sites).all();
     const maxSortOrder = existingSites.reduce((max, site) => Math.max(max, site.sortOrder || 0), -1);
@@ -588,6 +601,7 @@ export async function sitesRoutes(app: FastifyInstance) {
           sortOrder: normalizedSortOrder ?? (maxSortOrder + 1),
           globalWeight: normalizedGlobalWeight ?? 1,
           forcedEndpoint: normalizedForcedEndpoint ?? null,
+          codexIdentityMode: normalizedCodexIdentityMode ?? 'off',
           apiEndpointSiteFallbackEnabled: normalizedFallbackEnabled ?? true,
         }).run();
         const siteId = getInsertedRowId(siteInsert);
@@ -737,6 +751,13 @@ export async function sitesRoutes(app: FastifyInstance) {
         return reply.code(400).send({ error: 'Invalid forcedEndpoint. Expected "chat", "messages", "responses", or null.' });
       }
       updates.forcedEndpoint = normalized;
+    }
+    if (anyBody.codexIdentityMode !== undefined) {
+      const normalized = normalizeCodexIdentityMode(anyBody.codexIdentityMode);
+      if (normalized === null && anyBody.codexIdentityMode !== null) {
+        return reply.code(400).send({ error: 'Invalid codexIdentityMode. Expected "off", "synthesize", or null.' });
+      }
+      updates.codexIdentityMode = normalized || 'off';
     }
     updates.updatedAt = new Date().toISOString();
     try {

@@ -153,6 +153,7 @@ export function buildCodexRuntimeHeaders(input: {
   const codexTurnMetadata = input.codexTurnMetadata || null;
   const timingMetrics = input.timingMetrics || null;
   const openAiBeta = input.openAiBeta || null;
+  const codexWindowId = getInputHeader(input.baseHeaders, 'x-codex-window-id');
   const explicitSessionId = asTrimmedString(input.explicitSessionId);
   const continuityKey = asTrimmedString(input.continuityKey);
   const sessionId = (
@@ -178,6 +179,7 @@ export function buildCodexRuntimeHeaders(input: {
     ...(codexBetaFeatures ? { 'x-codex-beta-features': codexBetaFeatures } : {}),
     ...(codexTurnState ? { 'x-codex-turn-state': codexTurnState } : {}),
     ...(codexTurnMetadata ? { 'x-codex-turn-metadata': codexTurnMetadata } : {}),
+    ...(codexWindowId ? { 'x-codex-window-id': codexWindowId } : {}),
     ...(timingMetrics ? { 'x-responsesapi-include-timing-metrics': timingMetrics } : {}),
     ...(openAiBeta ? { 'OpenAI-Beta': openAiBeta } : {}),
     Session_id: sessionId,
