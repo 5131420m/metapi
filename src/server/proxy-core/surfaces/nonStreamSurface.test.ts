@@ -12,7 +12,7 @@ afterEach(() => {
 describe('non-stream terminal failure surface', () => {
   it('rewrites an exhausted upstream auth failure for a dedicated downstream key', () => {
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12],
     };
 
@@ -36,7 +36,7 @@ describe('non-stream terminal failure surface', () => {
 
   it('does not rewrite one upstream attempt without explicit exhaustion evidence', () => {
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12],
     };
     const originalPayload = {
@@ -61,7 +61,7 @@ describe('non-stream terminal failure surface', () => {
 
   it('preserves the original payload outside the dedicated downstream key scope', () => {
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12],
     };
     const originalPayload = { error: { message: 'quota exceeded', request_id: 'req_123' } };
@@ -91,7 +91,7 @@ describe('non-stream terminal failure surface', () => {
 
   it('keeps routing exhaustion non-2xx while neutralizing it for a dedicated key', () => {
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12],
     };
 

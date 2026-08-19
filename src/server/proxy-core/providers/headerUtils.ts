@@ -152,10 +152,9 @@ export function buildCodexRuntimeHeaders(input: {
   const codexBetaFeatures = input.codexBetaFeatures || null;
   const codexTurnState = input.codexTurnState || null;
   const codexTurnMetadata = input.codexTurnMetadata || null;
-  const codexWindowId = input.codexWindowId || null;
+  const codexWindowId = input.codexWindowId || getInputHeader(input.baseHeaders, 'x-codex-window-id') || null;
   const timingMetrics = input.timingMetrics || null;
   const openAiBeta = input.openAiBeta || null;
-  const codexWindowId = getInputHeader(input.baseHeaders, 'x-codex-window-id');
   const explicitSessionId = asTrimmedString(input.explicitSessionId);
   const continuityKey = asTrimmedString(input.continuityKey);
   const sessionId = (

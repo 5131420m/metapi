@@ -793,7 +793,7 @@ describe('gemini native proxy routes', () => {
   it('neutralizes an exhausted deep-upstream auth failure for a dedicated managed key', async () => {
     const previousPolicy = structuredClone(config.downstreamErrorPolicy);
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [91],
     };
     authorizeDownstreamTokenMock.mockResolvedValue({

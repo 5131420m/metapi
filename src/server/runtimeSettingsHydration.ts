@@ -93,10 +93,10 @@ export function applyRuntimeSettings(
     try {
       const parsed = parseDownstreamErrorPolicyConfig(downstreamErrorPolicy);
       const existingIds = options.existingDownstreamApiKeyIds;
-      if (parsed.mode === 'cpa-hermes-resilient' && existingIds) {
+      if (parsed.mode === 'resilient' && existingIds) {
         const downstreamApiKeyIds = parsed.downstreamApiKeyIds.filter((id) => existingIds.has(id));
         const normalized = downstreamApiKeyIds.length > 0
-          ? { mode: 'cpa-hermes-resilient' as const, downstreamApiKeyIds }
+          ? { mode: 'resilient' as const, downstreamApiKeyIds }
           : { mode: 'off' as const, downstreamApiKeyIds: [] };
         config.downstreamErrorPolicy = normalized;
         if (downstreamApiKeyIds.length !== parsed.downstreamApiKeyIds.length) {

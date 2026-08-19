@@ -71,7 +71,7 @@ describe('Settings downstream error policy', () => {
     apiMock.updateRuntimeSettings.mockResolvedValue({
       proxyErrorKeywords: [],
       proxyEmptyContentFailEnabled: false,
-      downstreamErrorPolicy: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [12] },
+      downstreamErrorPolicy: { mode: 'resilient', downstreamApiKeyIds: [12] },
     });
   });
 
@@ -87,8 +87,9 @@ describe('Settings downstream error policy', () => {
 
       const policySelect = root.root.find((node) => node.type === 'select'
         && node.props.value === 'off'
-        && node.children.some((child) => typeof child !== 'string' && collectText(child).includes('CPA/Hermes 韧性模式')));
-      await act(async () => policySelect.props.onChange({ target: { value: 'cpa-hermes-resilient' } }));
+        && node.children.some((child) => typeof child !== 'string' && collectText(child).includes('韧性模式')));
+      expect(policySelect.children.some((child) => typeof child !== 'string' && collectText(child).includes('原样透传'))).toBe(false);
+      await act(async () => policySelect.props.onChange({ target: { value: 'resilient' } }));
 
       const keyLabel = root.root.find((node) => node.type === 'label' && collectText(node).includes('CPA dedicated'));
       await act(async () => keyLabel.findByType('input').props.onChange({ target: { checked: true } }));
@@ -103,7 +104,7 @@ describe('Settings downstream error policy', () => {
         proxyErrorKeywords: [],
         proxyEmptyContentFailEnabled: false,
         downstreamErrorPolicy: {
-          mode: 'cpa-hermes-resilient',
+          mode: 'resilient',
           downstreamApiKeyIds: [12],
         },
       });

@@ -9,7 +9,7 @@ import {
 describe('planRuntimeSettingsHydration', () => {
   it('plans stale downstream policy cleanup without mutating the input map', () => {
     const originalPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [17, 18],
     };
     const settingsMap = new Map([
@@ -24,19 +24,19 @@ describe('planRuntimeSettingsHydration', () => {
 
     expect(JSON.parse(settingsMap.get('downstream_error_policy') || '{}')).toEqual(originalPolicy);
     expect(JSON.parse(result.settingsMap.get('downstream_error_policy') || '{}')).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [18],
     });
     expect(result.normalizedSettings).toEqual([{
       key: 'downstream_error_policy',
-      value: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [18] },
+      value: { mode: 'resilient', downstreamApiKeyIds: [18] },
     }]);
   });
 
   it('plans disabling a resilient policy whose key references are all stale', () => {
     const result = planRuntimeSettingsHydration(
       new Map([['downstream_error_policy', JSON.stringify({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [17],
       })]]),
       new Set(),
@@ -54,7 +54,7 @@ describe('planRuntimeSettingsHydration', () => {
 
     await expect(commitRuntimeSettingsHydration({
       settingsMap: new Map([['downstream_error_policy', JSON.stringify({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [17],
       })]]),
       existingDownstreamApiKeyIds: new Set(),

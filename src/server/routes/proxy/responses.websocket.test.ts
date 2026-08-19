@@ -2424,7 +2424,7 @@ describe('responses websocket transport', () => {
   it('sanitizes native websocket response.failed for a scoped managed key while preserving internal accounting', async () => {
     const previousPolicy = structuredClone(config.downstreamErrorPolicy);
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [99],
     };
     authorizeDownstreamTokenMock.mockResolvedValueOnce({
@@ -2474,7 +2474,7 @@ describe('responses websocket transport', () => {
   it('sanitizes a scoped managed-key error synthesized from an HTTP fallback response', async () => {
     const previousPolicy = structuredClone(config.downstreamErrorPolicy);
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [99],
     };
     authorizeDownstreamTokenMock.mockResolvedValueOnce({

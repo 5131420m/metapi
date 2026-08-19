@@ -12,7 +12,7 @@ import {
 } from './downstreamErrorPolicy.js';
 
 const resilientPolicy = parseDownstreamErrorPolicyConfig({
-  mode: 'cpa-hermes-resilient',
+  mode: 'resilient',
   downstreamApiKeyIds: [12],
 });
 
@@ -32,7 +32,7 @@ function failure(status: number, message: string, downstreamApiKeyId: number | n
 describe('downstream terminal error policy', () => {
   it('sanitizes scoped postcommit upstream errors without changing operational details', () => {
     const policy = {
-      mode: 'cpa-hermes-resilient' as const,
+      mode: 'resilient' as const,
       downstreamApiKeyIds: [12],
     };
     expect(sanitizePostcommitFailureMessage({
@@ -109,17 +109,17 @@ describe('downstream terminal error policy', () => {
 
   it('requires a dedicated downstream key scope for resilient mode', () => {
     expect(() => parseDownstreamErrorPolicyConfig({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [],
-    })).toThrow('至少选择一个专用下游 API Key');
+    })).toThrow('韧性模式必须至少选择一个专用下游 API Key');
   });
 
   it('normalizes and de-duplicates dedicated downstream key ids', () => {
     expect(parseDownstreamErrorPolicyConfig({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12, 12, 15],
     })).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12, 15],
     });
   });
@@ -129,22 +129,22 @@ describe('downstream terminal error policy', () => {
       mode: 'off',
       downstreamApiKeyIds: [],
     });
-    expect(parseDownstreamErrorPolicyConfig({ mode: 'passthrough', downstreamApiKeyIds: [12] })).toEqual({
+    expect(() => parseDownstreamErrorPolicyConfig({
       mode: 'passthrough',
-      downstreamApiKeyIds: [],
-    });
+      downstreamApiKeyIds: [12],
+    })).toThrow('mode 无效');
   });
 
   it('rejects invalid numeric dedicated downstream key ids', () => {
     expect(() => parseDownstreamErrorPolicyConfig({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12, -1, 0, 1.5],
     })).toThrow('必须是正整数');
   });
 
   it('rejects non-numeric dedicated downstream key ids instead of coercing them', () => {
     expect(() => parseDownstreamErrorPolicyConfig({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: ['12'],
     })).toThrow('必须是正整数');
   });

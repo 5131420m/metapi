@@ -774,7 +774,7 @@ describe('settings and auth events', () => {
       url: '/api/settings/runtime',
       payload: {
         downstreamErrorPolicy: {
-          mode: 'cpa-hermes-resilient',
+          mode: 'resilient',
           downstreamApiKeyIds: [dedicatedKey.id, dedicatedKey.id],
         },
       },
@@ -782,12 +782,12 @@ describe('settings and auth events', () => {
 
     expect(updateResponse.statusCode).toBe(200);
     expect(config.downstreamErrorPolicy).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [dedicatedKey.id],
     });
     const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'downstream_error_policy')).get();
     expect(JSON.parse(String(saved?.value))).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [dedicatedKey.id],
     });
   });
@@ -798,7 +798,7 @@ describe('settings and auth events', () => {
       url: '/api/settings/runtime',
       payload: {
         downstreamErrorPolicy: {
-          mode: 'cpa-hermes-resilient',
+          mode: 'resilient',
           downstreamApiKeyIds: [999999],
         },
       },
@@ -820,7 +820,7 @@ describe('settings and auth events', () => {
       url: '/api/settings/runtime',
       payload: {
         downstreamErrorPolicy: {
-          mode: 'cpa-hermes-resilient',
+          mode: 'resilient',
           downstreamApiKeyIds: [dedicatedKey.id],
         },
         globalBlockedBrands: 'not-an-array',
@@ -847,7 +847,7 @@ describe('settings and auth events', () => {
       url: '/api/settings/runtime',
       payload: {
         downstreamErrorPolicy: {
-          mode: 'cpa-hermes-resilient',
+          mode: 'resilient',
           downstreamApiKeyIds: [dedicatedKey.id],
         },
         smtpPort: 0,
@@ -966,7 +966,7 @@ describe('settings and auth events', () => {
       url: '/api/settings/runtime',
       payload: {
         downstreamErrorPolicy: {
-          mode: 'cpa-hermes-resilient',
+          mode: 'resilient',
           downstreamApiKeyIds: [],
         },
       },
@@ -974,6 +974,23 @@ describe('settings and auth events', () => {
 
     expect(response.statusCode).toBe(400);
     expect(response.json().message).toContain('至少选择一个专用下游 API Key');
+  });
+
+  it('rejects the removed passthrough downstream error policy mode', async () => {
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/api/settings/runtime',
+      payload: {
+        downstreamErrorPolicy: {
+          mode: 'passthrough',
+          downstreamApiKeyIds: [],
+        },
+      },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toContain('mode 无效');
+    expect(config.downstreamErrorPolicy).toEqual({ mode: 'off', downstreamApiKeyIds: [] });
   });
 
   it('persists global model and brand filters as JSON arrays', async () => {

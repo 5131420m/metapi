@@ -62,7 +62,7 @@ describe('downstream api keys routes', () => {
       { name: 'dedicated-b', key: 'sk-dedicated-b', enabled: true },
     ]).returning().all();
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: inserted.map((row: { id: number }) => row.id),
     };
     await db.insert(schema.settings).values({
@@ -77,7 +77,7 @@ describe('downstream api keys routes', () => {
 
     expect(response.statusCode).toBe(200);
     expect(config.downstreamErrorPolicy).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [inserted[1].id],
     });
     const saved = await db.select().from(schema.settings)
@@ -93,7 +93,7 @@ describe('downstream api keys routes', () => {
       enabled: true,
     }).returning().get();
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [inserted.id],
     };
     await db.insert(schema.settings).values({
@@ -120,7 +120,7 @@ describe('downstream api keys routes', () => {
         .where(eq(schema.downstreamApiKeys.id, inserted.id))
         .get()).toBeDefined();
       expect(config.downstreamErrorPolicy).toEqual({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [inserted.id],
       });
     } finally {

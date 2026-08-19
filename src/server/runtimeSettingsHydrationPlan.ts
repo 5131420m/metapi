@@ -29,7 +29,7 @@ export function planRuntimeSettingsHydration(
 
   try {
     const parsed = parseDownstreamErrorPolicyConfig(downstreamErrorPolicy);
-    if (parsed.mode !== 'cpa-hermes-resilient') {
+    if (parsed.mode !== 'resilient') {
       return { settingsMap: plannedMap, normalizedSettings };
     }
     const downstreamApiKeyIds = parsed.downstreamApiKeyIds.filter((id) => existingDownstreamApiKeyIds.has(id));
@@ -37,7 +37,7 @@ export function planRuntimeSettingsHydration(
       return { settingsMap: plannedMap, normalizedSettings };
     }
     const normalized: DownstreamErrorPolicyConfig = downstreamApiKeyIds.length > 0
-      ? { mode: 'cpa-hermes-resilient', downstreamApiKeyIds }
+      ? { mode: 'resilient', downstreamApiKeyIds }
       : { mode: 'off', downstreamApiKeyIds: [] };
     normalizedSettings.push({ key: 'downstream_error_policy', value: normalized });
     plannedMap.set('downstream_error_policy', JSON.stringify(normalized));

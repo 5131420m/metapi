@@ -83,7 +83,7 @@ type RuntimeSettings = {
   proxyErrorKeywords: string[];
   proxyEmptyContentFailEnabled: boolean;
   downstreamErrorPolicy: {
-    mode: 'off' | 'passthrough' | 'cpa-hermes-resilient';
+    mode: 'off' | 'resilient';
     downstreamApiKeyIds: number[];
   };
   proxyTokenMasked?: string;
@@ -1558,10 +1558,9 @@ export default function Settings() {
               style={{ ...inputStyle, marginBottom: 8 }}
             >
               <option value="off">关闭</option>
-              <option value="passthrough">原样透传</option>
-              <option value="cpa-hermes-resilient">CPA/Hermes 韧性模式</option>
+              <option value="resilient">韧性模式</option>
             </select>
-            {runtime.downstreamErrorPolicy.mode === 'cpa-hermes-resilient' && (
+            {runtime.downstreamErrorPolicy.mode === 'resilient' && (
               <div style={{ display: 'grid', gap: 6 }}>
                 <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>专用下游 API Key（可多选）</div>
                 {downstreamApiKeys.length === 0 ? (

@@ -90,12 +90,12 @@ function normalizeBatchIds(raw: unknown): number[] {
 
 function resolvePolicyAfterDownstreamKeyRemoval(id: number) {
   if (
-    config.downstreamErrorPolicy.mode !== 'cpa-hermes-resilient'
+    config.downstreamErrorPolicy.mode !== 'resilient'
     || !config.downstreamErrorPolicy.downstreamApiKeyIds.includes(id)
   ) return null;
   const remainingIds = config.downstreamErrorPolicy.downstreamApiKeyIds.filter((keyId) => keyId !== id);
   return remainingIds.length > 0
-    ? parseDownstreamErrorPolicyConfig({ mode: 'cpa-hermes-resilient', downstreamApiKeyIds: remainingIds })
+    ? parseDownstreamErrorPolicyConfig({ mode: 'resilient', downstreamApiKeyIds: remainingIds })
     : parseDownstreamErrorPolicyConfig({ mode: 'off', downstreamApiKeyIds: [] });
 }
 

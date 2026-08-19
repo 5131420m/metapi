@@ -416,7 +416,7 @@ export type RuntimeSettingsPayload = {
   proxyErrorKeywords?: string[] | string;
   proxyEmptyContentFailEnabled?: boolean;
   downstreamErrorPolicy?: {
-    mode: 'off' | 'passthrough' | 'cpa-hermes-resilient';
+    mode: 'off' | 'resilient';
     downstreamApiKeyIds: number[];
   };
   globalBlockedBrands?: string[];

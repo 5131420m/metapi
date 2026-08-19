@@ -615,7 +615,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [44],
     };
     try {
@@ -661,7 +661,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [44],
     };
     try {
@@ -700,7 +700,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [44],
     };
     try {
@@ -735,7 +735,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [44],
     };
     try {
@@ -795,7 +795,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [44],
     };
     try {
@@ -854,7 +854,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [44],
     };
     try {
@@ -1129,7 +1129,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     const { config } = await import('../../config.js');
     const previousPolicy = config.downstreamErrorPolicy;
     config.downstreamErrorPolicy = {
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [12],
     };
     try {

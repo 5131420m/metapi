@@ -1,7 +1,6 @@
 export const DOWNSTREAM_ERROR_POLICY_MODES = [
   'off',
-  'passthrough',
-  'cpa-hermes-resilient',
+  'resilient',
 ] as const;
 
 export type DownstreamErrorPolicyMode = typeof DOWNSTREAM_ERROR_POLICY_MODES[number];
@@ -75,7 +74,7 @@ export function sanitizePostcommitFailureMessage(input: {
   policy: DownstreamErrorPolicyConfig;
 }): string {
   if (
-    input.policy.mode !== 'cpa-hermes-resilient'
+    input.policy.mode !== 'resilient'
     || typeof input.downstreamApiKeyId !== 'number'
     || !input.policy.downstreamApiKeyIds.includes(input.downstreamApiKeyId)
   ) {
@@ -116,12 +115,12 @@ export function parseDownstreamErrorPolicyConfig(value: unknown): DownstreamErro
     throw new Error('下游终态错误策略 downstreamApiKeyIds 无效：需要 number[]');
   }
   const downstreamApiKeyIds = normalizePositiveIntegerIds(value.downstreamApiKeyIds);
-  if (mode === 'cpa-hermes-resilient' && downstreamApiKeyIds.length === 0) {
-    throw new Error('CPA/Hermes 韧性模式必须至少选择一个专用下游 API Key');
+  if (mode === 'resilient' && downstreamApiKeyIds.length === 0) {
+    throw new Error('韧性模式必须至少选择一个专用下游 API Key');
   }
   return {
     mode: mode as DownstreamErrorPolicyMode,
-    downstreamApiKeyIds: mode === 'cpa-hermes-resilient' ? downstreamApiKeyIds : [],
+    downstreamApiKeyIds: mode === 'resilient' ? downstreamApiKeyIds : [],
   };
 }
 
@@ -261,7 +260,7 @@ function isPolicyTarget(
   failure: CanonicalProxyFailure,
   policy: DownstreamErrorPolicyConfig,
 ): boolean {
-  if (policy.mode !== 'cpa-hermes-resilient') return false;
+  if (policy.mode !== 'resilient') return false;
   if (failure.origin !== 'upstream' && failure.origin !== 'routing') return false;
   if (failure.phase !== 'precommit') return false;
   if (failure.transport === 'websocket') return false;

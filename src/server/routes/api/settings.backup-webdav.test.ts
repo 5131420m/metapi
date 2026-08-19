@@ -154,7 +154,7 @@ describe('settings backup webdav api', () => {
       }).run();
       await db.insert(schema.settings).values({
         key: 'downstream_error_policy',
-        value: JSON.stringify({ mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [existingKey.id] }),
+        value: JSON.stringify({ mode: 'resilient', downstreamApiKeyIds: [existingKey.id] }),
       }).run();
 
       const response = await app.inject({ method: 'POST', url: '/api/settings/backup/webdav/import' });
@@ -165,7 +165,7 @@ describe('settings backup webdav api', () => {
         .get();
       expect(importedKey).toBeTruthy();
       expect(config.downstreamErrorPolicy).toEqual({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [importedKey!.id],
       });
     } finally {

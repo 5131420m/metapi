@@ -318,7 +318,7 @@ function parseBooleanFlag(value: unknown, label: string): boolean {
 }
 
 async function validateDownstreamErrorPolicyReferences(policy: ReturnType<typeof parseDownstreamErrorPolicyConfig>): Promise<void> {
-  if (policy.mode !== 'cpa-hermes-resilient') return;
+  if (policy.mode !== 'resilient') return;
   const rows = await db.select({ id: schema.downstreamApiKeys.id })
     .from(schema.downstreamApiKeys)
     .where(inArray(schema.downstreamApiKeys.id, policy.downstreamApiKeyIds))

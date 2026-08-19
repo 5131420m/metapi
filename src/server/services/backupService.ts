@@ -1306,14 +1306,14 @@ function isSettingValueAcceptable(key: string, value: unknown): boolean {
 
   if (key === 'downstream_error_policy') {
     if (isRecord(value) && Array.isArray(value.downstreamApiKeyKeys)) {
-      if (value.mode === 'cpa-hermes-resilient') {
+      if (value.mode === 'resilient') {
         if (value.downstreamApiKeyKeys.length === 0) return false;
         const keys = value.downstreamApiKeyKeys.filter(
           (key): key is string => typeof key === 'string' && key.trim().length > 0,
         );
         return keys.length === value.downstreamApiKeyKeys.length && new Set(keys).size === keys.length;
       }
-      return (value.mode === 'off' || value.mode === 'passthrough')
+      return value.mode === 'off'
         && value.downstreamApiKeyKeys.length === 0;
     }
     try {
@@ -1328,14 +1328,14 @@ function isSettingValueAcceptable(key: string, value: unknown): boolean {
 }
 
 async function hasExistingDownstreamErrorPolicyKeys(value: unknown): Promise<boolean> {
-  if (isRecord(value) && value.mode === 'cpa-hermes-resilient' && Array.isArray(value.downstreamApiKeyKeys)) {
+  if (isRecord(value) && value.mode === 'resilient' && Array.isArray(value.downstreamApiKeyKeys)) {
     const keys = value.downstreamApiKeyKeys.filter((key): key is string => typeof key === 'string' && key.trim().length > 0);
     if (keys.length !== value.downstreamApiKeyKeys.length) return false;
     const rows = await db.select({ key: schema.downstreamApiKeys.key }).from(schema.downstreamApiKeys).all();
     const existing = new Set(rows.map((row: { key: string }) => row.key));
     return keys.every((key) => existing.has(key));
   }
-  if (!isRecord(value) || value.mode !== 'cpa-hermes-resilient' || !Array.isArray(value.downstreamApiKeyIds)) return true;
+  if (!isRecord(value) || value.mode !== 'resilient' || !Array.isArray(value.downstreamApiKeyIds)) return true;
   const ids = value.downstreamApiKeyIds.filter((id): id is number => typeof id === 'number');
   if (ids.length !== value.downstreamApiKeyIds.length) return false;
   const rows = await db.select({ id: schema.downstreamApiKeys.id })
@@ -1347,11 +1347,11 @@ async function hasExistingDownstreamErrorPolicyKeys(value: unknown): Promise<boo
 
 async function normalizeImportedDownstreamErrorPolicy(value: unknown): Promise<unknown> {
   if (!isRecord(value) || !Array.isArray(value.downstreamApiKeyKeys)) return value;
-  if (value.mode === 'off' || value.mode === 'passthrough') {
+  if (value.mode === 'off') {
     if (value.downstreamApiKeyKeys.length !== 0) return null;
     return { mode: value.mode, downstreamApiKeyIds: [] };
   }
-  if (value.mode !== 'cpa-hermes-resilient') return null;
+  if (value.mode !== 'resilient') return null;
   const rows = await db.select({ id: schema.downstreamApiKeys.id, key: schema.downstreamApiKeys.key }).from(schema.downstreamApiKeys).all();
   const idByKey = new Map(rows.map((row: { id: number; key: string }) => [row.key, row.id]));
   const keys = value.downstreamApiKeyKeys.filter((key): key is string => typeof key === 'string' && key.trim().length > 0);
@@ -1622,7 +1622,7 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<Ar
   if (persistedPolicyRow) {
     try {
       const policy = parseSettingValue(persistedPolicyRow.value);
-      if (isRecord(policy) && policy.mode === 'cpa-hermes-resilient' && Array.isArray(policy.downstreamApiKeyIds)) {
+      if (isRecord(policy) && policy.mode === 'resilient' && Array.isArray(policy.downstreamApiKeyIds)) {
         const keyById = new Map(Array.from(runtimeState.downstreamApiKeyIdByKey, ([key, id]) => [id, key]));
         persistedPolicyKeys = policy.downstreamApiKeyIds
           .filter((id): id is number => typeof id === 'number')
@@ -1922,7 +1922,7 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<Ar
           .map((key) => downstreamApiKeyIdByKey.get(key))
           .filter((id): id is number => typeof id === 'number');
         const remappedPolicy = remappedIds.length > 0
-          ? { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: remappedIds }
+          ? { mode: 'resilient', downstreamApiKeyIds: remappedIds }
           : { mode: 'off', downstreamApiKeyIds: [] };
         await upsertSetting('downstream_error_policy', remappedPolicy, tx);
         appliedSettings = [{ key: 'downstream_error_policy', value: remappedPolicy }];

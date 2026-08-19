@@ -216,7 +216,7 @@ describe('backupService', () => {
     await db.insert(schema.settings).values({
       key: 'downstream_error_policy',
       value: JSON.stringify({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [exportedDownstreamKey.id],
       }),
     }).run();
@@ -275,7 +275,7 @@ describe('backupService', () => {
     expect(result.appliedSettings).toContainEqual({
       key: 'downstream_error_policy',
       value: {
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [expect.any(Number)],
       },
     });
@@ -295,7 +295,7 @@ describe('backupService', () => {
 
     expect(restoredSite?.proxyUrl).toBe('http://127.0.0.1:8080');
     expect(JSON.parse(String(restoredPolicy?.value))).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [restoredDownstreamKeys[0].id],
     });
     expect(restoredSite?.externalCheckinUrl).toBe('https://checkin.roundtrip.example.com');
@@ -401,7 +401,7 @@ describe('backupService', () => {
       preferences: {
         settings: [{
           key: 'downstream_error_policy',
-          value: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [] },
+          value: { mode: 'resilient', downstreamApiKeyIds: [] },
         }],
       },
     });
@@ -419,7 +419,7 @@ describe('backupService', () => {
       preferences: {
         settings: [{
           key: 'downstream_error_policy',
-          value: { mode: 'cpa-hermes-resilient', downstreamApiKeyIds: [999999] },
+          value: { mode: 'resilient', downstreamApiKeyIds: [999999] },
         }],
       },
     });
@@ -455,7 +455,7 @@ describe('backupService', () => {
     await db.insert(schema.settings).values({
       key: 'downstream_error_policy',
       value: JSON.stringify({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [dedicatedKey.id],
       }),
     }).run();
@@ -805,7 +805,7 @@ describe('backupService', () => {
     await db.insert(schema.settings).values({
       key: 'downstream_error_policy',
       value: JSON.stringify({
-        mode: 'cpa-hermes-resilient',
+        mode: 'resilient',
         downstreamApiKeyIds: [downstreamKey.id],
       }),
     }).run();
@@ -1031,7 +1031,7 @@ describe('backupService', () => {
 
     expect(restoredSite?.name).toBe('backup-site');
     expect(JSON.parse(String(restoredPolicy?.value))).toEqual({
-      mode: 'cpa-hermes-resilient',
+      mode: 'resilient',
       downstreamApiKeyIds: [restoredDownstreamKeys[0]?.id],
     });
     expect(restoredRoute?.displayName).toBe('backup-route');
