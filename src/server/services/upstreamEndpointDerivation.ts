@@ -15,6 +15,7 @@ export type EndpointDerivationHints = {
   oauthProvider?: string | null;
   requestKind?: 'default' | 'responses-compact' | 'claude-count-tokens';
   requiresNativeResponsesFileUrl?: boolean;
+  disableRuntimePreference?: boolean;
 };
 
 type ChannelContext = {
@@ -177,11 +178,13 @@ export async function resolveUpstreamEndpointCandidates(
   const wantsNativeResponsesReasoning = capabilityProfile.wantsNativeResponsesReasoning;
   const wantsContinuationAwareResponses = capabilityProfile.wantsContinuationAwareResponses;
   const applyRuntimePreference = (candidates: UpstreamEndpoint[]) => (
-    applyUpstreamEndpointRuntimePreference(candidates, {
-      siteId: context.site.id,
-      downstreamFormat,
-      capabilityProfile,
-    })
+    hints?.disableRuntimePreference
+      ? candidates
+      : applyUpstreamEndpointRuntimePreference(candidates, {
+        siteId: context.site.id,
+        downstreamFormat,
+        capabilityProfile,
+      })
   );
   const finalizeCandidates = (candidates: UpstreamEndpoint[]): UpstreamEndpoint[] => {
     const preferredCandidates = applyRuntimePreference(candidates);

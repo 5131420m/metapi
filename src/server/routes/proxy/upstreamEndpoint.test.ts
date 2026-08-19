@@ -445,6 +445,37 @@ describe('resolveUpstreamEndpointCandidates', () => {
     expect(order).toEqual(['responses', 'chat', 'messages']);
   });
 
+  it('ignores existing runtime endpoint memory when runtime preference is disabled', async () => {
+    recordUpstreamEndpointSuccess({
+      siteId: baseContext.site.id,
+      endpoint: 'messages',
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.3',
+    });
+
+    const order = await resolveUpstreamEndpointCandidates(
+      {
+        ...baseContext,
+        site: { ...baseContext.site, platform: 'new-api' },
+      },
+      'gpt-5.3',
+      'openai',
+      undefined,
+      undefined,
+      { disableRuntimePreference: true },
+    );
+
+    expect(order).toEqual(['chat', 'messages', 'responses']);
+    expect(getUpstreamEndpointRuntimeStateSnapshot({
+      siteId: baseContext.site.id,
+      downstreamFormat: 'openai',
+      modelName: 'gpt-5.3',
+    })).toMatchObject({
+      preferredEndpoint: 'messages',
+      blockedEndpoints: [],
+    });
+  });
+
   it('keeps learned endpoint state scoped to the model key', async () => {
     recordUpstreamEndpointSuccess({
       siteId: baseContext.site.id,

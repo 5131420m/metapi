@@ -2,7 +2,11 @@ import { zstdCompressSync } from 'node:zlib';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../../config.js';
-import { resetUpstreamEndpointRuntimeState } from '../../services/upstreamEndpointRuntimeMemory.js';
+import {
+  getUpstreamEndpointRuntimeStateSnapshot,
+  recordUpstreamEndpointSuccess,
+  resetUpstreamEndpointRuntimeState,
+} from '../../services/upstreamEndpointRuntimeMemory.js';
 
 const fetchMock = vi.fn();
 const selectChannelMock = vi.fn();
@@ -78,6 +82,7 @@ vi.mock('../../db/index.js', () => ({
     select: () => ({
       from: () => ({
         where: () => ({
+          get: async () => null,
           orderBy: () => ({
             all: async () => [],
           }),
@@ -97,6 +102,9 @@ vi.mock('../../db/index.js', () => ({
   hasProxyLogDownstreamApiKeyIdColumn: async () => false,
   hasProxyLogStreamTimingColumns: async () => false,
   schema: {
+    accounts: {
+      id: {},
+    },
     proxyLogs: {},
     siteApiEndpoints: {
       id: {},
@@ -3825,6 +3833,101 @@ describe('chat proxy stream behavior', () => {
     expect(firstUrl).toContain('/v1/messages');
     const body = response.json();
     expect(body?.error?.message).toContain('/v1/messages');
+  });
+
+  it('keeps repeated requests on the downstream protocol when cross protocol fallback is disabled', async () => {
+    (config as any).disableCrossProtocolFallback = true;
+    selectChannelMock.mockReturnValue({
+      channel: { id: 11, routeId: 22 },
+      site: { id: 44, name: 'generic-site', url: 'https://generic.example.com', platform: 'new-api' },
+      account: { id: 33, username: 'demo-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-generic',
+      actualModel: 'z-ai/glm-5.2',
+    });
+    recordUpstreamEndpointSuccess({
+      siteId: 44,
+      endpoint: 'messages',
+      downstreamFormat: 'openai',
+      modelName: 'z-ai/glm-5.2',
+      requestedModelHint: 'glm-5.2',
+    });
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({
+      error: {
+        message: 'openai_error',
+        type: 'bad_response_status_code',
+        code: 'bad_response_status_code',
+      },
+    }), {
+      status: 422,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'glm-5.2',
+          stream: true,
+          messages: [{ role: 'user', content: 'hello' }],
+        },
+      });
+      expect(response.statusCode).toBe(422);
+    }
+
+    expect(getUpstreamEndpointRuntimeStateSnapshot({
+      siteId: 44,
+      downstreamFormat: 'openai',
+      modelName: 'z-ai/glm-5.2',
+      requestedModelHint: 'glm-5.2',
+    })).toMatchObject({
+      preferredEndpoint: 'messages',
+      blockedEndpoints: [],
+    });
+
+    fetchMock.mockImplementationOnce(async () => new Response(JSON.stringify({
+      id: 'chatcmpl-glm',
+      object: 'chat.completion',
+      model: 'z-ai/glm-5.2',
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: 'ok' },
+        finish_reason: 'stop',
+      }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    const successResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      payload: {
+        model: 'glm-5.2',
+        stream: true,
+        messages: [{ role: 'user', content: 'hello again' }],
+      },
+    });
+    expect(successResponse.statusCode).toBe(200);
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    const attemptedPaths = fetchMock.mock.calls.map(([url]) => new URL(String(url)).pathname);
+    expect(attemptedPaths).toEqual([
+      '/v1/chat/completions',
+      '/v1/chat/completions',
+      '/v1/chat/completions',
+      '/v1/chat/completions',
+    ]);
+    expect(getUpstreamEndpointRuntimeStateSnapshot({
+      siteId: 44,
+      downstreamFormat: 'openai',
+      modelName: 'z-ai/glm-5.2',
+      requestedModelHint: 'glm-5.2',
+    })).toMatchObject({
+      preferredEndpoint: 'messages',
+      blockedEndpoints: [],
+    });
   });
 
   it('continues to /v1/responses when /v1/messages dispatch is denied for /v1/chat/completions', async () => {

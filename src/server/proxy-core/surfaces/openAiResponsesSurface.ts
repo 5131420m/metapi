@@ -462,6 +462,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           {
             requestKind: 'responses-compact',
             requiresNativeResponsesFileUrl,
+            disableRuntimePreference: config.disableCrossProtocolFallback,
           },
         )
         : await resolveUpstreamEndpointCandidates(
@@ -479,6 +480,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           },
           {
             requiresNativeResponsesFileUrl,
+            disableRuntimePreference: config.disableCrossProtocolFallback,
           },
         );
       const endpointRuntimeContext = {
@@ -720,7 +722,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             ctx.rawErrText || ctx.errText,
           ),
           onAttemptFailure: async (ctx) => {
-            const memoryWrite = isCompactRequest
+            const memoryWrite = isCompactRequest || config.disableCrossProtocolFallback
               ? null
               : recordUpstreamEndpointFailure({
                 ...endpointRuntimeContext,
@@ -747,7 +749,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             });
           },
           onAttemptSuccess: async (ctx) => {
-            const memoryWrite = isCompactRequest
+            const memoryWrite = isCompactRequest || config.disableCrossProtocolFallback
               ? null
               : recordUpstreamEndpointSuccess({
                 ...endpointRuntimeContext,

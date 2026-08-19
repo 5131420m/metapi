@@ -282,6 +282,7 @@ export async function handleChatSurfaceRequest(
         },
         {
           oauthProvider: oauth?.provider,
+          disableRuntimePreference: config.disableCrossProtocolFallback,
         },
       ),
     ];
@@ -423,12 +424,14 @@ export async function handleChatSurfaceRequest(
           ctx.rawErrText || ctx.errText,
         ),
         onAttemptFailure: async (ctx) => {
-          const memoryWrite = recordUpstreamEndpointFailure({
-            ...endpointRuntimeContext,
-            endpoint: ctx.request.endpoint,
-            status: ctx.response.status,
-            errorText: ctx.rawErrText,
-          });
+          const memoryWrite = config.disableCrossProtocolFallback
+            ? null
+            : recordUpstreamEndpointFailure({
+              ...endpointRuntimeContext,
+              endpoint: ctx.request.endpoint,
+              status: ctx.response.status,
+              errorText: ctx.rawErrText,
+            });
           await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
             attemptIndex: debugAttemptBase + ctx.endpointIndex,
             endpoint: ctx.request.endpoint,
@@ -448,10 +451,12 @@ export async function handleChatSurfaceRequest(
           });
         },
         onAttemptSuccess: async (ctx) => {
-          const memoryWrite = recordUpstreamEndpointSuccess({
-            ...endpointRuntimeContext,
-            endpoint: ctx.request.endpoint,
-          });
+          const memoryWrite = config.disableCrossProtocolFallback
+            ? null
+            : recordUpstreamEndpointSuccess({
+              ...endpointRuntimeContext,
+              endpoint: ctx.request.endpoint,
+            });
           const responseBody = await captureSurfaceProxyDebugSuccessResponseBody(debugTrace, ctx);
           await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
             attemptIndex: debugAttemptBase + ctx.endpointIndex,
