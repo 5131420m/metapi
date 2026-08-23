@@ -85,6 +85,11 @@ type RuntimeSettings = {
   downstreamErrorPolicy: {
     mode: 'off' | 'resilient';
     downstreamApiKeyIds: number[];
+    indeterminateRetry: {
+      enabled: boolean;
+      includePayloadTooLarge: boolean;
+      maxAttempts: number;
+    };
   };
   proxyTokenMasked?: string;
   adminIpAllowlist?: string[];
@@ -92,6 +97,23 @@ type RuntimeSettings = {
   globalBlockedBrands?: string[];
   globalAllowedModels?: string[];
 };
+
+/**
+ * Mirrors the server's `DEFAULT_INDETERMINATE_RETRY`. Both default to disabled so an
+ * existing deployment keeps its current routing behaviour until the toggle is set.
+ */
+const DEFAULT_INDETERMINATE_RETRY_FORM = {
+  enabled: false,
+  includePayloadTooLarge: false,
+  maxAttempts: 3,
+};
+
+/**
+ * Display-only mirror of the server's `MAX_TOTAL_CHANNEL_ATTEMPTS`. Kept as a local
+ * literal rather than an import so the web bundle does not pull in the server's
+ * downstream-error-policy module for one number.
+ */
+const MAX_TOTAL_CHANNEL_ATTEMPTS_HINT = 4;
 
 type SystemProxyTestState =
   | { kind: 'success'; text: string }
@@ -369,7 +391,11 @@ export default function Settings() {
     systemProxyUrl: '',
     proxyErrorKeywords: [],
     proxyEmptyContentFailEnabled: false,
-    downstreamErrorPolicy: { mode: 'off', downstreamApiKeyIds: [] },
+    downstreamErrorPolicy: {
+      mode: 'off',
+      downstreamApiKeyIds: [],
+      indeterminateRetry: { ...DEFAULT_INDETERMINATE_RETRY_FORM },
+    },
   });
   const [proxyTokenSuffix, setProxyTokenSuffix] = useState('');
   const [proxyErrorKeywordsText, setProxyErrorKeywordsText] = useState('');
@@ -718,8 +744,19 @@ export default function Settings() {
             downstreamApiKeyIds: Array.isArray(runtimeInfo.downstreamErrorPolicy.downstreamApiKeyIds)
               ? runtimeInfo.downstreamErrorPolicy.downstreamApiKeyIds.filter((item: unknown) => Number.isInteger(item))
               : [],
+            indeterminateRetry: {
+              enabled: !!runtimeInfo.downstreamErrorPolicy.indeterminateRetry?.enabled,
+              includePayloadTooLarge: !!runtimeInfo.downstreamErrorPolicy.indeterminateRetry?.includePayloadTooLarge,
+              maxAttempts: Number.isInteger(runtimeInfo.downstreamErrorPolicy.indeterminateRetry?.maxAttempts)
+                ? runtimeInfo.downstreamErrorPolicy.indeterminateRetry.maxAttempts
+                : DEFAULT_INDETERMINATE_RETRY_FORM.maxAttempts,
+            },
           }
-          : { mode: 'off', downstreamApiKeyIds: [] },
+          : {
+            mode: 'off',
+            downstreamApiKeyIds: [],
+            indeterminateRetry: { ...DEFAULT_INDETERMINATE_RETRY_FORM },
+          },
         proxyTokenMasked: runtimeInfo.proxyTokenMasked || '',
         adminIpAllowlist: Array.isArray(runtimeInfo.adminIpAllowlist)
           ? runtimeInfo.adminIpAllowlist.filter((item: unknown) => typeof item === 'string')
@@ -1583,6 +1620,48 @@ export default function Settings() {
                     {item.name} {item.keyMasked ? `(${item.keyMasked})` : ''}
                   </label>
                 ))}
+                <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 10, marginTop: 6 }}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 12 }}>
+                    <input
+                      type="checkbox"
+                      checked={runtime.downstreamErrorPolicy.indeterminateRetry.enabled}
+                      onChange={(e) => setRuntime((prev) => ({
+                        ...prev,
+                        downstreamErrorPolicy: {
+                          ...prev.downstreamErrorPolicy,
+                          indeterminateRetry: {
+                            ...prev.downstreamErrorPolicy.indeterminateRetry,
+                            enabled: e.target.checked,
+                          },
+                        },
+                      }))}
+                    />
+                    上游返回的 400/422 先换通道重试（错误不同则继续，重复则立即返回）
+                  </label>
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                    响应本身无法区分「请求体畸形」与「该通道拒绝了兄弟通道能接受的请求体」，因此换一个通道实测。
+                    总尝试次数上限 {MAX_TOTAL_CHANNEL_ATTEMPTS_HINT} 次。
+                  </div>
+                  {runtime.downstreamErrorPolicy.indeterminateRetry.enabled && (
+                    <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 12, marginTop: 8 }}>
+                      <input
+                        type="checkbox"
+                        checked={runtime.downstreamErrorPolicy.indeterminateRetry.includePayloadTooLarge}
+                        onChange={(e) => setRuntime((prev) => ({
+                          ...prev,
+                          downstreamErrorPolicy: {
+                            ...prev.downstreamErrorPolicy,
+                            indeterminateRetry: {
+                              ...prev.downstreamErrorPolicy.indeterminateRetry,
+                              includePayloadTooLarge: e.target.checked,
+                            },
+                          },
+                        }))}
+                      />
+                      同时重试 413（会重传整个请求体，上游可能已按输入计费）
+                    </label>
+                  )}
+                </div>
               </div>
             )}
           </div>

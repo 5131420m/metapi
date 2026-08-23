@@ -418,6 +418,11 @@ export type RuntimeSettingsPayload = {
   downstreamErrorPolicy?: {
     mode: 'off' | 'resilient';
     downstreamApiKeyIds: number[];
+    indeterminateRetry?: {
+      enabled: boolean;
+      includePayloadTooLarge: boolean;
+      maxAttempts: number;
+    };
   };
   globalBlockedBrands?: string[];
   globalAllowedModels?: string[];

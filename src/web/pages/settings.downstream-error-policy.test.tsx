@@ -100,12 +100,19 @@ describe('Settings downstream error policy', () => {
       await act(async () => saveButton.props.onClick());
       await flushMicrotasks();
 
+      // The indeterminate-retry block is sent on every save, disabled by default, so a
+      // key that opted into resilient mode does not silently also opt into 4xx retries.
       expect(apiMock.updateRuntimeSettings).toHaveBeenCalledWith({
         proxyErrorKeywords: [],
         proxyEmptyContentFailEnabled: false,
         downstreamErrorPolicy: {
           mode: 'resilient',
           downstreamApiKeyIds: [12],
+          indeterminateRetry: {
+            enabled: false,
+            includePayloadTooLarge: false,
+            maxAttempts: 3,
+          },
         },
       });
     } finally {
