@@ -4,7 +4,7 @@ import { buildConfig, buildFastifyOptions } from './config.js';
 
 describe('buildConfig', () => {
   it('defaults the downstream terminal error policy to the safe disabled mode', () => {
-    expect(buildConfig({}).downstreamErrorPolicy).toEqual({
+    expect(buildConfig({}).downstreamErrorPolicy).toMatchObject({
       mode: 'off',
       downstreamApiKeyIds: [],
     });

@@ -37,3 +37,67 @@ export function isUpstreamWrapperFailureText(rawMessage?: string | null): boolea
   if (!text) return false;
   return UPSTREAM_WRAPPER_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
 }
+
+/**
+ * Statuses where "the request is malformed" and "this channel refuses a body a sibling
+ * channel accepts" are indistinguishable from the response alone.
+ *
+ * A relay can answer 400/422 either because our body really is broken or because that
+ * particular vendor imposes a constraint of its own; nothing in the HTTP layer tells
+ * the two apart. The only way to find out is to try a different channel and compare.
+ *
+ * 413 is opt-in (`includePayloadTooLarge`): a different upstream may well accept a
+ * larger body, but retrying re-uploads the whole payload and the first upstream may
+ * already have billed for the input, so the cost profile is not the same as 400/422.
+ */
+export function isIndeterminate4xx(
+  status: number,
+  options?: { includePayloadTooLarge?: boolean },
+): boolean {
+  if (status === 400 || status === 422) return true;
+  if (status === 413) return options?.includePayloadTooLarge === true;
+  return false;
+}
+
+/**
+ * Strips the parts of an upstream message that differ between two otherwise identical
+ * failures — request ids, trace ids, timestamps, durations, bare numbers.
+ *
+ * Without this, comparing raw messages is useless: upstream error text routinely
+ * embeds a fresh `request_id` per attempt, so two identical faults never compare equal
+ * and a "retry while the error keeps changing" rule degenerates into always spending
+ * the full budget.
+ */
+function normalizeMessageFingerprint(rawMessage?: string | null): string {
+  return (rawMessage || '')
+    .toLowerCase()
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '<uuid>')
+    .replace(/\b[0-9a-f]{16,}\b/g, '<hex>')
+    .replace(/\d{4}-\d{2}-\d{2}[t\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?z?/g, '<ts>')
+    .replace(/\b\d+(?:\.\d+)?(?:ms|s)\b/g, '<dur>')
+    .replace(/\b\d+\b/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
+}
+
+/**
+ * Identity of a failure for "have I already seen this exact rejection?" comparison.
+ *
+ * `error.type` / `error.code` are preferred because they are the stable machine-readable
+ * part of the response. They are frequently absent, so the normalized message acts as
+ * the fallback dimension rather than being mixed in unconditionally — including it
+ * alongside a present type/code would let an incidental message difference mask a
+ * genuinely repeated rejection.
+ */
+export function buildFailureSignature(input: {
+  status: number;
+  type?: string | null;
+  code?: string | null;
+  message?: string | null;
+}): string {
+  const type = (input.type || '').trim().toLowerCase();
+  const code = (input.code || '').trim().toLowerCase();
+  if (type || code) return `${input.status}|${type}|${code}`;
+  return `${input.status}|msg:${normalizeMessageFingerprint(input.message)}`;
+}

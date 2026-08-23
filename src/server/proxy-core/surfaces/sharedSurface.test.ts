@@ -1627,3 +1627,215 @@ describe('selectSurfaceChannelForAttempt', () => {
     });
   });
 });
+
+describe('indeterminate 4xx channel retry', () => {
+  const selected = {
+    channel: { id: 11, routeId: 22 },
+    account: { id: 33, username: 'oauth-user' },
+    site: { name: 'Relay Site' },
+    actualModel: 'upstream-model',
+  };
+
+  const enabledPolicy = {
+    mode: 'resilient' as const,
+    downstreamApiKeyIds: [44],
+    indeterminateRetry: { enabled: true, includePayloadTooLarge: false, maxAttempts: 3 },
+  };
+
+  beforeEach(() => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+    isTokenExpiredErrorMock.mockReturnValue(false);
+    recordOauthQuotaResetHintMock.mockResolvedValue(null);
+    recordFailureMock.mockResolvedValue(undefined);
+    // The ordinary retry predicate is mocked in this file; returning false isolates the
+    // indeterminate path so a retry here can only come from the new logic.
+    shouldRetryProxyRequestMock.mockReturnValue(false);
+  });
+
+  async function withPolicy<T>(
+    policy: unknown,
+    fn: (toolkit: Awaited<ReturnType<typeof buildToolkit>>) => Promise<T>,
+  ): Promise<T> {
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = policy as typeof config.downstreamErrorPolicy;
+    try {
+      return await fn(await buildToolkit(44));
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  }
+
+  async function buildToolkit(downstreamApiKeyId: number | null) {
+    const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+    return createSurfaceFailureToolkit({
+      warningScope: 'chat',
+      downstreamPath: '/v1/chat/completions',
+      maxRetries: 2,
+      clientContext: null,
+      downstreamApiKeyId,
+    });
+  }
+
+  function fail(toolkit: Awaited<ReturnType<typeof buildToolkit>>, args: {
+    status: number;
+    retryCount: number;
+    type?: string;
+    message?: string;
+  }) {
+    const body = args.type
+      ? JSON.stringify({ error: { message: args.message ?? 'refused', type: args.type } })
+      : JSON.stringify({ error: { message: args.message ?? 'refused' } });
+    return toolkit.handleUpstreamFailure({
+      selected,
+      requestedModel: 'gpt-5.6',
+      modelName: 'upstream-model',
+      status: args.status,
+      errText: `Upstream returned HTTP ${args.status}: ${args.message ?? 'refused'}`,
+      rawErrText: body,
+      latencyMs: 120,
+      retryCount: args.retryCount,
+    });
+  }
+
+  it('retries an unexplained 422 on another channel for an opted-in key', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'relay_a' }))
+        .resolves.toEqual({ action: 'retry' });
+    });
+  });
+
+  it('stops retrying once the same rejection repeats', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      // A repeat proves the body is at fault rather than the channel, so further channels
+      // would only re-upload it.
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'relay_same' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 422, retryCount: 1, type: 'relay_same' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('keeps retrying while each channel rejects differently, then caps the total attempts', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'relay_1' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 422, retryCount: 1, type: 'relay_2' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 422, retryCount: 2, type: 'relay_3' }))
+        .resolves.toEqual({ action: 'retry' });
+      // Four attempts have now been made; the global ceiling refuses a fifth even though
+      // this rejection is new and the per-feature budget would still allow it.
+      await expect(fail(toolkit, { status: 422, retryCount: 3, type: 'relay_4' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('stops at the global attempt cap even when the per-feature budget would allow more', async () => {
+    // Isolates the ceiling guard from the per-feature budget: maxAttempts is raised to 4,
+    // so after three granted retries the feature budget still has room and ONLY the global
+    // cap can refuse the fourth. With both bounds at 3 the two guards decline at the same
+    // retryCount and neither could be falsified independently.
+    await withPolicy({
+      ...enabledPolicy,
+      indeterminateRetry: { enabled: true, includePayloadTooLarge: false, maxAttempts: 4 },
+    }, async (toolkit) => {
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'cap_1' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 422, retryCount: 1, type: 'cap_2' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 422, retryCount: 2, type: 'cap_3' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 422, retryCount: 3, type: 'cap_4' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('ignores an unrelated message difference when the rejection identity is unchanged', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      // Same error.type, different request id in the message: identity comes from
+      // type/code, so this must still count as a repeat.
+      await expect(fail(toolkit, {
+        status: 400, retryCount: 0, type: 'relay_stable', message: 'refused req_aaaa1111',
+      })).resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, {
+        status: 400, retryCount: 1, type: 'relay_stable', message: 'refused req_bbbb2222',
+      })).resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('falls back to a normalized message fingerprint when type and code are absent', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      // Without type/code the message is the only identity available, but volatile parts
+      // must be stripped or two identical faults would never compare equal.
+      await expect(fail(toolkit, { status: 400, retryCount: 0, message: 'refused after 120ms' }))
+        .resolves.toEqual({ action: 'retry' });
+      await expect(fail(toolkit, { status: 400, retryCount: 1, message: 'refused after 350ms' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('does not retry for a key outside the resilient scope', async () => {
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = enabledPolicy as typeof config.downstreamErrorPolicy;
+    try {
+      const toolkit = await buildToolkit(999);
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'relay_x' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('does not retry when the feature is off', async () => {
+    await withPolicy({
+      mode: 'resilient' as const,
+      downstreamApiKeyIds: [44],
+      indeterminateRetry: { enabled: false, includePayloadTooLarge: false, maxAttempts: 3 },
+    }, async (toolkit) => {
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'relay_off' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('retries 413 only when payload-too-large is opted in', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      await expect(fail(toolkit, { status: 413, retryCount: 0, type: 'too_big' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+
+    await withPolicy({
+      ...enabledPolicy,
+      indeterminateRetry: { enabled: true, includePayloadTooLarge: true, maxAttempts: 3 },
+    }, async (toolkit) => {
+      await expect(fail(toolkit, { status: 413, retryCount: 0, type: 'too_big' }))
+        .resolves.toEqual({ action: 'retry' });
+    });
+  });
+
+  it('exposes a raised loop bound only for an opted-in key', async () => {
+    // The surface loop guard reads this; if it stayed at the base bound an authorized
+    // retry would exit the handler without producing a response.
+    const { config } = await import('../../config.js');
+    const previousPolicy = config.downstreamErrorPolicy;
+    config.downstreamErrorPolicy = enabledPolicy as typeof config.downstreamErrorPolicy;
+    try {
+      expect((await buildToolkit(44)).effectiveMaxRetries).toBe(3);
+      expect((await buildToolkit(999)).effectiveMaxRetries).toBe(2);
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('still records the channel failure and proxy log for every declined attempt', async () => {
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      await fail(toolkit, { status: 422, retryCount: 0, type: 'relay_acct' });
+      // Operational bookkeeping must not depend on the public representation decision.
+      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 422 }));
+      expect(insertProxyLogMock).toHaveBeenCalled();
+    });
+  });
+});

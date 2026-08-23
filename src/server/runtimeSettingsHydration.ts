@@ -95,9 +95,12 @@ export function applyRuntimeSettings(
       const existingIds = options.existingDownstreamApiKeyIds;
       if (parsed.mode === 'resilient' && existingIds) {
         const downstreamApiKeyIds = parsed.downstreamApiKeyIds.filter((id) => existingIds.has(id));
+        // Carry every other parsed field through. This branch rebuilds the policy object
+        // AND may persist it via `normalizedSettings`, so any field omitted here is not
+        // just ignored at boot — it is durably erased from the stored setting.
         const normalized = downstreamApiKeyIds.length > 0
-          ? { mode: 'resilient' as const, downstreamApiKeyIds }
-          : { mode: 'off' as const, downstreamApiKeyIds: [] };
+          ? { ...parsed, mode: 'resilient' as const, downstreamApiKeyIds }
+          : { ...parsed, mode: 'off' as const, downstreamApiKeyIds: [] };
         config.downstreamErrorPolicy = normalized;
         if (downstreamApiKeyIds.length !== parsed.downstreamApiKeyIds.length) {
           normalizedSettings.push({ key: 'downstream_error_policy', value: normalized });

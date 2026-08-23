@@ -76,8 +76,20 @@ export function buildForcedChannelUnavailableMessage(forcedChannelId?: number | 
   return `指定通道 #${normalizedForcedChannelId} 当前不可用，固定通道模式不会自动切换其他通道`;
 }
 
-export function canRetryChannelSelection(retryCount: number, forcedChannelId?: number | null): boolean {
+/**
+ * `maxRetriesOverride` lets a caller whose attempt budget was raised above the global
+ * `PROXY_MAX_CHANNEL_ATTEMPTS` (currently only the indeterminate-4xx path, per downstream
+ * key) keep this guard in step. Without it this function silently re-imposes the global
+ * bound and the raised budget is unreachable — while the surface loop, believing a retry
+ * was authorized, would fall through without producing a response.
+ */
+export function canRetryChannelSelection(
+  retryCount: number,
+  forcedChannelId?: number | null,
+  maxRetriesOverride?: number,
+): boolean {
   if (normalizeForcedChannelId(forcedChannelId) !== null) return false;
+  if (typeof maxRetriesOverride === 'number') return retryCount < maxRetriesOverride;
   return canRetryProxyChannel(retryCount);
 }
 

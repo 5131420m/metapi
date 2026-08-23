@@ -781,12 +781,12 @@ describe('settings and auth events', () => {
     });
 
     expect(updateResponse.statusCode).toBe(200);
-    expect(config.downstreamErrorPolicy).toEqual({
+    expect(config.downstreamErrorPolicy).toMatchObject({
       mode: 'resilient',
       downstreamApiKeyIds: [dedicatedKey.id],
     });
     const saved = await db.select().from(schema.settings).where(eq(schema.settings.key, 'downstream_error_policy')).get();
-    expect(JSON.parse(String(saved?.value))).toEqual({
+    expect(JSON.parse(String(saved?.value))).toMatchObject({
       mode: 'resilient',
       downstreamApiKeyIds: [dedicatedKey.id],
     });

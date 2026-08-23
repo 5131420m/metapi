@@ -165,14 +165,18 @@ export async function handleChatSurfaceRequest(
     proxyToken: getProxyAuthContext(request)?.token || null,
   });
   const downstreamApiKeyId = getProxyAuthContext(request)?.keyId ?? null;
-  const maxRetries = getProxyMaxChannelRetries();
+  const baseMaxRetries = getProxyMaxChannelRetries();
   const failureToolkit = createSurfaceFailureToolkit({
     warningScope: 'chat',
     downstreamPath,
-    maxRetries,
+    maxRetries: baseMaxRetries,
     clientContext,
     downstreamApiKeyId,
   });
+  // Raised only for keys that opted into indeterminate-4xx retries; equals
+  // baseMaxRetries otherwise. Every guard below must use the same bound as the toolkit,
+  // or an authorized retry could exit the loop without producing a response.
+  const maxRetries = failureToolkit.effectiveMaxRetries;
   const stickySessionKey = buildSurfaceStickySessionKey({
     clientContext,
     requestedModel,
@@ -519,7 +523,7 @@ export async function handleChatSurfaceRequest(
         errorMessage: busyMessage,
         retryCount,
       });
-      if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+      if (canRetryChannelSelection(retryCount, forcedChannelId, baseMaxRetries)) {
         retryCount += 1;
         continue;
       }
@@ -774,7 +778,7 @@ export async function handleChatSurfaceRequest(
                 : undefined,
             });
             const terminalFailureOutcome = failureOutcome.action === 'retry'
-              ? (canRetryChannelSelection(retryCount, forcedChannelId)
+              ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
                 ? null
                 : failureToolkit.resolveTerminalFailure({
                   selected,
@@ -1007,7 +1011,7 @@ export async function handleChatSurfaceRequest(
           upstreamPath: successfulUpstreamPath,
         });
         const terminalFailureOutcome = failureOutcome.action === 'retry'
-          ? (canRetryChannelSelection(retryCount, forcedChannelId)
+          ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
             ? null
             : failureToolkit.resolveTerminalFailure({
               selected,
@@ -1116,7 +1120,7 @@ export async function handleChatSurfaceRequest(
           retryCount,
         });
         const terminalFailureOutcome = failureOutcome.action === 'retry'
-          ? (canRetryChannelSelection(retryCount, forcedChannelId)
+          ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
             ? null
             : failureToolkit.resolveTerminalFailure({
               selected,
@@ -1148,7 +1152,7 @@ export async function handleChatSurfaceRequest(
         retryCount,
       });
       const terminalFailureOutcome = failureOutcome.action === 'retry'
-        ? (canRetryChannelSelection(retryCount, forcedChannelId)
+        ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
           ? null
           : failureToolkit.resolveTerminalFailure({
             selected,
@@ -1235,14 +1239,18 @@ export async function handleClaudeCountTokensSurfaceRequest(
     clientIp: request.ip,
   });
   const downstreamApiKeyId = getProxyAuthContext(request)?.keyId ?? null;
-  const maxRetries = getProxyMaxChannelRetries();
+  const baseMaxRetries = getProxyMaxChannelRetries();
   const failureToolkit = createSurfaceFailureToolkit({
     warningScope: 'chat',
     downstreamPath,
-    maxRetries,
+    maxRetries: baseMaxRetries,
     clientContext,
     downstreamApiKeyId,
   });
+  // Raised only for keys that opted into indeterminate-4xx retries; equals
+  // baseMaxRetries otherwise. Every guard below must use the same bound as the toolkit,
+  // or an authorized retry could exit the loop without producing a response.
+  const maxRetries = failureToolkit.effectiveMaxRetries;
   const stickySessionKey = buildSurfaceStickySessionKey({
     clientContext,
     requestedModel,
@@ -1355,7 +1363,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
       },
     });
     if (endpointCandidates.length === 0) {
-      if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+      if (canRetryChannelSelection(retryCount, forcedChannelId, baseMaxRetries)) {
         retryCount += 1;
         continue;
       }
@@ -1393,7 +1401,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
         errorMessage: busyMessage,
         retryCount,
       });
-      if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+      if (canRetryChannelSelection(retryCount, forcedChannelId, baseMaxRetries)) {
         retryCount += 1;
         continue;
       }
@@ -1579,7 +1587,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
           retryCount,
         });
         const terminalFailureOutcome = failureOutcome.action === 'retry'
-          ? (canRetryChannelSelection(retryCount, forcedChannelId)
+          ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
             ? null
             : failureToolkit.resolveTerminalFailure({
               selected,
@@ -1607,7 +1615,7 @@ export async function handleClaudeCountTokensSurfaceRequest(
         retryCount,
       });
       const terminalFailureOutcome = failureOutcome.action === 'retry'
-        ? (canRetryChannelSelection(retryCount, forcedChannelId)
+        ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
           ? null
           : failureToolkit.resolveTerminalFailure({
             selected,

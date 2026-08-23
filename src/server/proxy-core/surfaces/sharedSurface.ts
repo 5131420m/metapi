@@ -22,12 +22,19 @@ import { readRuntimeResponseText } from '../executors/types.js';
 import { selectProxyChannelForAttempt } from '../channelSelection.js';
 import { config } from '../../config.js';
 import {
+  MAX_TOTAL_CHANNEL_ATTEMPTS,
   buildCanonicalRoutingFailure,
   buildCanonicalUpstreamFailure,
   resolveAggregatedPublicTerminalFailure,
+  resolveIndeterminateRetryCeiling,
+  resolveIndeterminateRetryPlan,
   resolvePublicTerminalFailure,
   serializePublicTerminalFailure,
 } from '../../services/downstreamErrorPolicy.js';
+import {
+  buildFailureSignature,
+  isIndeterminate4xx,
+} from '../../services/upstreamFailureSignals.js';
 
 type SelectedChannel = Awaited<ReturnType<typeof tokenRouter.selectChannel>>;
 type SurfaceWarningScope = 'chat' | 'responses';
@@ -537,6 +544,103 @@ export function createSurfaceFailureToolkit(input: {
     }
   };
 
+  const indeterminatePlan = resolveIndeterminateRetryPlan(
+    downstreamErrorPolicy,
+    input.downstreamApiKeyId,
+  );
+  /**
+   * Raised bound for the indeterminate path only. `maybeRetry` keeps using the base
+   * `input.maxRetries`, so an ordinary failure never gains an attempt from this feature.
+   * The surface's loop guard must be raised to the same value, otherwise authorizing a
+   * retry the loop refuses would exit the handler without a response.
+   */
+  const indeterminateCeiling = resolveIndeterminateRetryCeiling({
+    baseMaxRetries: input.maxRetries,
+    policy: downstreamErrorPolicy,
+    downstreamApiKeyId: input.downstreamApiKeyId,
+  });
+  const seenIndeterminateSignatures = new Set<string>();
+  let indeterminateAttempts = 0;
+
+  /**
+   * Pulls `error.type` / `error.code` out of an upstream body.
+   *
+   * `summarizeUpstreamError()` keeps `error.message` and drops type/code whenever a
+   * message exists, so these are the stable identity fields that only survive in the
+   * raw payload — and they are what the repeat-rejection signature is built from.
+   */
+  const extractOriginalErrorIdentity = (payload: unknown): {
+    type?: string;
+    code?: string;
+  } => {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+    const record = payload as Record<string, unknown>;
+    const error = record.error && typeof record.error === 'object' && !Array.isArray(record.error)
+      ? record.error as Record<string, unknown>
+      : record;
+    const type = typeof error.type === 'string' ? error.type.trim() : '';
+    const code = typeof error.code === 'string'
+      ? error.code.trim()
+      : typeof error.code === 'number'
+        ? String(error.code)
+        : '';
+    return {
+      ...(type ? { type } : {}),
+      ...(code ? { code } : {}),
+    };
+  };
+
+  /**
+   * Decides whether an indeterminate 4xx earns another channel.
+   *
+   * Four independent gates, all required:
+   *  - the key is in scope and the feature is on (`indeterminatePlan.enabled`);
+   *  - the status is one where the response cannot tell a malformed body from a
+   *    channel-specific refusal;
+   *  - this exact rejection has not been seen before — a repeat proves the body, not
+   *    the channel, is at fault, so further attempts would only re-upload it;
+   *  - neither the feature's own budget, the raised loop ceiling, nor the global
+   *    attempt cap is spent.
+   *
+   * Budget checks run BEFORE the signature is recorded: a decline must not mutate the
+   * seen-set, or the signature of an attempt that was never retried would suppress a
+   * later legitimate retry of the same rejection.
+   */
+  const maybeRetryIndeterminate = (args: {
+    status: number;
+    retryCount: number;
+    errText: string;
+    originalPayload: unknown;
+  }) => {
+    if (!indeterminatePlan.enabled) return null;
+    if (!isIndeterminate4xx(args.status, {
+      includePayloadTooLarge: indeterminatePlan.includePayloadTooLarge,
+    })) {
+      return null;
+    }
+    if (indeterminateAttempts >= indeterminatePlan.maxAttempts) return null;
+    // One bound, two constraints folded together: stay inside the surface's loop bound
+    // (authorizing a retry the loop refuses would exit the handler with no response) AND
+    // inside the global attempt cap. Declining early is always safe; authorizing too late
+    // is not. Kept as two separate guards these declined at the identical retryCount for
+    // every reachable configuration, so removing either one left the suite green — neither
+    // was falsifiable on its own.
+    if (args.retryCount >= Math.min(indeterminateCeiling, MAX_TOTAL_CHANNEL_ATTEMPTS - 1)) {
+      return null;
+    }
+    const identity = extractOriginalErrorIdentity(args.originalPayload);
+    const signature = buildFailureSignature({
+      status: args.status,
+      type: identity.type,
+      code: identity.code,
+      message: args.errText,
+    });
+    if (seenIndeterminateSignatures.has(signature)) return null;
+    seenIndeterminateSignatures.add(signature);
+    indeterminateAttempts += 1;
+    return { action: 'retry' as const };
+  };
+
   const resolveTerminalResponse = (args: {
     status: number;
     message: string;
@@ -593,6 +697,15 @@ export function createSurfaceFailureToolkit(input: {
 
   return {
     log,
+    /**
+     * Loop bound the surface must use for `while (retryCount <= …)`.
+     *
+     * Equals the base `maxRetries` unless this key opted into indeterminate-4xx retries,
+     * in which case it is raised so an authorized retry is actually reachable. The retry
+     * predicates keep enforcing their own budgets, so a raised bound alone never grants
+     * an ordinary failure an extra attempt.
+     */
+    effectiveMaxRetries: indeterminateCeiling,
     resolveRoutingFailure(args: {
       requestedModel: string;
       message?: string;
@@ -652,6 +765,8 @@ export function createSurfaceFailureToolkit(input: {
       retryCount: number;
     }): Promise<SurfaceFailureOutcome> {
       const rawErrText = args.rawErrText || args.errText;
+      const resolvedOriginalPayload = args.originalPayload ?? parseOriginalFailurePayload(rawErrText);
+      const originalErrorIdentity = extractOriginalErrorIdentity(resolvedOriginalPayload);
       terminalFailures.push(buildCanonicalUpstreamFailure({
         status: args.status,
         message: args.errText,
@@ -661,7 +776,9 @@ export function createSurfaceFailureToolkit(input: {
         upstreamModel: args.modelName,
         channelId: args.selected.channel.id,
         downstreamApiKeyId: input.downstreamApiKeyId,
-        originalPayload: args.originalPayload ?? parseOriginalFailurePayload(rawErrText),
+        originalType: originalErrorIdentity.type,
+        originalCode: originalErrorIdentity.code,
+        originalPayload: resolvedOriginalPayload,
       }));
       await tokenRouter.recordFailure(args.selected.channel.id, {
         status: args.status,
@@ -700,6 +817,17 @@ export function createSurfaceFailureToolkit(input: {
         if (retry) return retry;
       }
 
+      // An unexplained 4xx is only retried when the key opted in: the status alone cannot
+      // tell a malformed body from a channel that refuses one a sibling accepts, so this
+      // spends one more channel to find out, bounded by signature and attempt budget.
+      const indeterminateRetry = maybeRetryIndeterminate({
+        status: args.status,
+        retryCount: args.retryCount,
+        errText: args.errText,
+        originalPayload: resolvedOriginalPayload,
+      });
+      if (indeterminateRetry) return indeterminateRetry;
+
       runBestEffort('report proxy all failed', () => reportProxyAllFailed({
         model: args.requestedModel,
         reason: `upstream returned HTTP ${args.status}`,
@@ -715,7 +843,7 @@ export function createSurfaceFailureToolkit(input: {
         terminalScope: args.retryCount >= input.maxRetries ? 'attempt_budget_exhausted' : 'attempt',
         attemptedChannelCount: terminalFailures.length,
         maxChannelAttempts: input.maxRetries + 1,
-        originalPayload: args.originalPayload ?? parseOriginalFailurePayload(rawErrText),
+        originalPayload: resolvedOriginalPayload,
       });
     },
 

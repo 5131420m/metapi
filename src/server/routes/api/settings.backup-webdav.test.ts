@@ -164,7 +164,7 @@ describe('settings backup webdav api', () => {
         .where(eq(schema.downstreamApiKeys.key, 'sk-imported-cpa'))
         .get();
       expect(importedKey).toBeTruthy();
-      expect(config.downstreamErrorPolicy).toEqual({
+      expect(config.downstreamErrorPolicy).toMatchObject({
         mode: 'resilient',
         downstreamApiKeyIds: [importedKey!.id],
       });

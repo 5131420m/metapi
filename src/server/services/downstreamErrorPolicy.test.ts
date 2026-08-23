@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  MAX_TOTAL_CHANNEL_ATTEMPTS,
   aggregateCanonicalFailures,
   buildCanonicalUpstreamFailure,
   buildCanonicalRoutingFailure,
   parseDownstreamErrorPolicyConfig,
   resolveAggregatedPublicTerminalFailure,
+  resolveIndeterminateRetryCeiling,
+  resolveIndeterminateRetryPlan,
   resolvePublicTerminalFailure,
   serializePublicTerminalFailure,
   sanitizePostcommitFailureMessage,
@@ -118,14 +121,14 @@ describe('downstream terminal error policy', () => {
     expect(parseDownstreamErrorPolicyConfig({
       mode: 'resilient',
       downstreamApiKeyIds: [12, 12, 15],
-    })).toEqual({
+    })).toMatchObject({
       mode: 'resilient',
       downstreamApiKeyIds: [12, 15],
     });
   });
 
   it('canonicalizes non-resilient modes to an empty downstream key scope', () => {
-    expect(parseDownstreamErrorPolicyConfig({ mode: 'off', downstreamApiKeyIds: [12] })).toEqual({
+    expect(parseDownstreamErrorPolicyConfig({ mode: 'off', downstreamApiKeyIds: [12] })).toMatchObject({
       mode: 'off',
       downstreamApiKeyIds: [],
     });
@@ -595,6 +598,104 @@ describe('downstream terminal error policy', () => {
       message: 'expired token',
       rewritten: false,
     });
+  });
+});
+
+describe('indeterminate 4xx retry admission', () => {
+  const enabledRetry = { enabled: true, includePayloadTooLarge: false, maxAttempts: 3 };
+
+  it('is disabled unless the key is inside the resilient scope', () => {
+    // Routing and presentation must agree on who is in scope, so admission reuses the
+    // same predicate: resilient mode AND this key listed.
+    expect(resolveIndeterminateRetryPlan({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: enabledRetry,
+    }, 12).enabled).toBe(true);
+
+    expect(resolveIndeterminateRetryPlan({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: enabledRetry,
+    }, 99).enabled).toBe(false);
+
+    expect(resolveIndeterminateRetryPlan({
+      mode: 'off',
+      downstreamApiKeyIds: [],
+      indeterminateRetry: enabledRetry,
+    }, 12).enabled).toBe(false);
+
+    expect(resolveIndeterminateRetryPlan({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: enabledRetry,
+    }, null).enabled).toBe(false);
+  });
+
+  it('treats an absent indeterminateRetry block as disabled', () => {
+    expect(resolveIndeterminateRetryPlan({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+    }, 12).enabled).toBe(false);
+  });
+
+  it('raises the retry ceiling only for an admitted key, capped by the global maximum', () => {
+    // The surface loop guard has to move with the retry decision; if the toolkit
+    // authorizes a retry the loop then refuses, the handler exits without responding.
+    expect(resolveIndeterminateRetryCeiling({
+      baseMaxRetries: 2,
+      policy: { mode: 'resilient', downstreamApiKeyIds: [12], indeterminateRetry: enabledRetry },
+      downstreamApiKeyId: 12,
+    })).toBe(MAX_TOTAL_CHANNEL_ATTEMPTS - 1);
+
+    expect(resolveIndeterminateRetryCeiling({
+      baseMaxRetries: 2,
+      policy: { mode: 'resilient', downstreamApiKeyIds: [12], indeterminateRetry: enabledRetry },
+      downstreamApiKeyId: 99,
+    })).toBe(2);
+
+    expect(resolveIndeterminateRetryCeiling({
+      baseMaxRetries: 2,
+      policy: { mode: 'off', downstreamApiKeyIds: [] },
+      downstreamApiKeyId: 12,
+    })).toBe(2);
+  });
+
+  it('never returns a ceiling below the operator-configured base budget', () => {
+    // PROXY_MAX_CHANNEL_ATTEMPTS is operator-configurable, so the ordinary budget can
+    // legitimately exceed MAX_TOTAL_CHANNEL_ATTEMPTS. The ceiling becomes the surface's
+    // loop bound for EVERY failure type, so clamping it below the base would shrink the
+    // operator's configured budget the moment a key opted in — enabling a resilience
+    // feature would have made routing less resilient.
+    for (const baseMaxRetries of [5, 8]) {
+      expect(resolveIndeterminateRetryCeiling({
+        baseMaxRetries,
+        policy: { mode: 'resilient', downstreamApiKeyIds: [12], indeterminateRetry: enabledRetry },
+        downstreamApiKeyId: 12,
+      })).toBe(baseMaxRetries);
+    }
+  });
+
+  it('clamps a configured maxAttempts to the global attempt ceiling', () => {
+    const parsed = parseDownstreamErrorPolicyConfig({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: { enabled: true, includePayloadTooLarge: false, maxAttempts: 99 },
+    });
+    expect(parsed.indeterminateRetry?.maxAttempts).toBe(MAX_TOTAL_CHANNEL_ATTEMPTS);
+  });
+
+  it('rejects a malformed indeterminateRetry block', () => {
+    expect(() => parseDownstreamErrorPolicyConfig({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: { enabled: 'yes' },
+    })).toThrow('enabled 无效');
+    expect(() => parseDownstreamErrorPolicyConfig({
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: { enabled: true, maxAttempts: 0 },
+    })).toThrow('maxAttempts 无效');
   });
 });
 

@@ -33,6 +33,21 @@ export type CanonicalFailureCause =
 export type DownstreamErrorPolicyConfig = {
   mode: DownstreamErrorPolicyMode;
   downstreamApiKeyIds: number[];
+  /**
+   * Opt-in: try another channel for a 400/422 that carries no marker either way.
+   *
+   * Optional so the ~59 existing policy literals across the tree stay valid; an absent
+   * value means disabled, which is also the shipped default.
+   */
+  indeterminateRetry?: DownstreamIndeterminateRetryConfig;
+};
+
+export type DownstreamIndeterminateRetryConfig = {
+  enabled: boolean;
+  /** Include 413. Off by default: retrying re-uploads the body and may be billed twice. */
+  includePayloadTooLarge: boolean;
+  /** Extra channel attempts granted to indeterminate 4xx failures. */
+  maxAttempts: number;
 };
 
 export type CanonicalProxyFailure = {
@@ -65,10 +80,78 @@ export type PublicFailureDecision = {
   originalPayload?: unknown;
 };
 
+export const DEFAULT_INDETERMINATE_RETRY: DownstreamIndeterminateRetryConfig = {
+  enabled: false,
+  includePayloadTooLarge: false,
+  maxAttempts: 3,
+};
+
+/**
+ * Ceiling on total upstream attempts for one downstream request, counting both ordinary
+ * retries and indeterminate-4xx retries. Without it the two budgets compose
+ * multiplicatively (3 ordinary + 3 indeterminate = 6 uploads of the same body).
+ */
+export const MAX_TOTAL_CHANNEL_ATTEMPTS = 4;
+
 export const DEFAULT_DOWNSTREAM_ERROR_POLICY: DownstreamErrorPolicyConfig = {
   mode: 'off',
   downstreamApiKeyIds: [],
+  indeterminateRetry: structuredClone(DEFAULT_INDETERMINATE_RETRY),
 };
+
+/**
+ * Effective indeterminate-retry settings for one downstream key.
+ *
+ * Admission is deliberately the same predicate the presentation layer uses
+ * (`mode === 'resilient'` AND the key is listed): the feature is a per-key service
+ * level, so routing and presentation must agree on who is in scope. Anything out of
+ * scope gets `enabled: false` and therefore the unchanged legacy behaviour.
+ */
+export function resolveIndeterminateRetryPlan(
+  policy: DownstreamErrorPolicyConfig,
+  downstreamApiKeyId?: number | null,
+): DownstreamIndeterminateRetryConfig {
+  const configured = policy.indeterminateRetry ?? DEFAULT_INDETERMINATE_RETRY;
+  if (!configured.enabled) return { ...configured, enabled: false };
+  if (policy.mode !== 'resilient') return { ...configured, enabled: false };
+  if (typeof downstreamApiKeyId !== 'number') return { ...configured, enabled: false };
+  if (!policy.downstreamApiKeyIds.includes(downstreamApiKeyId)) {
+    return { ...configured, enabled: false };
+  }
+  return { ...configured };
+}
+
+/**
+ * Retry ceiling for a surface's attempt loop, raised only for keys that opted into
+ * indeterminate-4xx retries.
+ *
+ * This exists because the surface's `while (retryCount <= bound)` guard and the retry
+ * decision must agree. A surface loop body either returns a response or `continue`s, so
+ * if the toolkit authorizes a retry that the loop guard then refuses, the loop simply
+ * exits and the handler returns without ever answering — the request hangs. The extra
+ * budget therefore has to reach the loop bound, not just the retry predicate.
+ *
+ * Ordinary failures keep the base bound (enforced separately by the toolkit's
+ * `maybeRetry`); only the indeterminate path may consume the raised one.
+ * `MAX_TOTAL_CHANNEL_ATTEMPTS` caps the two budgets so they add rather than multiply.
+ */
+export function resolveIndeterminateRetryCeiling(input: {
+  baseMaxRetries: number;
+  policy: DownstreamErrorPolicyConfig;
+  downstreamApiKeyId?: number | null;
+}): number {
+  const plan = resolveIndeterminateRetryPlan(input.policy, input.downstreamApiKeyId);
+  if (!plan.enabled) return input.baseMaxRetries;
+  // Never return less than the base. `PROXY_MAX_CHANNEL_ATTEMPTS` is operator-configurable,
+  // so a deployment can set an ordinary budget larger than MAX_TOTAL_CHANNEL_ATTEMPTS; a
+  // bare `Math.min` would then make this the LOOP bound for every failure type and cut the
+  // operator's configured budget (measured 5 retries -> 3) the moment a key opted in —
+  // enabling a resilience feature would have made routing less resilient.
+  return Math.max(
+    input.baseMaxRetries,
+    Math.min(MAX_TOTAL_CHANNEL_ATTEMPTS - 1, input.baseMaxRetries + plan.maxAttempts),
+  );
+}
 
 export function sanitizePostcommitFailureMessage(input: {
   message: string;
@@ -145,6 +228,37 @@ export function parseDownstreamErrorPolicyConfig(value: unknown): DownstreamErro
   return {
     mode: mode as DownstreamErrorPolicyMode,
     downstreamApiKeyIds: mode === 'resilient' ? downstreamApiKeyIds : [],
+    indeterminateRetry: parseIndeterminateRetryConfig(value.indeterminateRetry),
+  };
+}
+
+function parseIndeterminateRetryConfig(value: unknown): DownstreamIndeterminateRetryConfig {
+  if (value === undefined || value === null || value === '') {
+    return structuredClone(DEFAULT_INDETERMINATE_RETRY);
+  }
+  if (!isRecord(value)) {
+    throw new Error('不确定 4xx 重试配置格式无效：需要 object');
+  }
+  const enabled = value.enabled === undefined ? false : value.enabled;
+  if (typeof enabled !== 'boolean') {
+    throw new Error('不确定 4xx 重试 enabled 无效：需要 boolean');
+  }
+  const includePayloadTooLarge = value.includePayloadTooLarge === undefined
+    ? false
+    : value.includePayloadTooLarge;
+  if (typeof includePayloadTooLarge !== 'boolean') {
+    throw new Error('不确定 4xx 重试 includePayloadTooLarge 无效：需要 boolean');
+  }
+  const rawMaxAttempts = value.maxAttempts === undefined
+    ? DEFAULT_INDETERMINATE_RETRY.maxAttempts
+    : value.maxAttempts;
+  if (typeof rawMaxAttempts !== 'number' || !Number.isInteger(rawMaxAttempts) || rawMaxAttempts < 1) {
+    throw new Error('不确定 4xx 重试 maxAttempts 无效：需要 >= 1 的整数');
+  }
+  return {
+    enabled,
+    includePayloadTooLarge,
+    maxAttempts: Math.min(rawMaxAttempts, MAX_TOTAL_CHANNEL_ATTEMPTS),
   };
 }
 

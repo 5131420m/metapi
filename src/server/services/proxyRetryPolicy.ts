@@ -1,5 +1,6 @@
 import {
   UPSTREAM_WRAPPER_FAILURE_PATTERNS,
+  isIndeterminate4xx,
   isUpstreamWrapperFailureText,
 } from './upstreamFailureSignals.js';
 
@@ -101,11 +102,23 @@ function matchesAnyPattern(patterns: RegExp[], rawMessage?: string | null): bool
  * the summary ONLY. Matching them against raw JSON widens them (e.g. a `validation`
  * type wrapping a channel-level fault) and would flip missed retries into wrong
  * terminal errors. The raw body is consulted solely for wrapper markers.
+ *
+ * `allowIndeterminateRetry` opts into trying another channel for a 400/422 (and 413,
+ * when `includePayloadTooLarge` is set) that carries NO marker either way — the case
+ * where the response alone cannot distinguish "our body is malformed" from "this
+ * vendor refuses a body a sibling channel accepts". It stays off by default so the
+ * plain routing path keeps treating an unexplained 4xx as terminal; the caller that
+ * enables it owns the attempt budget and the repeat-signature check.
+ *
+ * It is deliberately evaluated AFTER the request-shape patterns: a body that announces
+ * itself as `invalid json` / `validation` / `malformed` is determinate, and retrying
+ * would just re-upload the same broken payload to every channel in the route.
  */
 export function shouldRetryProxyRequest(
   status: number,
   upstreamErrorText?: string | null,
   rawUpstreamErrorText?: string | null,
+  options?: { allowIndeterminateRetry?: boolean; includePayloadTooLarge?: boolean },
 ): boolean {
   if (status >= 500) return true;
   if (status === 408 || status === 409 || status === 425 || status === 429) return true;
@@ -114,6 +127,12 @@ export function shouldRetryProxyRequest(
   if (matchesAnyPattern(NON_RETRYABLE_REQUEST_PATTERNS, upstreamErrorText)) return false;
   if (matchesAnyPattern(RETRYABLE_CHANNEL_LOCAL_PATTERNS, upstreamErrorText)) return true;
   if (isUpstreamWrapperFailureText(rawUpstreamErrorText)) return true;
+  if (
+    options?.allowIndeterminateRetry
+    && isIndeterminate4xx(status, { includePayloadTooLarge: options.includePayloadTooLarge })
+  ) {
+    return true;
+  }
   if (status === 400 || status === 404 || status === 422) return false;
   return false;
 }

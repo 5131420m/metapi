@@ -35,7 +35,7 @@ describe('applyRuntimeSettings', () => {
     expect(config.barkEnabled).toBe(false);
     expect(config.serverChanEnabled).toBe(false);
     expect(config.globalAllowedModels).toEqual(['gpt-5.4', 'claude-3.7-sonnet']);
-    expect(config.downstreamErrorPolicy).toEqual({ mode: 'resilient', downstreamApiKeyIds: [17] });
+    expect(config.downstreamErrorPolicy).toMatchObject({ mode: 'resilient', downstreamApiKeyIds: [17] });
   });
 
   it('drops stale downstream key references and disables an empty resilient policy', () => {
@@ -48,14 +48,13 @@ describe('applyRuntimeSettings', () => {
       })],
     ]), { existingDownstreamApiKeyIds: new Set([18]) });
 
-    expect(config.downstreamErrorPolicy).toEqual({
+    expect(config.downstreamErrorPolicy).toMatchObject({
       mode: 'resilient',
       downstreamApiKeyIds: [18],
     });
-    expect(result.normalizedSettings).toContainEqual({
-      key: 'downstream_error_policy',
-      value: { mode: 'resilient', downstreamApiKeyIds: [18] },
-    });
+    const normalizedEntry = result.normalizedSettings
+      .find((entry) => entry.key === 'downstream_error_policy');
+    expect(normalizedEntry?.value).toMatchObject({ mode: 'resilient', downstreamApiKeyIds: [18] });
 
     applyRuntimeSettings(new Map([
       ['downstream_error_policy', JSON.stringify({
@@ -63,7 +62,35 @@ describe('applyRuntimeSettings', () => {
         downstreamApiKeyIds: [17],
       })],
     ]), { existingDownstreamApiKeyIds: new Set() });
-    expect(config.downstreamErrorPolicy).toEqual({ mode: 'off', downstreamApiKeyIds: [] });
+    expect(config.downstreamErrorPolicy).toMatchObject({ mode: 'off', downstreamApiKeyIds: [] });
+  });
+
+  it('preserves indeterminateRetry when normalizing a resilient policy', () => {
+    // The stale-key branch rebuilds the policy object AND may persist the rebuilt value,
+    // so a field it forgets to copy is durably erased rather than merely ignored.
+    config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
+
+    const result = applyRuntimeSettings(new Map([
+      ['downstream_error_policy', JSON.stringify({
+        mode: 'resilient',
+        downstreamApiKeyIds: [17, 18],
+        indeterminateRetry: { enabled: true, includePayloadTooLarge: true, maxAttempts: 3 },
+      })],
+    ]), { existingDownstreamApiKeyIds: new Set([18]) });
+
+    expect(config.downstreamErrorPolicy.indeterminateRetry).toEqual({
+      enabled: true,
+      includePayloadTooLarge: true,
+      maxAttempts: 3,
+    });
+    const persisted = result.normalizedSettings
+      .find((entry) => entry.key === 'downstream_error_policy')?.value as
+        { indeterminateRetry?: unknown } | undefined;
+    expect(persisted?.indeterminateRetry).toEqual({
+      enabled: true,
+      includePayloadTooLarge: true,
+      maxAttempts: 3,
+    });
   });
 
   it('normalizes smtpPort to a positive integer during hydration', () => {

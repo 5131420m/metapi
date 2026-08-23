@@ -284,15 +284,19 @@ export async function handleOpenAiResponsesSurfaceRequest(
       clientIp: request.ip,
     });
     const downstreamApiKeyId = getProxyAuthContext(request)?.keyId ?? null;
-    const maxRetries = getProxyMaxChannelRetries();
+    const baseMaxRetries = getProxyMaxChannelRetries();
     const failureToolkit = createSurfaceFailureToolkit({
       warningScope: 'responses',
       downstreamPath,
-      maxRetries,
+      maxRetries: baseMaxRetries,
       clientContext,
       downstreamApiKeyId,
       downstreamTransport: websocketTransportRequest ? 'websocket' : 'http',
     });
+    // Raised only for keys that opted into indeterminate-4xx retries; equals
+    // baseMaxRetries otherwise. Must match the toolkit's bound so an authorized retry
+    // cannot exit the loop without producing a response.
+    const maxRetries = failureToolkit.effectiveMaxRetries;
     const stickySessionKey = buildSurfaceStickySessionKey({
       clientContext,
       requestedModel,
@@ -818,7 +822,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
         errorMessage: busyMessage,
         retryCount,
       });
-      if (retryCount < maxRetries && canRetryChannelSelection(retryCount, forcedChannelId)) {
+      if (retryCount < baseMaxRetries && canRetryChannelSelection(retryCount, forcedChannelId, baseMaxRetries)) {
         retryCount += 1;
         continue;
       }
@@ -1074,7 +1078,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   : undefined,
                 });
                 const terminalFailureOutcome = failureOutcome.action === 'retry'
-                  ? (canRetryChannelSelection(retryCount, forcedChannelId)
+                  ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
                     ? null
                     : failureToolkit.resolveTerminalFailure({
                     selected,
@@ -1425,7 +1429,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               : undefined,
             });
             const terminalFailureOutcome = failureOutcome.action === 'retry'
-              ? (canRetryChannelSelection(retryCount, forcedChannelId)
+              ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
                 ? null
                 : failureToolkit.resolveTerminalFailure({
                 selected,
@@ -1529,7 +1533,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
           retryCount,
         });
             const terminalFailureOutcome = failureOutcome.action === 'retry'
-              ? (canRetryChannelSelection(retryCount, forcedChannelId)
+              ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
                 ? null
                 : failureToolkit.resolveTerminalFailure({
                   selected,
@@ -1561,7 +1565,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
             retryCount,
           });
           const terminalFailureOutcome = failureOutcome.action === 'retry'
-            ? (canRetryChannelSelection(retryCount, forcedChannelId)
+            ? (canRetryChannelSelection(retryCount, forcedChannelId, maxRetries)
               ? null
               : failureToolkit.resolveTerminalFailure({
                 selected,

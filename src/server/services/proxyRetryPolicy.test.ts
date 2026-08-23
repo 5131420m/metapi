@@ -92,6 +92,70 @@ describe('proxyRetryPolicy', () => {
     ).toBe(false);
   });
 
+  it('leaves an unexplained 4xx terminal unless indeterminate retry was requested', () => {
+    // Default behaviour is unchanged: a 400/422 with no marker either way stays terminal,
+    // so the ordinary routing path never gains an attempt from this feature.
+    expect(shouldRetryProxyRequest(400, 'Upstream returned HTTP 400: rejected')).toBe(false);
+    expect(shouldRetryProxyRequest(422, 'Upstream returned HTTP 422: rejected')).toBe(false);
+  });
+
+  it('retries an unexplained 400/422 when indeterminate retry is allowed', () => {
+    expect(
+      shouldRetryProxyRequest(400, 'Upstream returned HTTP 400: rejected', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetryProxyRequest(422, 'Upstream returned HTTP 422: rejected', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(true);
+  });
+
+  it('keeps 413 out of indeterminate retry unless payload-too-large is opted in', () => {
+    expect(
+      shouldRetryProxyRequest(413, 'Upstream returned HTTP 413: too large', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetryProxyRequest(413, 'Upstream returned HTTP 413: too large', null, {
+        allowIndeterminateRetry: true,
+        includePayloadTooLarge: true,
+      }),
+    ).toBe(true);
+  });
+
+  it('keeps determinate request-shape errors terminal even with indeterminate retry on', () => {
+    // The request-shape patterns are evaluated BEFORE the indeterminate branch: a body
+    // that announces itself as malformed would fail identically on every channel, so
+    // retrying only re-uploads it.
+    expect(
+      shouldRetryProxyRequest(400, 'Upstream returned HTTP 400: invalid json', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetryProxyRequest(422, 'Upstream returned HTTP 422: missing required parameter model', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRetryProxyRequest(400, 'Upstream returned HTTP 400: validation failed', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(false);
+  });
+
+  it('does not extend indeterminate retry to 404', () => {
+    // 404 is a determinate "not here" answer and has its own model-unavailable handling.
+    expect(
+      shouldRetryProxyRequest(404, 'Upstream returned HTTP 404: not found', null, {
+        allowIndeterminateRetry: true,
+      }),
+    ).toBe(false);
+  });
+
   it('aborts same-site endpoint fallback on rate-limit and quota responses', () => {
     expect(
       shouldAbortSameSiteEndpointFallback(429, '{"error":{"message":"rate limit exceeded"}}'),

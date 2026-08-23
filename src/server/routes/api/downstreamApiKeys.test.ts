@@ -76,7 +76,7 @@ describe('downstream api keys routes', () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(config.downstreamErrorPolicy).toEqual({
+    expect(config.downstreamErrorPolicy).toMatchObject({
       mode: 'resilient',
       downstreamApiKeyIds: [inserted[1].id],
     });
