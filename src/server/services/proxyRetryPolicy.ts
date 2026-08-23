@@ -1,6 +1,6 @@
 import {
   UPSTREAM_WRAPPER_FAILURE_PATTERNS,
-  isIndeterminate4xx,
+  isDeterminateRequestShapeText,
   isUpstreamWrapperFailureText,
 } from './upstreamFailureSignals.js';
 
@@ -49,19 +49,6 @@ const RETRYABLE_CHANNEL_LOCAL_PATTERNS: RegExp[] = [
   ...RETRYABLE_TIMEOUT_PATTERNS,
 ];
 
-const NON_RETRYABLE_REQUEST_PATTERNS: RegExp[] = [
-  /invalid\s+request\s+body/i,
-  /validation/i,
-  /missing\s+required/i,
-  /required\s+parameter/i,
-  /unknown\s+parameter/i,
-  /unrecognized\s+(field|key|parameter)/i,
-  /malformed/i,
-  /invalid\s+json/i,
-  /cannot\s+parse/i,
-  /unsupported\s+media\s+type/i,
-];
-
 const SAME_SITE_ENDPOINT_ABORT_PATTERNS: RegExp[] = [
   /\b429\b/i,
   /too\s+many\s+requests/i,
@@ -98,41 +85,30 @@ function matchesAnyPattern(patterns: RegExp[], rawMessage?: string | null): bool
  * `error.code` whenever a message exists — so the wrapper markers that prove a
  * failure is channel-local survive only in the raw body.
  *
- * Deliberate ordering: the non-retryable request-shape patterns are matched against
+ * Deliberate ordering: the determinate request-shape patterns are matched against
  * the summary ONLY. Matching them against raw JSON widens them (e.g. a `validation`
  * type wrapping a channel-level fault) and would flip missed retries into wrong
  * terminal errors. The raw body is consulted solely for wrapper markers.
  *
- * `allowIndeterminateRetry` opts into trying another channel for a 400/422 (and 413,
- * when `includePayloadTooLarge` is set) that carries NO marker either way — the case
- * where the response alone cannot distinguish "our body is malformed" from "this
- * vendor refuses a body a sibling channel accepts". It stays off by default so the
- * plain routing path keeps treating an unexplained 4xx as terminal; the caller that
- * enables it owns the attempt budget and the repeat-signature check.
- *
- * It is deliberately evaluated AFTER the request-shape patterns: a body that announces
- * itself as `invalid json` / `validation` / `malformed` is determinate, and retrying
- * would just re-upload the same broken payload to every channel in the route.
+ * An unexplained 400/413/422 — no marker either way — stays terminal here. Whether to
+ * spend one more channel on it is a per-downstream-key service level, decided by the
+ * surface failure toolkit, which owns the attempt budget and the repeat-signature
+ * check. This predicate deliberately knows nothing about that: it is stateless and
+ * mocked with explicit factories by ~13 test files, so a config-dependent answer here
+ * would be silently blanked out in all of them.
  */
 export function shouldRetryProxyRequest(
   status: number,
   upstreamErrorText?: string | null,
   rawUpstreamErrorText?: string | null,
-  options?: { allowIndeterminateRetry?: boolean; includePayloadTooLarge?: boolean },
 ): boolean {
   if (status >= 500) return true;
   if (status === 408 || status === 409 || status === 425 || status === 429) return true;
   if (status === 401 || status === 403) return true;
   if (isModelUnsupportedErrorMessage(upstreamErrorText)) return true;
-  if (matchesAnyPattern(NON_RETRYABLE_REQUEST_PATTERNS, upstreamErrorText)) return false;
+  if (isDeterminateRequestShapeText(upstreamErrorText)) return false;
   if (matchesAnyPattern(RETRYABLE_CHANNEL_LOCAL_PATTERNS, upstreamErrorText)) return true;
   if (isUpstreamWrapperFailureText(rawUpstreamErrorText)) return true;
-  if (
-    options?.allowIndeterminateRetry
-    && isIndeterminate4xx(status, { includePayloadTooLarge: options.includePayloadTooLarge })
-  ) {
-    return true;
-  }
   if (status === 400 || status === 404 || status === 422) return false;
   return false;
 }

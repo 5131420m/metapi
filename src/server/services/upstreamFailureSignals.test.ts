@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildFailureSignature,
+  isDeterminateRequestShapeText,
   isIndeterminate4xx,
   isUpstreamWrapperFailureText,
 } from './upstreamFailureSignals.js';
@@ -87,6 +88,27 @@ describe('buildFailureSignature', () => {
       message: 'completely different wording',
     });
     expect(withMessage).toBe(withOtherMessage);
+  });
+});
+
+describe('isDeterminateRequestShapeText', () => {
+  it('recognizes upstream complaints about the request shape', () => {
+    // These name a defect in the body itself, so every channel rejects them identically.
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 400: invalid json')).toBe(true);
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 400: validation failed')).toBe(true);
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 422: missing required parameter model')).toBe(true);
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 400: unknown parameter: foo')).toBe(true);
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 400: malformed request')).toBe(true);
+  });
+
+  it('does not claim an unexplained rejection is determinate', () => {
+    // The whole point of the indeterminate family: nothing in the text says whose fault
+    // it is, so a sibling channel might well accept the same bytes.
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 422: rejected')).toBe(false);
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 422: openai_error')).toBe(false);
+    expect(isDeterminateRequestShapeText('Upstream returned HTTP 400: Mistral Console requires at least one message')).toBe(false);
+    expect(isDeterminateRequestShapeText('')).toBe(false);
+    expect(isDeterminateRequestShapeText(null)).toBe(false);
   });
 });
 

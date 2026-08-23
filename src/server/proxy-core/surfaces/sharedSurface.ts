@@ -33,6 +33,7 @@ import {
 } from '../../services/downstreamErrorPolicy.js';
 import {
   buildFailureSignature,
+  isDeterminateRequestShapeText,
   isIndeterminate4xx,
 } from '../../services/upstreamFailureSignals.js';
 
@@ -593,10 +594,16 @@ export function createSurfaceFailureToolkit(input: {
   /**
    * Decides whether an indeterminate 4xx earns another channel.
    *
-   * Four independent gates, all required:
+   * Five independent gates, all required:
    *  - the key is in scope and the feature is on (`indeterminatePlan.enabled`);
    *  - the status is one where the response cannot tell a malformed body from a
    *    channel-specific refusal;
+   *  - the upstream did not name a request-shape defect. A body that announces itself
+   *    as `invalid json` / `validation` / `malformed` is determinate: every channel
+   *    rejects it identically, so a probe only re-uploads it. `shouldRetryProxyRequest`
+   *    applies the same rule before its own retryable branches, but it cannot enforce it
+   *    for this path — it returns false for an unexplained 4xx, which is precisely how
+   *    control reaches here, so its ordering never runs. The gate has to be repeated.
    *  - this exact rejection has not been seen before — a repeat proves the body, not
    *    the channel, is at fault, so further attempts would only re-upload it;
    *  - neither the feature's own budget, the raised loop ceiling, nor the global
@@ -618,6 +625,10 @@ export function createSurfaceFailureToolkit(input: {
     })) {
       return null;
     }
+    // Summarized text only. The raw body is not consulted here on purpose: a
+    // `"type":"validation_error"` envelope wrapping a channel-level fault is exactly the
+    // case this feature exists to retry.
+    if (isDeterminateRequestShapeText(args.errText)) return null;
     if (indeterminateAttempts >= indeterminatePlan.maxAttempts) return null;
     // One bound, two constraints folded together: stay inside the surface's loop bound
     // (authorizing a retry the loop refuses would exit the handler with no response) AND

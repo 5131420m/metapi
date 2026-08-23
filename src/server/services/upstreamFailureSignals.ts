@@ -39,6 +39,46 @@ export function isUpstreamWrapperFailureText(rawMessage?: string | null): boolea
 }
 
 /**
+ * Signals that the REQUEST itself is malformed in a way every channel rejects
+ * identically — a missing field, unparseable JSON, an unknown parameter.
+ *
+ * Match these against the SUMMARIZED error text only. `summarizeUpstreamError()` keeps
+ * `error.message`, so a genuine complaint about the request shape lands there; matching
+ * raw JSON instead widens them badly — a `"type":"validation_error"` envelope wrapping a
+ * channel-level fault would read as the caller's fault — and turns missed retries into
+ * wrong terminal errors.
+ *
+ * This lives in the leaf module rather than in either consumer because two layers need
+ * the same answer, and a determinate body is exactly the case where spending another
+ * channel only re-uploads it:
+ *
+ *   - `proxyRetryPolicy.ts`            — refuses another channel outright
+ *   - `surfaces/sharedSurface.ts`      — refuses to spend an indeterminate-4xx probe
+ */
+export const DETERMINATE_REQUEST_SHAPE_PATTERNS: RegExp[] = [
+  /invalid\s+request\s+body/i,
+  /validation/i,
+  /missing\s+required/i,
+  /required\s+parameter/i,
+  /unknown\s+parameter/i,
+  /unrecognized\s+(field|key|parameter)/i,
+  /malformed/i,
+  /invalid\s+json/i,
+  /cannot\s+parse/i,
+  /unsupported\s+media\s+type/i,
+];
+
+/**
+ * True when the text names a request-shape defect that would fail the same way on every
+ * channel. Pass the summarized message, never the raw body.
+ */
+export function isDeterminateRequestShapeText(rawMessage?: string | null): boolean {
+  const text = (rawMessage || '').trim();
+  if (!text) return false;
+  return DETERMINATE_REQUEST_SHAPE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
  * Statuses where "the request is malformed" and "this channel refuses a body a sibling
  * channel accepts" are indistinguishable from the response alone.
  *

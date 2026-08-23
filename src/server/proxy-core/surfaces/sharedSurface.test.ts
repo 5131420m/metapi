@@ -1707,6 +1707,32 @@ describe('indeterminate 4xx channel retry', () => {
     });
   });
 
+  it('does not spend a channel when the upstream named a request-shape defect', async () => {
+    // The ordinary predicate already returns false for these (mocked false here, matching
+    // its real verdict), which is exactly how control reaches the indeterminate path — so
+    // its own ordering never runs and this path has to re-apply the rule. A body that
+    // announces itself as malformed fails identically everywhere; a probe only re-uploads
+    // it.
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      await expect(fail(toolkit, { status: 400, retryCount: 0, message: 'invalid json' }))
+        .resolves.toMatchObject({ action: 'respond' });
+      await expect(fail(toolkit, { status: 422, retryCount: 0, message: 'missing required parameter model' }))
+        .resolves.toMatchObject({ action: 'respond' });
+      await expect(fail(toolkit, { status: 400, retryCount: 0, message: 'validation failed' }))
+        .resolves.toMatchObject({ action: 'respond' });
+    });
+  });
+
+  it('still probes when a request-shape word only appears in the raw body envelope', async () => {
+    // A `validation_error` envelope wrapping a channel-level fault is the case this
+    // feature exists for, so the determinate gate must read the summarized text only.
+    // Matching raw JSON would turn a missed retry into a wrong terminal error.
+    await withPolicy(enabledPolicy, async (toolkit) => {
+      await expect(fail(toolkit, { status: 422, retryCount: 0, type: 'validation_error' }))
+        .resolves.toEqual({ action: 'retry' });
+    });
+  });
+
   it('stops retrying once the same rejection repeats', async () => {
     await withPolicy(enabledPolicy, async (toolkit) => {
       // A repeat proves the body is at fault rather than the channel, so further channels
