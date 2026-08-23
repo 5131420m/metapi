@@ -515,6 +515,49 @@ describe('selectSurfaceChannelForAttempt', () => {
     }));
   });
 
+  it('forwards the raw upstream body to the retry policy so wrapper markers survive summarization', async () => {
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    isTokenExpiredErrorMock.mockReturnValue(false);
+    recordOauthQuotaResetHintMock.mockResolvedValue(null);
+
+    const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+    const toolkit = createSurfaceFailureToolkit({
+      warningScope: 'chat',
+      downstreamPath: '/v1/chat/completions',
+      maxRetries: 2,
+      clientContext: null,
+      downstreamApiKeyId: 44,
+    });
+
+    // The summarized message drops error.type, so only the raw body proves this 422
+    // is a relayed upstream failure rather than a malformed downstream request.
+    const rawBody = '{"error":{"message":"request could not be completed","type":"bad_response_status_code"}}';
+    await expect(toolkit.handleUpstreamFailure({
+      selected: {
+        channel: { id: 11, routeId: 22 },
+        account: { id: 33, username: 'oauth-user' },
+        site: { name: 'Codex OAuth' },
+        actualModel: 'upstream-model',
+      },
+      requestedModel: 'gpt-5.2',
+      modelName: 'upstream-model',
+      status: 422,
+      errText: 'Upstream returned HTTP 422: request could not be completed',
+      rawErrText: rawBody,
+      latencyMs: 1200,
+      retryCount: 0,
+    })).resolves.toEqual({ action: 'retry' });
+
+    expect(shouldRetryProxyRequestMock).toHaveBeenCalledWith(
+      422,
+      'Upstream returned HTTP 422: request could not be completed',
+      rawBody,
+    );
+  });
+
   it('keeps retryable failures on the retry path even when quota hint recording fails', async () => {
     composeProxyLogMessageMock.mockReturnValue('normalized error');
     formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');

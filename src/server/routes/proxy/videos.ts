@@ -186,6 +186,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
       } catch (error: any) {
         const status = error instanceof SiteApiEndpointRequestError ? (error.status || 0) : 0;
         const errorText = error?.message || 'network failure';
+        const rawErrorText = error instanceof SiteApiEndpointRequestError ? error.rawErrText : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
           status,
           errorText,
@@ -199,7 +200,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount += 1;
           continue;
         }
@@ -214,7 +215,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(error instanceof SiteApiEndpointRequestError ? error.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
             ? 'attempt_budget_exhausted'
             : 'attempt',
           attemptedChannelCount: excludeChannelIds.length,

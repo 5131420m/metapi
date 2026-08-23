@@ -695,7 +695,7 @@ export function createSurfaceFailureToolkit(input: {
         }));
       }
 
-      if (shouldRetryProxyRequest(args.status, args.errText)) {
+      if (shouldRetryProxyRequest(args.status, args.errText, rawErrText)) {
         const retry = maybeRetry(args.retryCount);
         if (retry) return retry;
       }

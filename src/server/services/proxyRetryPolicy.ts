@@ -1,3 +1,8 @@
+import {
+  UPSTREAM_WRAPPER_FAILURE_PATTERNS,
+  isUpstreamWrapperFailureText,
+} from './upstreamFailureSignals.js';
+
 const MODEL_UNSUPPORTED_PATTERNS: RegExp[] = [
   /当前\s*api\s*不支持所选模型/i,
   /不支持所选模型/i,
@@ -20,6 +25,7 @@ export const RETRYABLE_TIMEOUT_PATTERNS: RegExp[] = [
 ];
 
 const RETRYABLE_CHANNEL_LOCAL_PATTERNS: RegExp[] = [
+  ...UPSTREAM_WRAPPER_FAILURE_PATTERNS,
   /unsupported\s+legacy\s+protocol/i,
   /please\s+use\s+\/v1\/responses/i,
   /please\s+use\s+\/v1\/messages/i,
@@ -84,13 +90,30 @@ function matchesAnyPattern(patterns: RegExp[], rawMessage?: string | null): bool
   return patterns.some((pattern) => pattern.test(text));
 }
 
-export function shouldRetryProxyRequest(status: number, upstreamErrorText?: string | null): boolean {
+/**
+ * `upstreamErrorText` is the summarized single-line error; `rawUpstreamErrorText` is
+ * the untouched upstream body when available. The summary is produced by
+ * `summarizeUpstreamError()`, which keeps `error.message` and DROPS `error.type` /
+ * `error.code` whenever a message exists — so the wrapper markers that prove a
+ * failure is channel-local survive only in the raw body.
+ *
+ * Deliberate ordering: the non-retryable request-shape patterns are matched against
+ * the summary ONLY. Matching them against raw JSON widens them (e.g. a `validation`
+ * type wrapping a channel-level fault) and would flip missed retries into wrong
+ * terminal errors. The raw body is consulted solely for wrapper markers.
+ */
+export function shouldRetryProxyRequest(
+  status: number,
+  upstreamErrorText?: string | null,
+  rawUpstreamErrorText?: string | null,
+): boolean {
   if (status >= 500) return true;
   if (status === 408 || status === 409 || status === 425 || status === 429) return true;
   if (status === 401 || status === 403) return true;
   if (isModelUnsupportedErrorMessage(upstreamErrorText)) return true;
   if (matchesAnyPattern(NON_RETRYABLE_REQUEST_PATTERNS, upstreamErrorText)) return false;
   if (matchesAnyPattern(RETRYABLE_CHANNEL_LOCAL_PATTERNS, upstreamErrorText)) return true;
+  if (isUpstreamWrapperFailureText(rawUpstreamErrorText)) return true;
   if (status === 400 || status === 404 || status === 422) return false;
   return false;
 }

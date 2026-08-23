@@ -53,6 +53,45 @@ describe('proxyRetryPolicy', () => {
     ).toBe(false);
   });
 
+  it('retries relayed upstream wrapper failures carried on a deterministic 4xx status', () => {
+    expect(
+      shouldRetryProxyRequest(422, 'Upstream returned HTTP 422: openai_error'),
+    ).toBe(true);
+    expect(
+      shouldRetryProxyRequest(422, 'Upstream returned HTTP 422: bad response status code 422'),
+    ).toBe(true);
+    expect(
+      shouldRetryProxyRequest(400, 'Upstream returned HTTP 400: Mistral Console requires at least one message'),
+    ).toBe(true);
+  });
+
+  it('recovers wrapper markers from the raw body when the summary dropped error.type', () => {
+    // summarizeUpstreamError() keeps error.message and DISCARDS error.type/code,
+    // so the only channel-local evidence survives in the raw upstream body.
+    const summarized = 'Upstream returned HTTP 422: request could not be completed';
+    const raw = '{"error":{"message":"request could not be completed","type":"bad_response_status_code"}}';
+
+    expect(shouldRetryProxyRequest(422, summarized)).toBe(false);
+    expect(shouldRetryProxyRequest(422, summarized, raw)).toBe(true);
+  });
+
+  it('keeps request-shape errors terminal even when a wrapper marker is present', () => {
+    // NON_RETRYABLE_REQUEST_PATTERNS is matched first and only against the summary,
+    // so a genuinely malformed request is never retried across channels.
+    expect(
+      shouldRetryProxyRequest(400, 'Upstream returned HTTP 400: unknown parameter: foo', '{"error":{"type":"openai_error"}}'),
+    ).toBe(false);
+    expect(
+      shouldRetryProxyRequest(422, 'Upstream returned HTTP 422: invalid request body', '{"error":{"type":"openai_error"}}'),
+    ).toBe(false);
+  });
+
+  it('does not treat an unrelated vendor mention as a console constraint', () => {
+    expect(
+      shouldRetryProxyRequest(400, '{"error":{"message":"messages[0].role is invalid"}}'),
+    ).toBe(false);
+  });
+
   it('aborts same-site endpoint fallback on rate-limit and quota responses', () => {
     expect(
       shouldAbortSameSiteEndpointFallback(429, '{"error":{"message":"rate limit exceeded"}}'),

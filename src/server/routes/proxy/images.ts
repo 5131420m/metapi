@@ -201,6 +201,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
       } catch (err: any) {
         const status = err instanceof SiteApiEndpointRequestError ? (err.status || 0) : 0;
         const errorText = err?.message || 'network failure';
+        const rawErrorText = err instanceof SiteApiEndpointRequestError ? err.rawErrText : null;
         const firstByteLatencyMs = err instanceof SiteApiEndpointRequestError ? err.firstByteLatencyMs : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
           status,
@@ -233,7 +234,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount++;
           continue;
         }
@@ -248,7 +249,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
             ? 'attempt_budget_exhausted'
             : 'attempt',
           attemptedChannelCount: excludeChannelIds.length,
@@ -450,6 +451,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
       } catch (err: any) {
         const status = err instanceof SiteApiEndpointRequestError ? (err.status || 0) : 0;
         const errorText = err?.message || 'network failure';
+        const rawErrorText = err instanceof SiteApiEndpointRequestError ? err.rawErrText : null;
         const firstByteLatencyMs = err instanceof SiteApiEndpointRequestError ? err.firstByteLatencyMs : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
           status,
@@ -482,7 +484,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount++;
           continue;
         }
@@ -497,7 +499,7 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText) : true)
+          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
             ? 'attempt_budget_exhausted'
             : 'attempt',
           attemptedChannelCount: excludeChannelIds.length,
