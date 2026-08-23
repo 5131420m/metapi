@@ -270,6 +270,87 @@ describe('downstream terminal error policy', () => {
     expect(serializePublicTerminalFailure(decision, 'responses')).toEqual(deterministicPayload);
   });
 
+  it('classifies a relayed upstream wrapper failure on a 4xx as an upstream fault, not a request error', () => {
+    const wrapperFailure = failure(422, 'Upstream returned HTTP 422: openai_error');
+
+    expect(wrapperFailure.cause).toBe('invalid_upstream_response');
+    expect(resolvePublicTerminalFailure(wrapperFailure, resilientPolicy)).toMatchObject({
+      status: 502,
+      code: 'metapi_invalid_upstream_response',
+      rewritten: true,
+    });
+  });
+
+  it('detects a wrapper marker that survives only in the retained original payload', () => {
+    // The summarized message keeps error.message and drops error.type, so the
+    // channel-local evidence exists solely on the original payload here.
+    const wrapperFailure = buildCanonicalUpstreamFailure({
+      status: 422,
+      message: 'request could not be completed',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      terminalScope: 'attempt_budget_exhausted',
+      originalPayload: {
+        error: {
+          message: 'request could not be completed',
+          type: 'bad_response_status_code',
+        },
+      },
+    });
+
+    expect(wrapperFailure.cause).toBe('invalid_upstream_response');
+    expect(resolvePublicTerminalFailure(wrapperFailure, resilientPolicy).rewritten).toBe(true);
+  });
+
+  it('aggregates mixed causes when the last channel returned a relayed wrapper 4xx', () => {
+    const transientFailure = failure(503, 'service unavailable');
+    const wrapperFailure = failure(422, 'Upstream returned HTTP 422: bad response status code 422');
+
+    const decision = resolveAggregatedPublicTerminalFailure(
+      [transientFailure, wrapperFailure],
+      wrapperFailure,
+      resilientPolicy,
+    );
+
+    expect(decision).toMatchObject({
+      status: 503,
+      code: 'metapi_upstream_pool_exhausted',
+      rewritten: true,
+    });
+  });
+
+  it('still surfaces a genuine deterministic 422 verbatim after channel retries', () => {
+    const priorRetryableFailure = failure(503, 'service unavailable');
+    const deterministicPayload = {
+      error: {
+        type: 'invalid_request_error',
+        code: 'unknown_parameter',
+        message: 'unknown parameter: foo',
+      },
+    };
+    const deterministicFailure = buildCanonicalUpstreamFailure({
+      status: 422,
+      message: 'unknown parameter: foo',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      terminalScope: 'attempt_budget_exhausted',
+      originalPayload: deterministicPayload,
+    });
+
+    expect(deterministicFailure.cause).toBe('request_invalid');
+    expect(resolveAggregatedPublicTerminalFailure(
+      [priorRetryableFailure],
+      deterministicFailure,
+      resilientPolicy,
+    )).toMatchObject({
+      status: 422,
+      rewritten: false,
+      message: 'unknown parameter: foo',
+    });
+  });
+
   it('preserves a Responses previous-response 404 when earlier channel failures exist', () => {
     const priorRetryableFailure = failure(401, 'expired upstream token');
     const continuationFailure = buildCanonicalUpstreamFailure({

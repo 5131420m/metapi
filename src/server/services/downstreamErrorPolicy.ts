@@ -1,3 +1,5 @@
+import { isUpstreamWrapperFailureText } from './upstreamFailureSignals.js';
+
 export const DOWNSTREAM_ERROR_POLICY_MODES = [
   'off',
   'resilient',
@@ -87,6 +89,28 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * Wrapper markers frequently live ONLY in the upstream body's `error.type` /
+ * `error.code`, because `summarizeUpstreamError()` keeps `error.message` and drops
+ * type/code whenever a message exists. Inspect the retained original payload as well
+ * as the summarized message so a relayed failure is recognized either way.
+ */
+function hasUpstreamWrapperFailureSignal(input: {
+  message: string;
+  originalType?: string;
+  originalCode?: string;
+  originalPayload?: unknown;
+}): boolean {
+  if (isUpstreamWrapperFailureText(input.message)) return true;
+  if (isUpstreamWrapperFailureText(input.originalType)) return true;
+  if (isUpstreamWrapperFailureText(input.originalCode)) return true;
+  const payload = input.originalPayload;
+  if (!isRecord(payload)) return false;
+  const error = isRecord(payload.error) ? payload.error : payload;
+  return isUpstreamWrapperFailureText(asTrimmedString(error.type))
+    || isUpstreamWrapperFailureText(asTrimmedString(error.code));
+}
+
 function asTrimmedString(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -128,6 +152,7 @@ export function inferCanonicalFailureCause(
   status: number,
   message: string,
   protocol: CanonicalFailureProtocol = 'responses',
+  hasWrapperSignal = false,
 ): CanonicalFailureCause {
   const normalizedMessage = message.toLowerCase();
   if (/no available channel|pool exhausted/.test(normalizedMessage)) return 'route_exhausted';
@@ -153,6 +178,12 @@ export function inferCanonicalFailureCause(
   )) {
     return 'request_scoped_not_found';
   }
+  // A 400/413/422 that only carries an upstream relay/wrapper marker is NOT a
+  // deterministic request error: a sibling channel can accept a byte-identical body.
+  // The retry layer already treats these as channel-local, so classifying them as
+  // `request_invalid` here would make the two layers disagree and leak a bare
+  // 400/422 to the client after every channel had in fact been tried.
+  if (hasWrapperSignal || isUpstreamWrapperFailureText(message)) return 'invalid_upstream_response';
   if (status === 400 || status === 413 || status === 422) return 'request_invalid';
   if (status === 404) return 'upstream_model_unavailable';
   return 'internal_error';
@@ -179,7 +210,17 @@ export function buildCanonicalUpstreamFailure(input: {
 }): CanonicalProxyFailure {
   return {
     origin: 'upstream',
-    cause: inferCanonicalFailureCause(input.status, input.message, input.protocol),
+    cause: inferCanonicalFailureCause(
+      input.status,
+      input.message,
+      input.protocol,
+      hasUpstreamWrapperFailureSignal({
+        message: input.message,
+        originalType: input.originalType,
+        originalCode: input.originalCode,
+        originalPayload: input.originalPayload,
+      }),
+    ),
     protocol: input.protocol,
     transport: input.transport ?? 'http',
     phase: input.phase ?? 'precommit',
@@ -291,12 +332,21 @@ export function resolvePublicTerminalFailure(
     };
   }
 
-  if (
-    failure.cause === 'request_invalid'
-    || failure.originalStatus === 400
-    || failure.originalStatus === 413
-    || failure.originalStatus === 422
-  ) {
+  // Deterministic client errors must reach the caller verbatim: masking a genuinely
+  // malformed request as 503 sends the client into a pointless retry loop. The status
+  // check is the safety net for causes we failed to infer — but it must not swallow a
+  // relayed upstream wrapper failure that merely happens to arrive on a 4xx, since
+  // those were retried across channels and are not the caller's fault.
+  const isDeterministicRequestFailure = failure.cause === 'request_invalid'
+    || (
+      failure.cause !== 'invalid_upstream_response'
+      && (
+        failure.originalStatus === 400
+        || failure.originalStatus === 413
+        || failure.originalStatus === 422
+      )
+    );
+  if (isDeterministicRequestFailure) {
     return {
       status: failure.originalStatus || 400,
       type: failure.originalType === 'server_error' ? 'server_error' : 'upstream_error',
