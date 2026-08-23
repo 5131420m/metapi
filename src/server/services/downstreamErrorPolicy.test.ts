@@ -597,3 +597,96 @@ describe('downstream terminal error policy', () => {
     });
   });
 });
+
+describe('rewritten terminal failures keep upstream evidence', () => {
+  it('nests the upstream body under upstream_error without changing the public contract', () => {
+    // Decision: the neutral 502 is what the client routes on, but the upstream's own body
+    // is what a human needs in order to see which upstream refused and why. Previously
+    // every rewritten branch discarded it.
+    const withPayload = buildCanonicalUpstreamFailure({
+      status: 422,
+      message: 'Upstream returned HTTP 422: openai_error',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      terminalScope: 'attempt_budget_exhausted',
+      originalPayload: { error: { message: 'relay failed', type: 'openai_error' } },
+    });
+
+    const decision = resolvePublicTerminalFailure(withPayload, resilientPolicy);
+    expect(decision).toMatchObject({
+      status: 502,
+      code: 'metapi_invalid_upstream_response',
+      rewritten: true,
+    });
+
+    const serialized = serializePublicTerminalFailure(decision, 'responses') as {
+      error: { message: string; type: string; code?: string; upstream_error?: unknown };
+    };
+    // Public fields stay Metapi's own.
+    expect(serialized.error.message).toBe('The upstream returned an invalid gateway response.');
+    expect(serialized.error.code).toBe('metapi_invalid_upstream_response');
+    // Evidence is preserved alongside, not in place of, the rewritten payload.
+    expect(serialized.error.upstream_error).toEqual({
+      error: { message: 'relay failed', type: 'openai_error' },
+    });
+  });
+
+  it('omits the evidence key entirely when there is no upstream body', () => {
+    const noPayload = buildCanonicalUpstreamFailure({
+      status: 422,
+      message: 'Upstream returned HTTP 422: openai_error',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      terminalScope: 'attempt_budget_exhausted',
+    });
+    const serialized = serializePublicTerminalFailure(
+      resolvePublicTerminalFailure(noPayload, resilientPolicy),
+      'responses',
+    ) as { error: Record<string, unknown> };
+    expect('upstream_error' in serialized.error).toBe(false);
+  });
+
+  it('does not nest evidence for a passthrough (non-rewritten) decision', () => {
+    // A passthrough decision serializes the upstream payload AS the response body; adding
+    // a nested copy would duplicate it.
+    const outOfScope = buildCanonicalUpstreamFailure({
+      status: 422,
+      message: 'Upstream returned HTTP 422: openai_error',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 999,
+      terminalScope: 'attempt_budget_exhausted',
+      originalPayload: { error: { message: 'relay failed', type: 'openai_error' } },
+    });
+    const decision = resolvePublicTerminalFailure(outOfScope, resilientPolicy);
+    expect(decision.rewritten).toBe(false);
+    const serialized = serializePublicTerminalFailure(decision, 'responses') as {
+      error: Record<string, unknown>;
+    };
+    expect('upstream_error' in serialized.error).toBe(false);
+    expect(serialized.error.type).toBe('openai_error');
+  });
+
+  it('retains the last upstream body when mixed causes collapse to a pool-exhausted terminal', () => {
+    // Mixed causes are the common shape once indeterminate retries are in play, because
+    // the retry only continues while the rejection keeps changing.
+    const first = failure(400, 'Upstream returned HTTP 400: rejected');
+    const second = buildCanonicalUpstreamFailure({
+      status: 422,
+      message: 'Upstream returned HTTP 422: openai_error',
+      protocol: 'responses',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+      terminalScope: 'attempt_budget_exhausted',
+      originalPayload: { error: { message: 'second channel refused', type: 'openai_error' } },
+    });
+
+    const aggregated = aggregateCanonicalFailures([first, second]);
+    expect(aggregated).toMatchObject({ cause: 'upstream_pool_exhausted', originalStatus: 503 });
+    expect(aggregated.originalPayload).toEqual({
+      error: { message: 'second channel refused', type: 'openai_error' },
+    });
+  });
+});

@@ -294,6 +294,10 @@ export function aggregateCanonicalFailures(
     originalType: undefined,
     originalCode: undefined,
     originalMessage: 'All configured upstream channels were exhausted by mixed failures.',
+    // NOTE: originalPayload is deliberately NOT reset alongside type/code above — the
+    // spread carries it through. Mixed causes are the common shape once indeterminate-4xx
+    // retries are in play, so clearing it would drop the upstream evidence in exactly the
+    // case where several different channels were actually tried.
   };
 }
 
@@ -365,6 +369,11 @@ export function resolvePublicTerminalFailure(
         code: 'metapi_invalid_upstream_response',
         message: 'The upstream returned an invalid gateway response.',
         rewritten: true,
+        // Keep the upstream's own body as evidence. The neutral 502 is what the client
+        // routes on (a bare relayed 422 reads like the caller's fault); the original
+        // payload is what a human needs to see to diagnose which upstream refused and
+        // why. Dropping it left only "invalid gateway response", which names no cause.
+        originalPayload: failure.originalPayload,
       };
     case 'upstream_timeout':
       return {
@@ -457,6 +466,7 @@ export function serializePublicTerminalFailure(
       error: {
         type: 'api_error',
         message: decision.message,
+        ...(buildUpstreamEvidence(decision) ?? {}),
       },
     };
   }
@@ -465,8 +475,26 @@ export function serializePublicTerminalFailure(
       message: decision.message,
       type: decision.type === 'upstream_error' ? 'upstream_error' : decision.type,
       ...(decision.code ? { code: decision.code } : {}),
+      ...(buildUpstreamEvidence(decision) ?? {}),
     },
   };
+}
+
+/**
+ * Attaches the upstream's original body to a REWRITTEN decision under its own key.
+ *
+ * A rewritten decision must not be serialized as the upstream payload itself — that is
+ * precisely the leak the rewrite exists to prevent, and the status/type/code the client
+ * routes on have to stay Metapi's. Nesting the evidence keeps the public contract
+ * (`error.message` / `error.type` / `error.code`) byte-identical while preserving the
+ * diagnostic detail that was previously discarded.
+ */
+function buildUpstreamEvidence(
+  decision: PublicFailureDecision,
+): { upstream_error?: unknown } | null {
+  if (!decision.rewritten) return null;
+  if (decision.originalPayload === undefined) return null;
+  return { upstream_error: structuredClone(decision.originalPayload) };
 }
 
 export function resolveAggregatedPublicTerminalFailure(
