@@ -17,6 +17,7 @@ import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
 import { resolveProxyLogBilling } from './proxyBilling.js';
 import { getProxyAuthContext } from '../../middleware/auth.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
+import { summarizeUpstreamError } from './upstreamError.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../proxy-core/downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../../proxy-core/firstByteTimeout.js';
@@ -121,7 +122,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
             throw error;
           }
           if (!response.ok) {
-            throw new SiteApiEndpointRequestError(responseText || 'unknown error', {
+            throw new SiteApiEndpointRequestError(summarizeUpstreamError(status, responseText), {
               status,
               rawErrText: responseText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
@@ -209,7 +210,7 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
         const firstByteLatencyMs = err instanceof SiteApiEndpointRequestError ? err.firstByteLatencyMs : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
           status,
-          errorText,
+          errorText: rawErrorText || errorText,
           modelName: upstreamModel,
           failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
             ? err.failureKind

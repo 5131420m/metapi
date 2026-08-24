@@ -483,4 +483,68 @@ describe('/v1/videos routes', () => {
     expect(response.headers['content-type']).toContain('text/plain');
     expect(response.body).toBe('temporary unavailable');
   });
+
+  it('classifies a create failure on the summarized message while keeping the raw body for evidence', async () => {
+    const rawBody = JSON.stringify({
+      error: { message: 'bad response status code 422', type: 'validation_error' },
+    });
+    fetchMock.mockResolvedValue(new Response(rawBody, {
+      status: 422,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    await app.inject({
+      method: 'POST',
+      url: '/v1/videos',
+      payload: { model: 'sora-2', prompt: 'a cat walking' },
+    });
+
+    // The retry predicate must judge the summarized message, not the raw envelope: a
+    // relayed wrapper failure carrying a determinate-looking `type` would otherwise be
+    // classified as the caller's fault and lose its channel retry.
+    expect(shouldRetryProxyRequestMock).toHaveBeenCalledWith(
+      422,
+      'Upstream returned HTTP 422: bad response status code 422',
+      rawBody,
+    );
+    // Channel health still classifies on the untouched body, matching the surfaces.
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      status: 422,
+      errorText: rawBody,
+    }));
+  });
+
+  it('passes both the summarized message and the raw body when polling a mapped task', async () => {
+    siteApiEndpointRows = [
+      { id: 91, siteId: 44, url: 'https://api-videos.example.com', enabled: true, sortOrder: 0 },
+    ];
+    resolveProxyVideoTaskSiteMock.mockResolvedValue({
+      id: 44,
+      name: 'demo-site',
+      url: 'https://panel.example.com',
+      platform: 'openai',
+    });
+    getProxyVideoTaskByPublicIdMock.mockResolvedValue({
+      publicId: 'vid_local_args_get',
+      upstreamVideoId: 'vid_upstream_args_get',
+      siteUrl: 'https://api-videos.example.com',
+      tokenValue: 'sk-demo',
+      accountId: 33,
+    });
+    const rawBody = JSON.stringify({
+      error: { message: 'openai_error', type: 'validation_error' },
+    });
+    fetchMock.mockResolvedValue(new Response(rawBody, {
+      status: 400,
+      headers: { 'content-type': 'application/json' },
+    }));
+
+    await app.inject({ method: 'GET', url: '/v1/videos/vid_local_args_get' });
+
+    expect(shouldRetryProxyRequestMock).toHaveBeenCalledWith(
+      400,
+      'Upstream returned HTTP 400: openai_error',
+      rawBody,
+    );
+  });
 });

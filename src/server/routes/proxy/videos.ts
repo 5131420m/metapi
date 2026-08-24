@@ -12,6 +12,7 @@ import { withSiteProxyRequestInit, withSiteRecordProxyRequestInit } from '../../
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { cloneFormDataWithOverrides, ensureMultipartBufferParser, parseMultipartFormData } from './multipart.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
+import { summarizeUpstreamError } from './upstreamError.js';
 import {
   deleteProxyVideoTaskByPublicId,
   getProxyVideoTaskByPublicId,
@@ -124,7 +125,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
           const response = await fetch(targetUrl, requestInit);
           const responseText = await response.text();
           if (!response.ok) {
-            throw new SiteApiEndpointRequestError(responseText || 'unknown error', {
+            throw new SiteApiEndpointRequestError(summarizeUpstreamError(response.status, responseText), {
               status: response.status,
               rawErrText: responseText || null,
             });
@@ -189,7 +190,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
         const rawErrorText = error instanceof SiteApiEndpointRequestError ? error.rawErrText : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
           status,
-          errorText,
+          errorText: rawErrorText || errorText,
           modelName: upstreamModel,
         }));
         if (status > 0 && isTokenExpiredError({ status, message: errorText })) {
@@ -303,8 +304,9 @@ async function requestMappedVideoTaskUpstream(
     }));
     if (!upstream.ok) {
       const errorText = await upstream.clone().text().catch(() => '');
-      if (shouldRetryProxyRequest(upstream.status, errorText || `HTTP ${upstream.status}`)) {
-        throw new SiteApiEndpointRequestError(errorText || `HTTP ${upstream.status}`, {
+      const summary = summarizeUpstreamError(upstream.status, errorText);
+      if (shouldRetryProxyRequest(upstream.status, summary, errorText || null)) {
+        throw new SiteApiEndpointRequestError(summary, {
           status: upstream.status,
           rawErrText: errorText || null,
         });

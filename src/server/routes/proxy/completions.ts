@@ -18,6 +18,7 @@ import { detectProxyFailure } from '../../services/proxyFailureJudge.js';
 import { resolveProxyLogBilling } from './proxyBilling.js';
 import { getProxyAuthContext } from '../../middleware/auth.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
+import { summarizeUpstreamError } from './upstreamError.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../proxy-core/downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../../proxy-core/firstByteTimeout.js';
@@ -112,7 +113,7 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           if (!response.ok) {
             const errText = await response.text().catch(() => 'unknown error');
-            throw new SiteApiEndpointRequestError(errText || 'unknown error', {
+            throw new SiteApiEndpointRequestError(summarizeUpstreamError(response.status, errText), {
               status: response.status,
               rawErrText: errText || null,
               firstByteLatencyMs: observedFirstByteLatencyMs,
@@ -341,7 +342,7 @@ export async function completionsProxyRoute(app: FastifyInstance) {
         const firstByteLatencyMs = err instanceof SiteApiEndpointRequestError ? err.firstByteLatencyMs : null;
         await recordTokenRouterEventBestEffort('record channel failure', () => tokenRouter.recordFailure(selected.channel.id, {
           status,
-          errorText,
+          errorText: rawErrorText || errorText,
           modelName: upstreamModel,
           failureKind: err instanceof SiteApiEndpointRequestError && err.failureKind === 'first-byte-timeout'
             ? err.failureKind

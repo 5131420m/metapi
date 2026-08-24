@@ -215,7 +215,10 @@ describe('/v1/completions site api endpoint rotation', () => {
       .all();
     expect(storedEndpoints[0]).toMatchObject({
       url: 'https://api-a.example.com',
-      lastFailureReason: 'HTTP 502: bad gateway',
+      // The route now records the summarized upstream message, matching the shared
+      // surfaces; `formatFailureReason()` adds its own `HTTP <status>: ` prefix because
+      // the summary starts with "Upstream returned HTTP", exactly as on the chat path.
+      lastFailureReason: 'HTTP 502: Upstream returned HTTP 502: bad gateway',
     });
     expect(storedEndpoints[0]?.cooldownUntil).toBeNull();
     expect(storedEndpoints[0]?.consecutiveFailureCount).toBe(1);
