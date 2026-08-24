@@ -9,7 +9,11 @@ import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageFallbackService.js';
 import { mergeProxyUsage, parseProxyUsage, pullSseDataEvents } from '../../services/proxyUsageParser.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
-import { parseNonStreamOriginalPayload, resolveNonStreamTerminalFailure } from '../../proxy-core/surfaces/nonStreamSurface.js';
+import {
+  parseNonStreamOriginalPayload,
+  resolveNonStreamTerminalFailure,
+  resolveNonStreamTerminalScope,
+} from '../../proxy-core/surfaces/nonStreamSurface.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
@@ -165,7 +169,11 @@ export async function completionsProxyRoute(app: FastifyInstance) {
               status: 502,
               message: errorText,
               downstreamApiKeyId,
-              terminalScope: 'attempt_budget_exhausted',
+              terminalScope: resolveNonStreamTerminalScope({
+                retryable: true,
+                retryCount,
+                maxRetries: getProxyMaxChannelRetries(),
+              }),
               attemptedChannelCount: excludeChannelIds.length,
               maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
             });
@@ -261,7 +269,8 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             firstByteLatencyMs,
           );
 
-          if (shouldRetryProxyRequest(failure.status, errText) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+          const detectedRetryable = shouldRetryProxyRequest(failure.status, errText);
+          if (detectedRetryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
             retryCount += 1;
             continue;
           }
@@ -278,9 +287,11 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             message: errText,
             downstreamApiKeyId,
             originalPayload: data,
-            terminalScope: shouldRetryProxyRequest(failure.status, errText)
-              ? 'attempt_budget_exhausted'
-              : 'attempt',
+            terminalScope: resolveNonStreamTerminalScope({
+              retryable: detectedRetryable,
+              retryCount,
+              maxRetries: getProxyMaxChannelRetries(),
+            }),
             attemptedChannelCount: excludeChannelIds.length,
             maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
           });
@@ -376,7 +387,8 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount++;
           continue;
         }
@@ -391,9 +403,11 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
-            ? 'attempt_budget_exhausted'
-            : 'attempt',
+          terminalScope: resolveNonStreamTerminalScope({
+            retryable,
+            retryCount,
+            maxRetries: getProxyMaxChannelRetries(),
+          }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });

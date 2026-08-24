@@ -8,7 +8,11 @@ import { isTokenExpiredError } from '../../services/alertRules.js';
 import { estimateProxyCost } from '../../services/modelPricingService.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
-import { parseNonStreamOriginalPayload, resolveNonStreamTerminalFailure } from '../../proxy-core/surfaces/nonStreamSurface.js';
+import {
+  parseNonStreamOriginalPayload,
+  resolveNonStreamTerminalFailure,
+  resolveNonStreamTerminalScope,
+} from '../../proxy-core/surfaces/nonStreamSurface.js';
 import { withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
@@ -158,7 +162,11 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             message: data.message,
             downstreamApiKeyId,
             originalPayload: parseNonStreamOriginalPayload(text),
-            terminalScope: 'attempt_budget_exhausted',
+            terminalScope: resolveNonStreamTerminalScope({
+              retryable: true,
+              retryCount,
+              maxRetries: getProxyMaxChannelRetries(),
+            }),
             attemptedChannelCount: excludeChannelIds.length,
             maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
           });
@@ -235,7 +243,8 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount++;
           continue;
         }
@@ -250,9 +259,11 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
-            ? 'attempt_budget_exhausted'
-            : 'attempt',
+          terminalScope: resolveNonStreamTerminalScope({
+            retryable,
+            retryCount,
+            maxRetries: getProxyMaxChannelRetries(),
+          }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });
@@ -408,7 +419,11 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             message: data.message,
             downstreamApiKeyId,
             originalPayload: parseNonStreamOriginalPayload(text),
-            terminalScope: 'attempt_budget_exhausted',
+            terminalScope: resolveNonStreamTerminalScope({
+              retryable: true,
+              retryCount,
+              maxRetries: getProxyMaxChannelRetries(),
+            }),
             attemptedChannelCount: excludeChannelIds.length,
             maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
           });
@@ -485,7 +500,8 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount++;
           continue;
         }
@@ -500,9 +516,11 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
-            ? 'attempt_budget_exhausted'
-            : 'attempt',
+          terminalScope: resolveNonStreamTerminalScope({
+            retryable,
+            retryCount,
+            maxRetries: getProxyMaxChannelRetries(),
+          }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });

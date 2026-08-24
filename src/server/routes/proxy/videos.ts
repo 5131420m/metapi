@@ -7,7 +7,11 @@ import { isTokenExpiredError } from '../../services/alertRules.js';
 import { estimateProxyCost } from '../../services/modelPricingService.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
-import { parseNonStreamOriginalPayload, resolveNonStreamTerminalFailure } from '../../proxy-core/surfaces/nonStreamSurface.js';
+import {
+  parseNonStreamOriginalPayload,
+  resolveNonStreamTerminalFailure,
+  resolveNonStreamTerminalScope,
+} from '../../proxy-core/surfaces/nonStreamSurface.js';
 import { withSiteProxyRequestInit, withSiteRecordProxyRequestInit } from '../../services/siteProxy.js';
 import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js';
 import { cloneFormDataWithOverrides, ensureMultipartBufferParser, parseMultipartFormData } from './multipart.js';
@@ -201,7 +205,8 @@ export async function videosProxyRoute(app: FastifyInstance) {
             detail: `HTTP ${status}`,
           });
         }
-        if ((status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true) && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
           retryCount += 1;
           continue;
         }
@@ -216,9 +221,11 @@ export async function videosProxyRoute(app: FastifyInstance) {
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
           downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(error instanceof SiteApiEndpointRequestError ? error.rawErrText : errorText),
-          terminalScope: (status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true)
-            ? 'attempt_budget_exhausted'
-            : 'attempt',
+          terminalScope: resolveNonStreamTerminalScope({
+            retryable,
+            retryCount,
+            maxRetries: getProxyMaxChannelRetries(),
+          }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
         });

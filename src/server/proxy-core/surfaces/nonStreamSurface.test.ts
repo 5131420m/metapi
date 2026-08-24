@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { config } from '../../config.js';
-import { resolveNonStreamTerminalFailure } from './nonStreamSurface.js';
+import { resolveNonStreamTerminalFailure, resolveNonStreamTerminalScope } from './nonStreamSurface.js';
 
 const originalPolicy = structuredClone(config.downstreamErrorPolicy);
 
@@ -110,5 +110,66 @@ describe('non-stream terminal failure surface', () => {
         code: 'metapi_no_available_channel',
       } },
     });
+  });
+});
+
+describe('non-stream terminal scope', () => {
+  it('does not claim budget exhaustion on an unspent budget', () => {
+    // A pinned channel reaches the terminal site with retryCount still 0, because
+    // `canRetryChannelSelection()` refuses a forced channel before the loop can increment.
+    // The old scope was inferred from that refusal and reported an exhausted budget.
+    expect(resolveNonStreamTerminalScope({
+      retryable: true,
+      retryCount: 0,
+      maxRetries: 3,
+    })).toBe('attempt');
+  });
+
+  it('claims budget exhaustion only once the retry budget is actually spent', () => {
+    expect(resolveNonStreamTerminalScope({
+      retryable: true,
+      retryCount: 3,
+      maxRetries: 3,
+    })).toBe('attempt_budget_exhausted');
+  });
+
+  it('keeps a mid-budget retryable failure scoped to the attempt', () => {
+    expect(resolveNonStreamTerminalScope({
+      retryable: true,
+      retryCount: 1,
+      maxRetries: 3,
+    })).toBe('attempt');
+  });
+
+  it('never claims exhaustion for a failure that was never retryable', () => {
+    expect(resolveNonStreamTerminalScope({
+      retryable: false,
+      retryCount: 3,
+      maxRetries: 3,
+    })).toBe('attempt');
+  });
+
+  it('relays the upstream error verbatim for a pinned channel instead of neutralizing it', () => {
+    // The model tester pins a channel to see what that channel actually returned. Under
+    // the old reverse-inferred scope this became a rewritten 503 for an opted-in key.
+    config.downstreamErrorPolicy = {
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+    };
+    const originalPayload = { error: { message: 'bad gateway', type: 'server_error' } };
+
+    expect(resolveNonStreamTerminalFailure({
+      protocol: 'openai',
+      requestedModel: 'gpt-5.6',
+      status: 502,
+      message: 'bad gateway',
+      downstreamApiKeyId: 12,
+      originalPayload,
+      terminalScope: resolveNonStreamTerminalScope({
+        retryable: true,
+        retryCount: 0,
+        maxRetries: 3,
+      }),
+    })).toEqual({ status: 502, payload: originalPayload });
   });
 });
