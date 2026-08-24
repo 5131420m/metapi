@@ -122,6 +122,38 @@ function normalizeMessageFingerprint(rawMessage?: string | null): string {
 }
 
 /**
+ * Pulls `error.type` / `error.code` out of an upstream body.
+ *
+ * `summarizeUpstreamError()` keeps `error.message` and drops type/code whenever a
+ * message exists, so these are the stable identity fields that only survive in the
+ * raw payload — and they are what the repeat-rejection signature is built from.
+ *
+ * Lives here rather than inside a surface closure because it is the input half of
+ * `buildFailureSignature()`: any caller that needs a repeat-rejection signature needs
+ * this first, and a second copy would let the two drift apart while both look correct.
+ */
+export function extractOriginalErrorIdentity(payload: unknown): {
+  type?: string;
+  code?: string;
+} {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+  const record = payload as Record<string, unknown>;
+  const error = record.error && typeof record.error === 'object' && !Array.isArray(record.error)
+    ? record.error as Record<string, unknown>
+    : record;
+  const type = typeof error.type === 'string' ? error.type.trim() : '';
+  const code = typeof error.code === 'string'
+    ? error.code.trim()
+    : typeof error.code === 'number'
+      ? String(error.code)
+      : '';
+  return {
+    ...(type ? { type } : {}),
+    ...(code ? { code } : {}),
+  };
+}
+
+/**
  * Identity of a failure for "have I already seen this exact rejection?" comparison.
  *
  * `error.type` / `error.code` are preferred because they are the stable machine-readable

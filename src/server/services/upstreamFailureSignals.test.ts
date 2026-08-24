@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildFailureSignature,
+  extractOriginalErrorIdentity,
   isDeterminateRequestShapeText,
   isIndeterminate4xx,
   isUpstreamWrapperFailureText,
@@ -123,5 +124,68 @@ describe('isUpstreamWrapperFailureText', () => {
     expect(isUpstreamWrapperFailureText('messages[0].role is invalid')).toBe(false);
     expect(isUpstreamWrapperFailureText('')).toBe(false);
     expect(isUpstreamWrapperFailureText(null)).toBe(false);
+  });
+});
+
+describe('extractOriginalErrorIdentity', () => {
+  it('reads the identity out of a nested error envelope', () => {
+    expect(extractOriginalErrorIdentity({
+      error: { message: 'nope', type: 'validation_error', code: 'invalid_body' },
+    })).toEqual({ type: 'validation_error', code: 'invalid_body' });
+  });
+
+  it('falls back to the top level when there is no error envelope', () => {
+    expect(extractOriginalErrorIdentity({ type: 'openai_error', code: 'upstream' }))
+      .toEqual({ type: 'openai_error', code: 'upstream' });
+  });
+
+  it('accepts a numeric code, since upstreams disagree on its type', () => {
+    expect(extractOriginalErrorIdentity({ error: { code: 40301 } }))
+      .toEqual({ code: '40301' });
+  });
+
+  it('omits absent, blank and non-string identity fields instead of reporting empties', () => {
+    // An empty string must not become a present dimension: `buildFailureSignature` treats
+    // any present type/code as "identity known" and stops consulting the message, so a
+    // blank one would collapse two genuinely different rejections into one signature.
+    expect(extractOriginalErrorIdentity({ error: { message: 'nope' } })).toEqual({});
+    expect(extractOriginalErrorIdentity({ error: { type: '   ', code: '' } })).toEqual({});
+    expect(extractOriginalErrorIdentity({ error: { type: { nested: true } } })).toEqual({});
+  });
+
+  it('treats a non-object body as carrying no identity', () => {
+    expect(extractOriginalErrorIdentity(undefined)).toEqual({});
+    expect(extractOriginalErrorIdentity(null)).toEqual({});
+    expect(extractOriginalErrorIdentity('bad gateway')).toEqual({});
+    expect(extractOriginalErrorIdentity(502)).toEqual({});
+    // Array row documents the contract but cannot falsify the top-level `Array.isArray`
+    // guard: payloads reach here via `JSON.parse`, and a parsed array never carries an
+    // own `type`/`code`, so dropping that guard changes nothing observable. Only the
+    // inner `record.error` array guard is falsifiable — see the next case.
+    expect(extractOriginalErrorIdentity([{ type: 'validation_error' }])).toEqual({});
+  });
+
+  it('ignores an array-shaped error member and reads the top level instead', () => {
+    expect(extractOriginalErrorIdentity({ error: ['nope'], type: 'openai_error' }))
+      .toEqual({ type: 'openai_error' });
+  });
+
+  it('feeds buildFailureSignature so one rejection keeps one signature across attempts', () => {
+    // The pair only earns its keep together: identity survives in the raw payload while
+    // the message carries per-attempt noise, so two relays of the SAME rejection must
+    // compare equal and a different rejection must not.
+    const first = { error: { message: 'refused (request_id=a1b2c3d4e5f60718)', type: 'validation_error' } };
+    const second = { error: { message: 'refused (request_id=99887766554433aa)', type: 'validation_error' } };
+    const other = { error: { message: 'refused', type: 'permission_error' } };
+
+    const sign = (payload: unknown, message: string) => buildFailureSignature({
+      status: 400,
+      ...extractOriginalErrorIdentity(payload),
+      message,
+    });
+
+    expect(sign(first, 'refused (request_id=a1b2c3d4e5f60718)'))
+      .toBe(sign(second, 'refused (request_id=99887766554433aa)'));
+    expect(sign(first, 'refused')).not.toBe(sign(other, 'refused'));
   });
 });

@@ -33,6 +33,7 @@ import {
 } from '../../services/downstreamErrorPolicy.js';
 import {
   buildFailureSignature,
+  extractOriginalErrorIdentity,
   isDeterminateRequestShapeText,
   isIndeterminate4xx,
 } from '../../services/upstreamFailureSignals.js';
@@ -562,34 +563,6 @@ export function createSurfaceFailureToolkit(input: {
   });
   const seenIndeterminateSignatures = new Set<string>();
   let indeterminateAttempts = 0;
-
-  /**
-   * Pulls `error.type` / `error.code` out of an upstream body.
-   *
-   * `summarizeUpstreamError()` keeps `error.message` and drops type/code whenever a
-   * message exists, so these are the stable identity fields that only survive in the
-   * raw payload — and they are what the repeat-rejection signature is built from.
-   */
-  const extractOriginalErrorIdentity = (payload: unknown): {
-    type?: string;
-    code?: string;
-  } => {
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
-    const record = payload as Record<string, unknown>;
-    const error = record.error && typeof record.error === 'object' && !Array.isArray(record.error)
-      ? record.error as Record<string, unknown>
-      : record;
-    const type = typeof error.type === 'string' ? error.type.trim() : '';
-    const code = typeof error.code === 'string'
-      ? error.code.trim()
-      : typeof error.code === 'number'
-        ? String(error.code)
-        : '';
-    return {
-      ...(type ? { type } : {}),
-      ...(code ? { code } : {}),
-    };
-  };
 
   /**
    * Decides whether an indeterminate 4xx earns another channel.
