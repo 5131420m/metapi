@@ -11,6 +11,7 @@ import { parseProxyUsage } from '../../services/proxyUsageParser.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
 import {
   createNonStreamFailureAccumulator,
+  createNonStreamRetryBudget,
   parseNonStreamOriginalPayload,
   resolveNonStreamTerminalFailure,
   resolveNonStreamTerminalScope,
@@ -26,7 +27,7 @@ import { summarizeUpstreamError } from './upstreamError.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../proxy-core/downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../../proxy-core/firstByteTimeout.js';
-import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import {
   buildForcedChannelUnavailableMessage,
@@ -63,10 +64,13 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
       requestedModel,
       downstreamApiKeyId,
     });
+    const retryBudget = createNonStreamRetryBudget({ downstreamApiKeyId });
     let retryCount = 0;
     const siteApiEndpointRequestScopeId = randomUUID();
 
-    while (retryCount <= getProxyMaxChannelRetries()) {
+    // Bound by the raised ceiling, never the base: an authorized indeterminate probe the
+    // loop then refuses would exit the handler without sending anything.
+    while (retryCount <= retryBudget.maxRetries) {
       const selected = await selectProxyChannelForAttempt({
         requestedModel,
         downstreamPolicy,
@@ -167,14 +171,16 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
             terminalScope: resolveNonStreamTerminalScope({
               retryable: true,
               retryCount,
-              maxRetries: getProxyMaxChannelRetries(),
+              maxRetries: retryBudget.baseMaxRetries,
             }),
             attemptedChannelCount: excludeChannelIds.length,
-            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+            maxChannelAttempts: forcedChannelId === null ? retryBudget.baseMaxRetries + 1 : 1,
             channelId: selected.channel.id,
             upstreamModel,
           };
-          if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+          // Base budget only. A malformed 2xx body is reported as 502, which is never an
+          // indeterminate 4xx, so the probe has nothing to add here.
+          if (canRetryChannelSelection(retryCount, forcedChannelId, retryBudget.baseMaxRetries)) {
             failureAccumulator.record(malformedAttempt);
             retryCount++;
             continue;
@@ -267,14 +273,35 @@ export async function embeddingsProxyRoute(app: FastifyInstance) {
           terminalScope: resolveNonStreamTerminalScope({
             retryable,
             retryCount,
-            maxRetries: getProxyMaxChannelRetries(),
+            maxRetries: retryBudget.baseMaxRetries,
           }),
           attemptedChannelCount: excludeChannelIds.length,
-          maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+          maxChannelAttempts: forcedChannelId === null ? retryBudget.baseMaxRetries + 1 : 1,
           channelId: selected.channel.id,
           upstreamModel,
         };
-        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
+        // Ordinary retryable failure: base budget only. The raised ceiling belongs to the
+        // indeterminate probe below, or enabling that feature would quietly grant every
+        // failure type an extra upstream attempt.
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId, retryBudget.baseMaxRetries)) {
+          failureAccumulator.record(failedAttempt);
+          retryCount++;
+          continue;
+        }
+        // Unexplained 4xx: spend one more channel to tell a malformed body apart from a
+        // channel that refuses one a sibling accepts. Reached only after the ordinary
+        // predicate declined, which is how a determinate 4xx arrives here too — hence the
+        // probe repeats the request-shape gate itself.
+        if (
+          status > 0
+          && retryBudget.maybeRetryIndeterminate({
+            status,
+            retryCount,
+            errText: errorText,
+            originalPayload: failedAttempt.originalPayload,
+          })
+          && canRetryChannelSelection(retryCount, forcedChannelId, retryBudget.maxRetries)
+        ) {
           failureAccumulator.record(failedAttempt);
           retryCount++;
           continue;

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { config } from '../../config.js';
 import {
   createNonStreamFailureAccumulator,
+  createNonStreamRetryBudget,
   resolveNonStreamTerminalFailure,
   resolveNonStreamTerminalScope,
 } from './nonStreamSurface.js';
@@ -302,5 +303,128 @@ describe('non-stream failure accumulator', () => {
       originalPayload,
       terminalScope: 'attempt',
     })).toEqual({ status: 400, payload: originalPayload });
+  });
+});
+
+describe('createNonStreamRetryBudget', () => {
+  const optIn = (overrides?: { includePayloadTooLarge?: boolean; maxAttempts?: number }) => {
+    config.downstreamErrorPolicy = {
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+      indeterminateRetry: {
+        enabled: true,
+        includePayloadTooLarge: overrides?.includePayloadTooLarge ?? false,
+        maxAttempts: overrides?.maxAttempts ?? 3,
+      },
+    };
+  };
+
+  const probe = (
+    budget: ReturnType<typeof createNonStreamRetryBudget>,
+    args: { status?: number; retryCount?: number; errText?: string; originalPayload?: unknown },
+  ) => budget.maybeRetryIndeterminate({
+    status: args.status ?? 400,
+    retryCount: args.retryCount ?? 0,
+    errText: args.errText ?? 'refused',
+    originalPayload: args.originalPayload,
+  });
+
+  it('leaves the bound at the base when the key did not opt in', () => {
+    // Out of scope must be byte-identical to the legacy shape: same loop bound, no probe.
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    expect(budget.maxRetries).toBe(budget.baseMaxRetries);
+    expect(probe(budget, {})).toBe(false);
+  });
+
+  it('raises the bound only for a listed key', () => {
+    optIn();
+    const listed = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    const unlisted = createNonStreamRetryBudget({ downstreamApiKeyId: 99 });
+    const anonymous = createNonStreamRetryBudget({ downstreamApiKeyId: null });
+
+    expect(listed.maxRetries).toBeGreaterThan(listed.baseMaxRetries);
+    expect(unlisted.maxRetries).toBe(unlisted.baseMaxRetries);
+    expect(anonymous.maxRetries).toBe(anonymous.baseMaxRetries);
+    expect(probe(unlisted, {})).toBe(false);
+    expect(probe(anonymous, {})).toBe(false);
+  });
+
+  it('never returns a bound below the base, even with a large operator budget', () => {
+    // A deployment may configure more ordinary attempts than the global cap. Clamping
+    // blindly would make opting into a resilience feature REDUCE the operator's budget.
+    optIn({ maxAttempts: 1 });
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    expect(budget.maxRetries).toBeGreaterThanOrEqual(budget.baseMaxRetries);
+  });
+
+  it('probes an unexplained 400/422 and declines a status with a clear meaning', () => {
+    optIn();
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    expect(probe(budget, { status: 400, errText: 'refused one' })).toBe(true);
+    expect(probe(budget, { status: 422, errText: 'refused two' })).toBe(true);
+    expect(probe(budget, { status: 502, errText: 'bad gateway' })).toBe(false);
+    expect(probe(budget, { status: 401, errText: 'invalid api key' })).toBe(false);
+  });
+
+  it('gates 413 behind the payload-size opt-in', () => {
+    optIn({ includePayloadTooLarge: false });
+    expect(probe(createNonStreamRetryBudget({ downstreamApiKeyId: 12 }), {
+      status: 413,
+      errText: 'request entity too large',
+    })).toBe(false);
+
+    optIn({ includePayloadTooLarge: true });
+    expect(probe(createNonStreamRetryBudget({ downstreamApiKeyId: 12 }), {
+      status: 413,
+      errText: 'request entity too large',
+    })).toBe(true);
+  });
+
+  it('refuses to spend a probe on a named request-shape defect', () => {
+    optIn();
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    expect(probe(budget, { errText: 'messages: missing required field' })).toBe(false);
+    expect(probe(budget, { errText: 'invalid json' })).toBe(false);
+    expect(budget.probeCount).toBe(0);
+  });
+
+  it('declines a repeated rejection identity without consuming budget', () => {
+    optIn();
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    const payload = { error: { type: 'channel_refusal' } };
+
+    expect(probe(budget, { errText: 'refused (request_id=aabbccdd11223344)', originalPayload: payload })).toBe(true);
+    // Same identity, fresh per-attempt request id: still the same rejection.
+    expect(probe(budget, { errText: 'refused (request_id=99887766554433aa)', originalPayload: payload })).toBe(false);
+    expect(budget.probeCount).toBe(1);
+  });
+
+  it('does not record a signature on a declined probe', () => {
+    // A decline must leave the seen-set untouched, or an attempt that was never retried
+    // would suppress a later legitimate probe of the identical rejection.
+    optIn();
+    const spent = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    const payload = { error: { type: 'channel_refusal' } };
+
+    // Declined for being out of loop budget, not for its signature.
+    expect(probe(spent, { retryCount: 99, originalPayload: payload })).toBe(false);
+    expect(probe(spent, { retryCount: 0, originalPayload: payload })).toBe(true);
+  });
+
+  it('stops at its own attempt budget', () => {
+    optIn({ maxAttempts: 1 });
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    expect(probe(budget, { errText: 'refused one' })).toBe(true);
+    expect(probe(budget, { errText: 'refused two' })).toBe(false);
+    expect(budget.probeCount).toBe(1);
+  });
+
+  it('stops at the loop bound so it can never authorize a retry the loop refuses', () => {
+    // This is the hang guard: authorizing past the bound drops the request out of the
+    // handler with nothing sent.
+    optIn({ maxAttempts: 9 });
+    const budget = createNonStreamRetryBudget({ downstreamApiKeyId: 12 });
+    expect(probe(budget, { retryCount: budget.maxRetries, errText: 'refused at bound' })).toBe(false);
+    expect(probe(budget, { retryCount: budget.maxRetries - 1, errText: 'refused below bound' })).toBe(true);
   });
 });

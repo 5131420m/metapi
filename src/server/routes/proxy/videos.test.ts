@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { config } from '../../config.js';
 
@@ -665,5 +665,200 @@ describe('/v1/videos routes', () => {
     } finally {
       config.downstreamErrorPolicy = previousPolicy;
     }
+  });
+
+  describe('indeterminate 4xx channel retry', () => {
+    // An unexplained 400/422 cannot be told apart from "this channel refuses a body a
+    // sibling accepts" by looking at the response, so an opted-in key spends one more
+    // channel to find out. `shouldRetryProxyRequest` returning false is not incidental
+    // setup here: it is exactly how control reaches this path in production.
+    const optIn = (overrides?: { includePayloadTooLarge?: boolean; maxAttempts?: number }) => {
+      config.downstreamErrorPolicy = {
+        mode: 'resilient',
+        downstreamApiKeyIds: [12],
+        indeterminateRetry: {
+          enabled: true,
+          includePayloadTooLarge: overrides?.includePayloadTooLarge ?? false,
+          maxAttempts: overrides?.maxAttempts ?? 3,
+        },
+      };
+      proxyAuthContext = {
+        token: 'sk-managed',
+        source: 'managed',
+        keyId: 12,
+        keyName: 'dedicated',
+        policy: {},
+      };
+      shouldRetryProxyRequestMock.mockReturnValue(false);
+      selectNextChannelMock.mockImplementation(() => ({
+        channel: { id: 12, routeId: 22 },
+        site: { id: 45, name: 'other-site', url: 'https://other.example.com', platform: 'openai' },
+        account: { id: 34, username: 'other-user' },
+        tokenName: 'default',
+        tokenValue: 'sk-other',
+        actualModel: 'sora-2',
+      }));
+    };
+
+    // Fresh Response per call — a single instance has its body consumed after one read.
+    const reply4xx = (bodies: string[], status = 400) => {
+      let call = 0;
+      fetchMock.mockImplementation(async () => {
+        const body = bodies[Math.min(call, bodies.length - 1)];
+        call += 1;
+        return new Response(body, {
+          status,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+    };
+
+    const createVideo = () => app.inject({
+      method: 'POST',
+      url: '/v1/videos',
+      payload: { model: 'sora-2', prompt: 'a cat walking' },
+    });
+
+    let previousPolicy: typeof config.downstreamErrorPolicy;
+
+    beforeEach(() => {
+      previousPolicy = structuredClone(config.downstreamErrorPolicy);
+    });
+
+    afterEach(() => {
+      config.downstreamErrorPolicy = previousPolicy;
+    });
+
+    it('keeps the loop bound and the retry guard in step while spending the raised budget', async () => {
+      // The raised budget has to reach the `while` bound, not just the guards. If a guard
+      // authorizes a probe the loop then refuses, the handler falls out with nothing sent:
+      // a hung socket in production, and — measured — a bogus empty 200 under `inject`.
+      // So the fallthrough signature is a 200 where a failure was due, which is why this
+      // asserts the upstream's own status rather than merely "some number came back".
+      optIn();
+      reply4xx([
+        '{"error":{"message":"refused by channel one","type":"channel_one_refusal"}}',
+        '{"error":{"message":"refused by channel two","type":"channel_two_refusal"}}',
+        '{"error":{"message":"refused by channel three","type":"channel_three_refusal"}}',
+        '{"error":{"message":"refused by channel four","type":"channel_four_refusal"}}',
+      ]);
+
+      const response = await createVideo();
+
+      expect(response.statusCode).toBe(400);
+      expect(response.body.length).toBeGreaterThan(0);
+      // base retries (2) + feature budget (3), capped by MAX_TOTAL_CHANNEL_ATTEMPTS (4).
+      expect(fetchMock.mock.calls.length).toBe(4);
+    });
+
+    it('still hands an unexplained 400 back to the caller once the probes are spent', async () => {
+      // Spending channels must not change WHAT the caller is told: a 4xx that was never
+      // explained still belongs to them verbatim, per the deterministic-request-failure
+      // guard in downstreamErrorPolicy. The probe buys a second opinion, not a rewrite.
+      optIn();
+      reply4xx([
+        '{"error":{"message":"refused by channel one","type":"channel_one_refusal"}}',
+        '{"error":{"message":"refused by channel two","type":"channel_two_refusal"}}',
+        '{"error":{"message":"refused by channel three","type":"channel_three_refusal"}}',
+        '{"error":{"message":"refused by channel four","type":"channel_four_refusal"}}',
+      ]);
+
+      const response = await createVideo();
+
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: { message: expect.stringContaining('refused by channel four') },
+      });
+    });
+
+    it('stops probing once the same rejection repeats, instead of spending the budget', async () => {
+      // A repeat proves the body is at fault, not the channel. Without signature dedup
+      // this would burn all four attempts re-uploading a payload nobody will accept.
+      optIn();
+      reply4xx(['{"error":{"message":"refused everywhere","type":"same_refusal"}}']);
+
+      const response = await createVideo();
+
+      expect(fetchMock.mock.calls.length).toBe(2);
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('does not probe a 400 that names a request-shape defect', async () => {
+      // `missing required` is determinate: every channel rejects it identically, so a
+      // probe only re-uploads it. One attempt, answer straight back.
+      optIn();
+      reply4xx(['{"error":{"message":"messages: missing required field"}}']);
+
+      const response = await createVideo();
+
+      expect(fetchMock.mock.calls.length).toBe(1);
+      expect(response.statusCode).toBe(400);
+      expect(response.json()).toMatchObject({
+        error: { message: expect.stringContaining('missing required field') },
+      });
+    });
+
+    it('leaves 413 alone until the payload-size opt-in is set', async () => {
+      // Retrying 413 re-uploads the whole body and the first upstream may already have
+      // billed for it, so it needs its own switch rather than riding along with 400/422.
+      optIn({ includePayloadTooLarge: false });
+      reply4xx(['{"error":{"message":"request entity too large"}}'], 413);
+
+      const response = await createVideo();
+
+      expect(fetchMock.mock.calls.length).toBe(1);
+      expect(response.statusCode).toBe(413);
+    });
+
+    it('probes 413 once the payload-size opt-in is set', async () => {
+      optIn({ includePayloadTooLarge: true });
+      reply4xx([
+        '{"error":{"message":"too large for channel one","type":"channel_one_limit"}}',
+        '{"error":{"message":"too large for channel two","type":"channel_two_limit"}}',
+      ], 413);
+
+      const response = await createVideo();
+
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+      expect(response.statusCode).toBe(413);
+    });
+
+    it('gives an out-of-scope key the unchanged single-attempt behaviour', async () => {
+      // Same 400, same everything — only the key is not listed. The feature is a per-key
+      // service level, so an unlisted key must see exactly the legacy shape.
+      optIn();
+      config.downstreamErrorPolicy = {
+        ...config.downstreamErrorPolicy,
+        downstreamApiKeyIds: [99],
+      };
+      reply4xx([
+        '{"error":{"message":"refused by channel one","type":"channel_one_refusal"}}',
+        '{"error":{"message":"refused by channel two","type":"channel_two_refusal"}}',
+      ]);
+
+      const response = await createVideo();
+
+      expect(fetchMock.mock.calls.length).toBe(1);
+      expect(response.statusCode).toBe(400);
+    });
+
+    it('does not let the raised budget inflate an ordinary retryable failure', async () => {
+      // The raised ceiling belongs to the indeterminate path only. A 502 keeps the base
+      // budget, or enabling a resilience feature would quietly hand every failure type an
+      // extra upstream attempt.
+      optIn();
+      shouldRetryProxyRequestMock.mockReturnValue(true);
+      fetchMock.mockImplementation(async () => new Response('bad gateway', {
+        status: 502,
+        headers: { 'content-type': 'text/plain' },
+      }));
+
+      const response = await createVideo();
+
+      // base retries (2) + 1 = 3 attempts, NOT the raised 4.
+      expect(fetchMock.mock.calls.length).toBe(3);
+      // A rewritten pool answer, not the empty 200 that a loop fallthrough produces.
+      expect(response.statusCode).toBe(503);
+    });
   });
 });

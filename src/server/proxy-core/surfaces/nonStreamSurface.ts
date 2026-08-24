@@ -3,11 +3,21 @@ import {
   buildCanonicalRoutingFailure,
   buildCanonicalUpstreamFailure,
   resolveAggregatedPublicTerminalFailure,
+  resolveIndeterminateRetryCeiling,
+  resolveIndeterminateRetryPlan,
   resolvePublicTerminalFailure,
   serializePublicTerminalFailure,
+  MAX_TOTAL_CHANNEL_ATTEMPTS,
   type CanonicalFailureProtocol,
   type CanonicalProxyFailure,
 } from '../../services/downstreamErrorPolicy.js';
+import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
+import {
+  buildFailureSignature,
+  extractOriginalErrorIdentity,
+  isDeterminateRequestShapeText,
+  isIndeterminate4xx,
+} from '../../services/upstreamFailureSignals.js';
 
 export type NonStreamTerminalFailureInput = {
   protocol: CanonicalFailureProtocol;
@@ -155,6 +165,92 @@ export function createNonStreamFailureAccumulator(input: {
     },
     get recordedCount(): number {
       return failures.length;
+    },
+  };
+}
+
+/**
+ * Per-request attempt budget for the hand-rolled non-stream retry loops, including the
+ * indeterminate-4xx probe.
+ *
+ * Two budgets, deliberately not one. An ordinary retryable failure keeps
+ * `baseMaxRetries`; only an unexplained 400/422 (413 opt-in) may spend the raised
+ * `maxRetries`. Collapsing them would hand every failure type an extra upstream attempt
+ * the moment a key opted into a resilience feature.
+ *
+ * `maxRetries` MUST be the `while` loop bound. `canRetryChannelSelection()` falls back to
+ * the global bound when given no third argument, so authorizing a probe the loop then
+ * refuses drops the request out of the handler with no response sent — a hang, which is
+ * strictly worse than the feature not working. Loop bound, ordinary guard and probe guard
+ * are three halves of one decision and have to move together.
+ *
+ * Mirrors `sharedSurface.ts`'s `maybeRetryIndeterminate` gate-for-gate rather than
+ * reimplementing the policy: same plan resolution, same ordering, same global cap.
+ */
+export function createNonStreamRetryBudget(input: {
+  downstreamApiKeyId?: number | null;
+}) {
+  const policy = config.downstreamErrorPolicy;
+  const baseMaxRetries = getProxyMaxChannelRetries();
+  const plan = resolveIndeterminateRetryPlan(policy, input.downstreamApiKeyId);
+  const ceiling = resolveIndeterminateRetryCeiling({
+    baseMaxRetries,
+    policy,
+    downstreamApiKeyId: input.downstreamApiKeyId,
+  });
+  const seenSignatures = new Set<string>();
+  let probesSpent = 0;
+
+  return {
+    /** Bound for ordinary retryable failures. Never raised by the probe feature. */
+    baseMaxRetries,
+    /** Bound the `while` loop and the probe's own guard must both use. */
+    maxRetries: ceiling,
+    /**
+     * True when this failure earns one more channel purely because the response cannot
+     * tell a malformed body from a channel-specific refusal.
+     *
+     * Call only AFTER the ordinary retry predicate has declined: a determinate 4xx makes
+     * `shouldRetryProxyRequest` return false, and that is precisely how control reaches
+     * here, so this repeats the request-shape gate rather than relying on that ordering.
+     *
+     * Budget and signature checks run before the seen-set is mutated — a decline must not
+     * record a signature, or an attempt that was never retried would suppress a later
+     * legitimate probe of the same rejection.
+     */
+    maybeRetryIndeterminate(args: {
+      status: number;
+      retryCount: number;
+      errText: string;
+      originalPayload?: unknown;
+    }): boolean {
+      if (!plan.enabled) return false;
+      if (!isIndeterminate4xx(args.status, {
+        includePayloadTooLarge: plan.includePayloadTooLarge,
+      })) {
+        return false;
+      }
+      // Summarized text only. A `"type":"validation_error"` envelope wrapping a
+      // channel-level fault is exactly the case this exists to retry.
+      if (isDeterminateRequestShapeText(args.errText)) return false;
+      if (probesSpent >= plan.maxAttempts) return false;
+      // One bound, two constraints: stay inside the loop bound AND inside the global
+      // attempt cap, so the two budgets add rather than multiply.
+      if (args.retryCount >= Math.min(ceiling, MAX_TOTAL_CHANNEL_ATTEMPTS - 1)) return false;
+      const identity = extractOriginalErrorIdentity(args.originalPayload);
+      const signature = buildFailureSignature({
+        status: args.status,
+        type: identity.type,
+        code: identity.code,
+        message: args.errText,
+      });
+      if (seenSignatures.has(signature)) return false;
+      seenSignatures.add(signature);
+      probesSpent += 1;
+      return true;
+    },
+    get probeCount(): number {
+      return probesSpent;
     },
   };
 }
