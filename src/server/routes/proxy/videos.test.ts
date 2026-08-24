@@ -1,6 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { config } from '../../config.js';
+
 const fetchMock = vi.fn();
 const selectChannelMock = vi.fn();
 const selectNextChannelMock = vi.fn();
@@ -17,6 +19,14 @@ const deleteProxyVideoTaskByPublicIdMock = vi.fn();
 const refreshProxyVideoTaskSnapshotMock = vi.fn();
 const resolveProxyVideoTaskSiteMock = vi.fn();
 let siteApiEndpointRows: Array<Record<string, unknown>> = [];
+// Defaults to null so every existing test keeps the unauthenticated shape (no downstream
+// key id, so the resilient policy never targets the failure). Only the aggregation test
+// opts in.
+let proxyAuthContext: unknown = null;
+
+vi.mock('../../middleware/auth.js', () => ({
+  getProxyAuthContext: () => proxyAuthContext,
+}));
 
 vi.mock('undici', async () => {
   const actual = await vi.importActual<typeof import('undici')>('undici');
@@ -135,6 +145,7 @@ describe('/v1/videos routes', () => {
     refreshProxyVideoTaskSnapshotMock.mockReset();
     resolveProxyVideoTaskSiteMock.mockReset();
     siteApiEndpointRows = [];
+    proxyAuthContext = null;
     shouldRetryProxyRequestMock.mockReturnValue(false);
 
     selectChannelMock.mockReturnValue({
@@ -546,5 +557,113 @@ describe('/v1/videos routes', () => {
       'Upstream returned HTTP 400: openai_error',
       rawBody,
     );
+  });
+
+  it('answers a mixed-cause multi-channel request from every attempt, not just the last', async () => {
+    // Only this test authenticates: an opted-in downstream key is what puts the failure
+    // in the resilient policy's scope, which is where aggregation becomes observable.
+    const previousPolicy = structuredClone(config.downstreamErrorPolicy);
+    config.downstreamErrorPolicy = { mode: 'resilient', downstreamApiKeyIds: [12] };
+    proxyAuthContext = {
+      token: 'sk-managed',
+      source: 'managed',
+      keyId: 12,
+      keyName: 'dedicated',
+      policy: {},
+    };
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { id: 45, name: 'other-site', url: 'https://other.example.com', platform: 'openai' },
+      account: { id: 34, username: 'other-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-other',
+      actualModel: 'sora-2',
+    });
+    // Channel A is rate limited, the rest are unauthenticated: two unrelated causes, so
+    // relaying only the final attempt would report "auth" for a request that also died of
+    // a rate limit. Each call must build a FRESH Response — a single instance can only be
+    // read once, and the later attempts would then see an empty body (a different cause,
+    // which would make this pass for the wrong reason).
+    let attempt = 0;
+    fetchMock.mockImplementation(async () => {
+      attempt += 1;
+      return attempt === 1
+        ? new Response(JSON.stringify({ error: { message: 'rate limit exceeded' } }), {
+          status: 429,
+          headers: { 'content-type': 'application/json' },
+        })
+        : new Response(JSON.stringify({ error: { message: 'invalid api key' } }), {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+        });
+    });
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/videos',
+        payload: { model: 'sora-2', prompt: 'a cat walking' },
+      });
+
+      expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          message: 'All configured upstream channels are currently unavailable.',
+          type: 'server_error',
+          code: 'metapi_upstream_pool_exhausted',
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
+  });
+
+  it('keeps the specific cause when every channel failed the same way', async () => {
+    const previousPolicy = structuredClone(config.downstreamErrorPolicy);
+    config.downstreamErrorPolicy = { mode: 'resilient', downstreamApiKeyIds: [12] };
+    proxyAuthContext = {
+      token: 'sk-managed',
+      source: 'managed',
+      keyId: 12,
+      keyName: 'dedicated',
+      policy: {},
+    };
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { id: 45, name: 'other-site', url: 'https://other.example.com', platform: 'openai' },
+      account: { id: 34, username: 'other-user' },
+      tokenName: 'default',
+      tokenValue: 'sk-other',
+      actualModel: 'sora-2',
+    });
+    // Fresh Response per call: reusing one instance leaves the body consumed after the
+    // first read, and the resulting empty message infers a different cause.
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({
+      error: { message: 'rate limit exceeded' },
+    }), { status: 429, headers: { 'content-type': 'application/json' } }));
+
+    try {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/videos',
+        payload: { model: 'sora-2', prompt: 'a cat walking' },
+      });
+
+      // One shared cause must keep its specific answer instead of collapsing into the
+      // generic pool-exhausted one.
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({
+        error: {
+          message: 'All configured upstream channels are temporarily unavailable.',
+          type: 'server_error',
+          code: 'metapi_upstream_rate_limited',
+        },
+      });
+    } finally {
+      config.downstreamErrorPolicy = previousPolicy;
+    }
   });
 });

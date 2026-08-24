@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { config } from '../../config.js';
-import { resolveNonStreamTerminalFailure, resolveNonStreamTerminalScope } from './nonStreamSurface.js';
+import {
+  createNonStreamFailureAccumulator,
+  resolveNonStreamTerminalFailure,
+  resolveNonStreamTerminalScope,
+} from './nonStreamSurface.js';
 
 const originalPolicy = structuredClone(config.downstreamErrorPolicy);
 
@@ -171,5 +175,132 @@ describe('non-stream terminal scope', () => {
         maxRetries: 3,
       }),
     })).toEqual({ status: 502, payload: originalPayload });
+  });
+});
+
+describe('non-stream failure accumulator', () => {
+  const resilientForKey12 = () => {
+    config.downstreamErrorPolicy = {
+      mode: 'resilient',
+      downstreamApiKeyIds: [12],
+    };
+  };
+
+  it('collapses mixed causes across channels into one pool-exhausted answer', () => {
+    resilientForKey12();
+    const acc = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+    });
+
+    // Channel A hit a rate limit, channel B an auth failure. Reporting only the last one
+    // told the caller "auth" when the request actually died of two unrelated causes.
+    acc.record({
+      status: 429,
+      message: 'rate limit exceeded',
+      terminalScope: 'attempt_budget_exhausted',
+    });
+
+    expect(acc.resolveTerminal({
+      status: 401,
+      message: 'invalid api key',
+      terminalScope: 'attempt_budget_exhausted',
+    })).toEqual({
+      status: 503,
+      payload: { error: {
+        message: 'All configured upstream channels are currently unavailable.',
+        type: 'server_error',
+        code: 'metapi_upstream_pool_exhausted',
+      } },
+    });
+    expect(acc.recordedCount).toBe(2);
+  });
+
+  it('keeps the specific cause when every channel failed the same way', () => {
+    resilientForKey12();
+    const acc = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+    });
+    acc.record({
+      status: 429,
+      message: 'rate limit exceeded',
+      terminalScope: 'attempt_budget_exhausted',
+    });
+
+    expect(acc.resolveTerminal({
+      status: 429,
+      message: 'rate limit exceeded',
+      terminalScope: 'attempt_budget_exhausted',
+    })).toEqual({
+      status: 503,
+      payload: { error: {
+        message: 'All configured upstream channels are temporarily unavailable.',
+        type: 'server_error',
+        code: 'metapi_upstream_rate_limited',
+      } },
+    });
+  });
+
+  it('relays a single unexhausted attempt verbatim', () => {
+    resilientForKey12();
+    const acc = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+    });
+    const originalPayload = { error: { message: 'bad gateway', type: 'server_error' } };
+
+    expect(acc.resolveTerminal({
+      status: 502,
+      message: 'bad gateway',
+      originalPayload,
+      terminalScope: resolveNonStreamTerminalScope({
+        retryable: true,
+        retryCount: 0,
+        maxRetries: 3,
+      }),
+    })).toEqual({ status: 502, payload: originalPayload });
+    expect(acc.recordedCount).toBe(1);
+  });
+
+  it('leaves a mixed-cause request untouched outside the opted-in key scope', () => {
+    resilientForKey12();
+    const acc = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 13,
+    });
+    const originalPayload = { error: { message: 'invalid api key' } };
+    acc.record({ status: 429, message: 'rate limit exceeded', terminalScope: 'attempt_budget_exhausted' });
+
+    expect(acc.resolveTerminal({
+      status: 401,
+      message: 'invalid api key',
+      originalPayload,
+      terminalScope: 'attempt_budget_exhausted',
+    })).toEqual({ status: 401, payload: originalPayload });
+  });
+
+  it('keeps a determinate request defect verbatim even after several channels failed', () => {
+    resilientForKey12();
+    const acc = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel: 'gpt-5.6',
+      downstreamApiKeyId: 12,
+    });
+    const originalPayload = { error: { message: 'messages: missing required field' } };
+    acc.record({ status: 429, message: 'rate limit exceeded', terminalScope: 'attempt_budget_exhausted' });
+
+    // The caller's own malformed request must not be masked as a 503 just because the
+    // aggregate saw mixed causes; a 4xx request defect is theirs to fix.
+    expect(acc.resolveTerminal({
+      status: 400,
+      message: 'messages: missing required field',
+      originalPayload,
+      terminalScope: 'attempt',
+    })).toEqual({ status: 400, payload: originalPayload });
   });
 });

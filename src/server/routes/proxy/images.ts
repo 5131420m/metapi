@@ -9,6 +9,7 @@ import { estimateProxyCost } from '../../services/modelPricingService.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
 import {
+  createNonStreamFailureAccumulator,
   parseNonStreamOriginalPayload,
   resolveNonStreamTerminalFailure,
   resolveNonStreamTerminalScope,
@@ -54,6 +55,11 @@ export async function imagesProxyRoute(app: FastifyInstance) {
     });
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
+    const failureAccumulator = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel,
+      downstreamApiKeyId,
+    });
     let retryCount = 0;
     const siteApiEndpointRequestScopeId = randomUUID();
 
@@ -147,20 +153,9 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             false,
             firstByteLatencyMs,
           );
-          if (canRetryChannelSelection(retryCount, forcedChannelId)) {
-            retryCount++;
-            continue;
-          }
-          await reportProxyAllFailed({
-            model: requestedModel,
-            reason: data.message,
-          });
-          const terminal = resolveNonStreamTerminalFailure({
-            protocol: 'openai',
-            requestedModel,
+          const upstreamErrorAttempt = {
             status: 502,
             message: data.message,
-            downstreamApiKeyId,
             originalPayload: parseNonStreamOriginalPayload(text),
             terminalScope: resolveNonStreamTerminalScope({
               retryable: true,
@@ -169,7 +164,19 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             }),
             attemptedChannelCount: excludeChannelIds.length,
             maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+            channelId: selected.channel.id,
+            upstreamModel,
+          };
+          if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+            failureAccumulator.record(upstreamErrorAttempt);
+            retryCount++;
+            continue;
+          }
+          await reportProxyAllFailed({
+            model: requestedModel,
+            reason: data.message,
           });
+          const terminal = failureAccumulator.resolveTerminal(upstreamErrorAttempt);
           return reply.code(terminal.status).send(terminal.payload);
         }
 
@@ -244,20 +251,9 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           });
         }
         const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
-        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
-          retryCount++;
-          continue;
-        }
-        await reportProxyAllFailed({
-          model: requestedModel,
-          reason: errorText || 'network failure',
-        });
-        const terminal = resolveNonStreamTerminalFailure({
-          protocol: 'openai',
-          requestedModel,
+        const failedAttempt = {
           status: status || 502,
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
-          downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
           terminalScope: resolveNonStreamTerminalScope({
             retryable,
@@ -266,7 +262,19 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+          channelId: selected.channel.id,
+          upstreamModel,
+        };
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
+          failureAccumulator.record(failedAttempt);
+          retryCount++;
+          continue;
+        }
+        await reportProxyAllFailed({
+          model: requestedModel,
+          reason: errorText || 'network failure',
         });
+        const terminal = failureAccumulator.resolveTerminal(failedAttempt);
         return reply.code(terminal.status).send(terminal.payload);
       }
     }
@@ -296,6 +304,11 @@ export async function imagesProxyRoute(app: FastifyInstance) {
     });
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
+    const failureAccumulator = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel,
+      downstreamApiKeyId,
+    });
     let retryCount = 0;
     const siteApiEndpointRequestScopeId = randomUUID();
 
@@ -404,20 +417,9 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             false,
             firstByteLatencyMs,
           );
-          if (canRetryChannelSelection(retryCount, forcedChannelId)) {
-            retryCount++;
-            continue;
-          }
-          await reportProxyAllFailed({
-            model: requestedModel,
-            reason: data.message,
-          });
-          const terminal = resolveNonStreamTerminalFailure({
-            protocol: 'openai',
-            requestedModel,
+          const upstreamErrorAttempt = {
             status: 502,
             message: data.message,
-            downstreamApiKeyId,
             originalPayload: parseNonStreamOriginalPayload(text),
             terminalScope: resolveNonStreamTerminalScope({
               retryable: true,
@@ -426,7 +428,19 @@ export async function imagesProxyRoute(app: FastifyInstance) {
             }),
             attemptedChannelCount: excludeChannelIds.length,
             maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+            channelId: selected.channel.id,
+            upstreamModel,
+          };
+          if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+            failureAccumulator.record(upstreamErrorAttempt);
+            retryCount++;
+            continue;
+          }
+          await reportProxyAllFailed({
+            model: requestedModel,
+            reason: data.message,
           });
+          const terminal = failureAccumulator.resolveTerminal(upstreamErrorAttempt);
           return reply.code(terminal.status).send(terminal.payload);
         }
 
@@ -501,20 +515,9 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           });
         }
         const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
-        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
-          retryCount++;
-          continue;
-        }
-        await reportProxyAllFailed({
-          model: requestedModel,
-          reason: errorText || 'network failure',
-        });
-        const terminal = resolveNonStreamTerminalFailure({
-          protocol: 'openai',
-          requestedModel,
+        const failedAttempt = {
           status: status || 502,
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
-          downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
           terminalScope: resolveNonStreamTerminalScope({
             retryable,
@@ -523,7 +526,19 @@ export async function imagesProxyRoute(app: FastifyInstance) {
           }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+          channelId: selected.channel.id,
+          upstreamModel,
+        };
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
+          failureAccumulator.record(failedAttempt);
+          retryCount++;
+          continue;
+        }
+        await reportProxyAllFailed({
+          model: requestedModel,
+          reason: errorText || 'network failure',
         });
+        const terminal = failureAccumulator.resolveTerminal(failedAttempt);
         return reply.code(terminal.status).send(terminal.payload);
       }
     }

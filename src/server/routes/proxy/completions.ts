@@ -10,6 +10,7 @@ import { resolveProxyUsageWithSelfLogFallback } from '../../services/proxyUsageF
 import { mergeProxyUsage, parseProxyUsage, pullSseDataEvents } from '../../services/proxyUsageParser.js';
 import { ensureModelAllowedForDownstreamKey, getDownstreamRoutingPolicy, recordDownstreamCostUsage } from './downstreamPolicy.js';
 import {
+  createNonStreamFailureAccumulator,
   parseNonStreamOriginalPayload,
   resolveNonStreamTerminalFailure,
   resolveNonStreamTerminalScope,
@@ -60,6 +61,11 @@ export async function completionsProxyRoute(app: FastifyInstance) {
     const isStream = body.stream === true;
     const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
     const excludeChannelIds: number[] = [];
+    const failureAccumulator = createNonStreamFailureAccumulator({
+      protocol: 'openai',
+      requestedModel,
+      downstreamApiKeyId,
+    });
     let retryCount = 0;
     const siteApiEndpointRequestScopeId = randomUUID();
 
@@ -159,16 +165,9 @@ export async function completionsProxyRoute(app: FastifyInstance) {
               0, 0, 0, 0, null, clientContext, downstreamPath, null, true, firstByteLatencyMs,
             );
             if (streamResult.committed) return;
-            if (canRetryChannelSelection(retryCount, forcedChannelId)) {
-              retryCount++;
-              continue;
-            }
-            const terminal = resolveNonStreamTerminalFailure({
-              protocol: 'openai',
-              requestedModel,
+            const streamFailureAttempt = {
               status: 502,
               message: errorText,
-              downstreamApiKeyId,
               terminalScope: resolveNonStreamTerminalScope({
                 retryable: true,
                 retryCount,
@@ -176,7 +175,15 @@ export async function completionsProxyRoute(app: FastifyInstance) {
               }),
               attemptedChannelCount: excludeChannelIds.length,
               maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
-            });
+              channelId: selected.channel.id,
+              upstreamModel,
+            };
+            if (canRetryChannelSelection(retryCount, forcedChannelId)) {
+              failureAccumulator.record(streamFailureAttempt);
+              retryCount++;
+              continue;
+            }
+            const terminal = failureAccumulator.resolveTerminal(streamFailureAttempt);
             return reply.code(terminal.status).send(terminal.payload);
           }
           const parsedUsage = streamResult.usage;
@@ -270,7 +277,22 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           );
 
           const detectedRetryable = shouldRetryProxyRequest(failure.status, errText);
+          const detectedFailureAttempt = {
+            status: failure.status,
+            message: errText,
+            originalPayload: data,
+            terminalScope: resolveNonStreamTerminalScope({
+              retryable: detectedRetryable,
+              retryCount,
+              maxRetries: getProxyMaxChannelRetries(),
+            }),
+            attemptedChannelCount: excludeChannelIds.length,
+            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+            channelId: selected.channel.id,
+            upstreamModel,
+          };
           if (detectedRetryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
+            failureAccumulator.record(detectedFailureAttempt);
             retryCount += 1;
             continue;
           }
@@ -280,21 +302,7 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             reason: failure.reason,
           });
 
-          const terminal = resolveNonStreamTerminalFailure({
-            protocol: 'openai',
-            requestedModel,
-            status: failure.status,
-            message: errText,
-            downstreamApiKeyId,
-            originalPayload: data,
-            terminalScope: resolveNonStreamTerminalScope({
-              retryable: detectedRetryable,
-              retryCount,
-              maxRetries: getProxyMaxChannelRetries(),
-            }),
-            attemptedChannelCount: excludeChannelIds.length,
-            maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
-          });
+          const terminal = failureAccumulator.resolveTerminal(detectedFailureAttempt);
           return reply.code(terminal.status).send(terminal.payload);
         }
 
@@ -388,20 +396,9 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           });
         }
         const retryable = status > 0 ? shouldRetryProxyRequest(status, errorText, rawErrorText) : true;
-        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
-          retryCount++;
-          continue;
-        }
-        await reportProxyAllFailed({
-          model: requestedModel,
-          reason: errorText || 'network failure',
-        });
-        const terminal = resolveNonStreamTerminalFailure({
-          protocol: 'openai',
-          requestedModel,
+        const failedAttempt = {
           status: status || 502,
           message: status > 0 ? errorText : `Upstream error: ${errorText}`,
-          downstreamApiKeyId,
           originalPayload: parseNonStreamOriginalPayload(err instanceof SiteApiEndpointRequestError ? err.rawErrText : errorText),
           terminalScope: resolveNonStreamTerminalScope({
             retryable,
@@ -410,7 +407,19 @@ export async function completionsProxyRoute(app: FastifyInstance) {
           }),
           attemptedChannelCount: excludeChannelIds.length,
           maxChannelAttempts: forcedChannelId === null ? getProxyMaxChannelRetries() + 1 : 1,
+          channelId: selected.channel.id,
+          upstreamModel,
+        };
+        if (retryable && canRetryChannelSelection(retryCount, forcedChannelId)) {
+          failureAccumulator.record(failedAttempt);
+          retryCount++;
+          continue;
+        }
+        await reportProxyAllFailed({
+          model: requestedModel,
+          reason: errorText || 'network failure',
         });
+        const terminal = failureAccumulator.resolveTerminal(failedAttempt);
         return reply.code(terminal.status).send(terminal.payload);
       }
     }
