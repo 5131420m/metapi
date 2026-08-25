@@ -19,6 +19,9 @@ import { getProxyUrlFromExtraConfig } from '../../services/accountExtraConfig.js
 import { cloneFormDataWithOverrides, ensureMultipartBufferParser, parseMultipartFormData } from './multipart.js';
 import { buildUpstreamUrl } from './upstreamUrl.js';
 import { summarizeUpstreamError } from './upstreamError.js';
+import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../../proxy-core/firstByteTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../../proxy-core/responseTimeoutPolicy.js';
+import { config } from '../../config.js';
 import {
   deleteProxyVideoTaskByPublicId,
   getProxyVideoTaskByPublicId,
@@ -78,6 +81,12 @@ export async function videosProxyRoute(app: FastifyInstance) {
     const retryBudget = createNonStreamRetryBudget({ downstreamApiKeyId });
     let retryCount = 0;
     const siteApiEndpointRequestScopeId = randomUUID();
+    // Task creation is a generation job, so it takes the media budget rather than the
+    // stream-shaped first-byte one. Previously this route had no observed timeout at all.
+    const responseTimeoutMs = resolveResponseTimeoutMs(
+      resolveResponseTimeoutKind({ downstreamPath: '/v1/videos' }),
+      config,
+    );
 
     // Bound by the raised ceiling, never the base: an authorized indeterminate probe the
     // loop then refuses would exit the handler without sending anything.
@@ -113,6 +122,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
 
       try {
         const { upstream, text, baseUrl } = await runWithSiteApiEndpointPool(selected.site, async (target) => {
+          const attemptStartedAtMs = Date.now();
           const targetUrl = buildUpstreamUrl(target.baseUrl, '/v1/videos');
           const accountProxy = getProxyUrlFromExtraConfig(selected.account.extraConfig);
           const requestInit = multipartForm
@@ -136,18 +146,29 @@ export async function videosProxyRoute(app: FastifyInstance) {
                 model: upstreamModel,
               }),
             }, accountProxy);
-          const response = await fetch(targetUrl, requestInit);
+          const response = await fetchWithObservedFirstByte(
+            async (signal) => fetch(targetUrl, { ...requestInit, signal }),
+            {
+              firstByteTimeoutMs: responseTimeoutMs,
+              startedAtMs: attemptStartedAtMs,
+            },
+          );
+          const observedResponseMeta = getObservedResponseMeta(response);
+          const observedFirstByteLatencyMs = observedResponseMeta?.firstByteLatencyMs ?? null;
           const responseText = await response.text();
           if (!response.ok) {
             throw new SiteApiEndpointRequestError(summarizeUpstreamError(response.status, responseText), {
               status: response.status,
               rawErrText: responseText || null,
+              firstByteLatencyMs: observedFirstByteLatencyMs,
+              failureKind: observedResponseMeta?.timedOutBeforeFirstByte ? 'first-byte-timeout' : null,
             });
           }
           return {
             baseUrl: target.baseUrl,
             upstream: response,
             text: responseText,
+            firstByteLatencyMs: observedFirstByteLatencyMs,
           };
         }, { requestScopeId: siteApiEndpointRequestScopeId });
 

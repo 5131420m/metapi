@@ -129,6 +129,8 @@ describe('Settings route cooldown cap', () => {
         },
         routingFallbackUnitCost: 1,
         proxyFirstByteTimeoutSec: 0,
+        proxyNonStreamTimeoutSec: 0,
+        proxyMediaTimeoutSec: 0,
         tokenRouterFailureCooldownMaxSec: 10,
         disableCrossProtocolFallback: false,
         channelRecoveryProbeEnabled: false,
@@ -231,10 +233,61 @@ describe('Settings route cooldown cap', () => {
         },
         routingFallbackUnitCost: 1,
         proxyFirstByteTimeoutSec: 7,
+        proxyNonStreamTimeoutSec: 0,
+        proxyMediaTimeoutSec: 0,
         tokenRouterFailureCooldownMaxSec: 30 * 24 * 60 * 60,
         disableCrossProtocolFallback: false,
         channelRecoveryProbeEnabled: false,
       });
+    } finally {
+      root?.unmount();
+    }
+  });
+
+  it('saves the per-shape response timeouts independently', async () => {
+    let root!: ReactTestRenderer;
+    try {
+      await act(async () => {
+        root = create(
+          <MemoryRouter>
+            <ToastProvider>
+              <Settings />
+            </ToastProvider>
+          </MemoryRouter>,
+        );
+      });
+      await flushMicrotasks();
+
+      const numberInput = (label: string) => root.root.find((node) => (
+        node.type === 'input'
+        && node.props.type === 'number'
+        && node.props['aria-label'] === label
+      ));
+
+      await act(async () => {
+        numberInput('首字超时秒数').props.onChange({ target: { value: '45' } });
+        numberInput('非流式响应超时秒数').props.onChange({ target: { value: '120' } });
+        numberInput('媒体生成响应超时秒数').props.onChange({ target: { value: '600' } });
+      });
+
+      const saveButton = root.root.find((node) => (
+        node.type === 'button'
+        && typeof node.props.onClick === 'function'
+        && collectText(node).trim() === '保存路由策略'
+      ));
+
+      await act(async () => {
+        saveButton.props.onClick();
+      });
+      await flushMicrotasks();
+
+      // Each shape must travel independently — a single shared value would let one
+      // budget silently govern all three.
+      expect(apiMock.updateRuntimeSettings).toHaveBeenCalledWith(expect.objectContaining({
+        proxyFirstByteTimeoutSec: 45,
+        proxyNonStreamTimeoutSec: 120,
+        proxyMediaTimeoutSec: 600,
+      }));
     } finally {
       root?.unmount();
     }

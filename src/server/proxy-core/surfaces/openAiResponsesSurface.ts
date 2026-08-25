@@ -49,6 +49,7 @@ import {
 } from '../../transformers/gemini/generate-content/cliBridge.js';
 import { isCodexResponsesSurface } from '../cliProfiles/codexProfile.js';
 import { getObservedResponseMeta } from '../firstByteTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../responseTimeoutPolicy.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { runCodexHttpSessionTask } from '../runtime/codexHttpSessionQueue.js';
 import {
@@ -716,7 +717,14 @@ export async function handleOpenAiResponsesSurfaceRequest(
         return executeEndpointFlow({
           siteUrl: siteApiBaseUrl,
           disableCrossProtocolFallback: isCompactRequest || config.disableCrossProtocolFallback,
-          firstByteTimeoutMs: Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000)),
+          firstByteTimeoutMs: resolveResponseTimeoutMs(
+            resolveResponseTimeoutKind({
+              downstreamPath,
+              isStream,
+              body: requestEnvelope.parsed.normalizedBody,
+            }),
+            config,
+          ),
           endpointCandidates,
           buildRequest: (endpoint) => buildEndpointRequest(endpoint),
           dispatchRequest,

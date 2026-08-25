@@ -45,6 +45,7 @@ import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../firstByteTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../responseTimeoutPolicy.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import {
@@ -648,7 +649,10 @@ export async function geminiProxyRoute(app: FastifyInstance) {
       const isInternalGemini = isInternalGeminiPlatform(selected.site.platform);
       const isDirectGeminiFamily = isDirectGeminiFamilyPlatform(selected.site.platform);
       const startTime = Date.now();
-      const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
+      const firstByteTimeoutMs = resolveResponseTimeoutMs(
+        resolveResponseTimeoutKind({ isStream: isStreamAction, body: normalizedBody }),
+        config,
+      );
       let upstreamPath = '';
 
       try {

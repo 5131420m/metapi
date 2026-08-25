@@ -106,6 +106,8 @@ interface RuntimeSettingsBody {
   adminIpAllowlist?: string[] | string;
   routingFallbackUnitCost?: number;
   proxyFirstByteTimeoutSec?: number;
+  proxyNonStreamTimeoutSec?: number;
+  proxyMediaTimeoutSec?: number;
   tokenRouterFailureCooldownMaxSec?: number;
   routingWeights?: Partial<RoutingWeights>;
   proxyErrorKeywords?: string[] | string;
@@ -735,6 +737,18 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       config.proxyFirstByteTimeoutSec = Math.max(0, Math.trunc(n));
       return;
     }
+    case 'proxy_non_stream_timeout_sec': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0) return;
+      config.proxyNonStreamTimeoutSec = Math.max(0, Math.trunc(n));
+      return;
+    }
+    case 'proxy_media_timeout_sec': {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n < 0) return;
+      config.proxyMediaTimeoutSec = Math.max(0, Math.trunc(n));
+      return;
+    }
     case 'token_router_failure_cooldown_max_sec': {
       const normalized = normalizeTokenRouterFailureCooldownMaxSec(value);
       if (normalized == null) return;
@@ -778,6 +792,8 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     proxyDebugMaxBodyBytes: config.proxyDebugMaxBodyBytes,
     routingFallbackUnitCost: config.routingFallbackUnitCost,
     proxyFirstByteTimeoutSec: config.proxyFirstByteTimeoutSec,
+    proxyNonStreamTimeoutSec: config.proxyNonStreamTimeoutSec,
+    proxyMediaTimeoutSec: config.proxyMediaTimeoutSec,
     tokenRouterFailureCooldownMaxSec: config.tokenRouterFailureCooldownMaxSec,
     routingWeights: config.routingWeights,
     webhookUrl: config.webhookUrl,
@@ -1071,6 +1087,18 @@ export async function settingsRoutes(app: FastifyInstance) {
       const timeoutSec = Number(body.proxyFirstByteTimeoutSec);
       if (!Number.isFinite(timeoutSec) || timeoutSec < 0) {
         return reply.code(400).send({ success: false, message: '首字超时必须是大于等于 0 的数字（秒）' });
+      }
+    }
+    if (body.proxyNonStreamTimeoutSec !== undefined) {
+      const timeoutSec = Number(body.proxyNonStreamTimeoutSec);
+      if (!Number.isFinite(timeoutSec) || timeoutSec < 0) {
+        return reply.code(400).send({ success: false, message: '非流式响应超时必须是大于等于 0 的数字（秒）' });
+      }
+    }
+    if (body.proxyMediaTimeoutSec !== undefined) {
+      const timeoutSec = Number(body.proxyMediaTimeoutSec);
+      if (!Number.isFinite(timeoutSec) || timeoutSec < 0) {
+        return reply.code(400).send({ success: false, message: '媒体生成响应超时必须是大于等于 0 的数字（秒）' });
       }
     }
     if (
@@ -1885,6 +1913,32 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.proxyFirstByteTimeoutSec = normalized;
       await upsertSetting('proxy_first_byte_timeout_sec', normalized);
+    }
+
+    if (body.proxyNonStreamTimeoutSec !== undefined) {
+      const nextProxyNonStreamTimeoutSec = Number(body.proxyNonStreamTimeoutSec);
+      if (!Number.isFinite(nextProxyNonStreamTimeoutSec) || nextProxyNonStreamTimeoutSec < 0) {
+        return reply.code(400).send({ success: false, message: '非流式响应超时必须是大于等于 0 的数字（秒）' });
+      }
+      const normalized = Math.max(0, Math.trunc(nextProxyNonStreamTimeoutSec));
+      if (normalized !== config.proxyNonStreamTimeoutSec) {
+        changedLabels.push(`非流式响应超时（${config.proxyNonStreamTimeoutSec}s -> ${normalized}s）`);
+      }
+      config.proxyNonStreamTimeoutSec = normalized;
+      await upsertSetting('proxy_non_stream_timeout_sec', normalized);
+    }
+
+    if (body.proxyMediaTimeoutSec !== undefined) {
+      const nextProxyMediaTimeoutSec = Number(body.proxyMediaTimeoutSec);
+      if (!Number.isFinite(nextProxyMediaTimeoutSec) || nextProxyMediaTimeoutSec < 0) {
+        return reply.code(400).send({ success: false, message: '媒体生成响应超时必须是大于等于 0 的数字（秒）' });
+      }
+      const normalized = Math.max(0, Math.trunc(nextProxyMediaTimeoutSec));
+      if (normalized !== config.proxyMediaTimeoutSec) {
+        changedLabels.push(`媒体生成响应超时（${config.proxyMediaTimeoutSec}s -> ${normalized}s）`);
+      }
+      config.proxyMediaTimeoutSec = normalized;
+      await upsertSetting('proxy_media_timeout_sec', normalized);
     }
 
     if (body.tokenRouterFailureCooldownMaxSec !== undefined) {

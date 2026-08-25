@@ -50,6 +50,7 @@ import {
 } from '../../transformers/gemini/generate-content/cliBridge.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
 import { getObservedResponseMeta } from '../firstByteTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../responseTimeoutPolicy.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
@@ -418,7 +419,10 @@ export async function handleChatSurfaceRequest(
       return executeEndpointFlow({
         siteUrl: siteApiBaseUrl,
         disableCrossProtocolFallback: config.disableCrossProtocolFallback,
-        firstByteTimeoutMs: Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000)),
+        firstByteTimeoutMs: resolveResponseTimeoutMs(
+          resolveResponseTimeoutKind({ downstreamPath, isStream, body: upstreamBody }),
+          config,
+        ),
         endpointCandidates,
         buildRequest: (endpoint) => buildEndpointRequest(endpoint),
         dispatchRequest,

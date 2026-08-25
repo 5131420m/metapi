@@ -255,6 +255,16 @@ export function applyRuntimeSettings(
     config.proxyFirstByteTimeoutSec = Math.max(0, Math.trunc(proxyFirstByteTimeoutSec));
   }
 
+  const proxyNonStreamTimeoutSec = parseSettingFromMap<number>(settingsMap, 'proxy_non_stream_timeout_sec');
+  if (typeof proxyNonStreamTimeoutSec === 'number' && Number.isFinite(proxyNonStreamTimeoutSec) && proxyNonStreamTimeoutSec >= 0) {
+    config.proxyNonStreamTimeoutSec = Math.max(0, Math.trunc(proxyNonStreamTimeoutSec));
+  }
+
+  const proxyMediaTimeoutSec = parseSettingFromMap<number>(settingsMap, 'proxy_media_timeout_sec');
+  if (typeof proxyMediaTimeoutSec === 'number' && Number.isFinite(proxyMediaTimeoutSec) && proxyMediaTimeoutSec >= 0) {
+    config.proxyMediaTimeoutSec = Math.max(0, Math.trunc(proxyMediaTimeoutSec));
+  }
+
   const tokenRouterFailureCooldownMaxSec = parseSettingFromMap<number>(settingsMap, 'token_router_failure_cooldown_max_sec');
   const normalizedFailureCooldownMaxSec = normalizeTokenRouterFailureCooldownMaxSec(tokenRouterFailureCooldownMaxSec);
   if (normalizedFailureCooldownMaxSec != null) {

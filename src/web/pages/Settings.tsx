@@ -76,6 +76,8 @@ type RuntimeSettings = {
   proxySessionChannelQueueWaitMs: number;
   routingFallbackUnitCost: number;
   proxyFirstByteTimeoutSec: number;
+  proxyNonStreamTimeoutSec: number;
+  proxyMediaTimeoutSec: number;
   routeFailureCooldownMaxValue: number;
   routeFailureCooldownMaxUnit: RouteCooldownUnit;
   routingWeights: RoutingWeights;
@@ -385,6 +387,8 @@ export default function Settings() {
     proxySessionChannelQueueWaitMs: 1500,
     routingFallbackUnitCost: 1,
     proxyFirstByteTimeoutSec: 0,
+    proxyNonStreamTimeoutSec: 0,
+    proxyMediaTimeoutSec: 0,
     routeFailureCooldownMaxValue: 30,
     routeFailureCooldownMaxUnit: 'day',
     routingWeights: defaultWeights,
@@ -726,6 +730,12 @@ export default function Settings() {
           : 1,
         proxyFirstByteTimeoutSec: Number(runtimeInfo.proxyFirstByteTimeoutSec) >= 0
           ? Math.trunc(Number(runtimeInfo.proxyFirstByteTimeoutSec))
+          : 0,
+        proxyNonStreamTimeoutSec: Number(runtimeInfo.proxyNonStreamTimeoutSec) >= 0
+          ? Math.trunc(Number(runtimeInfo.proxyNonStreamTimeoutSec))
+          : 0,
+        proxyMediaTimeoutSec: Number(runtimeInfo.proxyMediaTimeoutSec) >= 0
+          ? Math.trunc(Number(runtimeInfo.proxyMediaTimeoutSec))
           : 0,
         routeFailureCooldownMaxValue: routeCooldownInput.value,
         routeFailureCooldownMaxUnit: routeCooldownInput.unit,
@@ -1111,6 +1121,12 @@ export default function Settings() {
         routingFallbackUnitCost: runtime.routingFallbackUnitCost,
         proxyFirstByteTimeoutSec: Number.isFinite(runtime.proxyFirstByteTimeoutSec)
           ? Math.max(0, Math.trunc(runtime.proxyFirstByteTimeoutSec))
+          : 0,
+        proxyNonStreamTimeoutSec: Number.isFinite(runtime.proxyNonStreamTimeoutSec)
+          ? Math.max(0, Math.trunc(runtime.proxyNonStreamTimeoutSec))
+          : 0,
+        proxyMediaTimeoutSec: Number.isFinite(runtime.proxyMediaTimeoutSec)
+          ? Math.max(0, Math.trunc(runtime.proxyMediaTimeoutSec))
           : 0,
         tokenRouterFailureCooldownMaxSec: toRouteCooldownSeconds(
           runtime.routeFailureCooldownMaxValue,
@@ -2333,7 +2349,7 @@ export default function Settings() {
 
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-              首字超时（无首包 / 首 token）
+              首字超时（流式请求，无首包 / 首 token）
             </div>
             <input
               type="number"
@@ -2353,7 +2369,59 @@ export default function Settings() {
               style={inputStyle}
             />
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7, marginTop: 6 }}>
-              `0` 表示关闭。只有在指定时间内完全没有任何首包 / 首 token 返回时才切换，已经开始输出的请求不会被这项超时打断。
+              `0` 表示关闭。仅作用于流式请求：只有在指定时间内完全没有任何首包 / 首 token 返回时才切换，已经开始输出的请求不会被这项超时打断。
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
+              非流式响应超时
+            </div>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              aria-label="非流式响应超时秒数"
+              value={runtime.proxyNonStreamTimeoutSec}
+              onChange={(e) => {
+                const nextValue = Number(e.target.value);
+                setRuntime((prev) => ({
+                  ...prev,
+                  proxyNonStreamTimeoutSec: Number.isFinite(nextValue) && nextValue >= 0
+                    ? Math.trunc(nextValue)
+                    : prev.proxyNonStreamTimeoutSec,
+                }));
+              }}
+              style={inputStyle}
+            />
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7, marginTop: 6 }}>
+              `0` 表示关闭。非流式上游只有生成结束才返回响应体，所以这里等待的是整个响应，而不是首个 token。
+            </div>
+          </div>
+
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
+              媒体生成响应超时（生图 / 视频）
+            </div>
+            <input
+              type="number"
+              min={0}
+              step={1}
+              aria-label="媒体生成响应超时秒数"
+              value={runtime.proxyMediaTimeoutSec}
+              onChange={(e) => {
+                const nextValue = Number(e.target.value);
+                setRuntime((prev) => ({
+                  ...prev,
+                  proxyMediaTimeoutSec: Number.isFinite(nextValue) && nextValue >= 0
+                    ? Math.trunc(nextValue)
+                    : prev.proxyMediaTimeoutSec,
+                }));
+              }}
+              style={inputStyle}
+            />
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7, marginTop: 6 }}>
+              `0` 表示关闭（默认）。作用于 `/v1/images/*`、`/v1/videos` 以及声明了 `image_generation` 工具的 Responses 请求；生图动辄数十秒到数分钟，用上面两项的秒数会打断正常请求。
             </div>
           </div>
 

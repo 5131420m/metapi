@@ -24,6 +24,7 @@ import { summarizeUpstreamError } from './upstreamError.js';
 import { detectDownstreamClientContext, type DownstreamClientContext } from '../../proxy-core/downstreamClientContext.js';
 import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../../proxy-core/firstByteTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../../proxy-core/responseTimeoutPolicy.js';
 
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import {
@@ -82,7 +83,10 @@ export async function searchProxyRoute(app: FastifyInstance) {
       headers: request.headers as Record<string, unknown>,
       body,
     });
-    const firstByteTimeoutMs = Math.max(0, Math.trunc((config.proxyFirstByteTimeoutSec || 0) * 1000));
+    const firstByteTimeoutMs = resolveResponseTimeoutMs(
+      resolveResponseTimeoutKind({ downstreamPath, isStream: false, body }),
+      config,
+    );
     const excludeChannelIds: number[] = [];
     const failureAccumulator = createNonStreamFailureAccumulator({
       protocol: 'openai',
