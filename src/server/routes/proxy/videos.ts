@@ -227,6 +227,9 @@ export async function videosProxyRoute(app: FastifyInstance) {
           status,
           errorText: rawErrorText || errorText,
           modelName: upstreamModel,
+          failureKind: error instanceof SiteApiEndpointRequestError && error.failureKind === 'first-byte-timeout'
+            ? error.failureKind
+            : null,
         }));
         if (status > 0 && isTokenExpiredError({ status, message: errorText })) {
           await reportTokenExpired({

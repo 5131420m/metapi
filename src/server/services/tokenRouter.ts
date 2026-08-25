@@ -479,6 +479,28 @@ function resolveStableFirstSuccessRate(
   );
 }
 
+/**
+ * An observed timeout says "this attempt waited longer than its budget", not "this
+ * credential is broken". The budget itself is a per-response-shape policy decision
+ * (see `proxy-core/responseTimeoutPolicy.ts`), so a media generation that legitimately
+ * runs long must not be recorded as channel damage: otherwise every channel the request
+ * touched lands in Fibonacci backoff and the NEXT request has nothing left to select.
+ *
+ * With the toggle off (default) the abort may still rotate address/protocol/channel for
+ * the current request — only the bookkeeping is suppressed. `lastFailAt` is still written
+ * so the timeout stays visible for diagnosis. Turning the toggle on restores the old
+ * behaviour of treating a timeout as an ordinary upstream failure everywhere.
+ */
+function isExemptTimeoutFailure(context: SiteRuntimeFailureContext = {}): boolean {
+  if (config.timeoutCountsAsChannelFailure) return false;
+  return context.failureKind === 'first-byte-timeout';
+}
+
+// NOTE: deliberately has NO timeout exemption of its own. Its only caller chain is
+// `recordSiteRuntimeFailure` -> `applyRuntimeHealthFailure` -> here, and that entry point
+// already skips both the global and the model-level state for an exempt timeout. A second
+// check here would be unreachable by construction (an added one survived mutation testing,
+// which is what exposed it as dead defense).
 function resolveSiteRuntimeFailurePenalty(context: SiteRuntimeFailureContext = {}): number {
   const status = typeof context.status === 'number' ? context.status : 0;
   const errorText = (context.errorText || '').trim();
@@ -519,7 +541,7 @@ function resolveSiteRuntimeFailurePenalty(context: SiteRuntimeFailureContext = {
 }
 
 function isTransientSiteRuntimeFailure(context: SiteRuntimeFailureContext = {}): boolean {
-  if (context.failureKind === 'first-byte-timeout') {
+  if (isExemptTimeoutFailure(context)) {
     return false;
   }
   const status = typeof context.status === 'number' ? context.status : 0;
@@ -918,12 +940,12 @@ async function ensureSiteRuntimeHealthStateLoaded(): Promise<void> {
 }
 
 function recordSiteRuntimeFailure(siteId: number, context: SiteRuntimeFailureContext = {}, nowMs = Date.now()): void {
-  if (context.failureKind !== 'first-byte-timeout') {
+  if (!isExemptTimeoutFailure(context)) {
     applyRuntimeHealthFailure(getOrCreateSiteRuntimeHealthState(siteId, nowMs), context, nowMs);
-  }
-  const modelState = getOrCreateSiteModelRuntimeHealthState(siteId, context.modelName, nowMs);
-  if (modelState) {
-    applyRuntimeHealthFailure(modelState, context, nowMs);
+    const modelState = getOrCreateSiteModelRuntimeHealthState(siteId, context.modelName, nowMs);
+    if (modelState) {
+      applyRuntimeHealthFailure(modelState, context, nowMs);
+    }
   }
   scheduleSiteRuntimeHealthPersistence();
 }
@@ -2748,6 +2770,18 @@ export class TokenRouter {
         ))
         .get();
       if (memberRow) {
+        // Route-unit channels carry their cooldown on the MEMBER row, not the channel row,
+        // so the exemption has to be repeated here or a timeout would still cool the member.
+        if (isExemptTimeoutFailure(normalizedContext)) {
+          await db.update(schema.oauthRouteUnitMembers).set({
+            lastFailAt: nowIso,
+            updatedAt: nowIso,
+          }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
+          recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+          invalidateRouteScopedCache(route.id);
+          return;
+        }
+
         const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(memberRow.account, normalizedContext, nowMs);
         const failCount = shortWindowLimitCooldownUntil ? 0 : ((memberRow.member.failCount ?? 0) + 1);
         const routeUnitStrategy = memberRow.unit.strategy === 'stick_until_unavailable'
@@ -2788,6 +2822,21 @@ export class TokenRouter {
         invalidateRouteScopedCache(route.id);
         return;
       }
+    }
+
+    const exemptTimeout = isExemptTimeoutFailure(normalizedContext);
+    if (exemptTimeout) {
+      // Observability only: record that the attempt timed out without growing failCount,
+      // consecutiveFailCount or cooldown, so the channel stays selectable for the retry
+      // this very request is about to make.
+      await db.update(schema.routeChannels).set({
+        lastFailAt: nowIso,
+      }).where(eq(schema.routeChannels.id, channelId)).run();
+      patchCachedChannel(channelId, (channel) => {
+        channel.lastFailAt = nowIso;
+      });
+      recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+      return;
     }
 
     const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(account, normalizedContext, nowMs);

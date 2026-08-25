@@ -131,6 +131,7 @@ describe('Settings route cooldown cap', () => {
         proxyFirstByteTimeoutSec: 0,
         proxyNonStreamTimeoutSec: 0,
         proxyMediaTimeoutSec: 0,
+        timeoutCountsAsChannelFailure: false,
         tokenRouterFailureCooldownMaxSec: 10,
         disableCrossProtocolFallback: false,
         channelRecoveryProbeEnabled: false,
@@ -235,6 +236,7 @@ describe('Settings route cooldown cap', () => {
         proxyFirstByteTimeoutSec: 7,
         proxyNonStreamTimeoutSec: 0,
         proxyMediaTimeoutSec: 0,
+        timeoutCountsAsChannelFailure: false,
         tokenRouterFailureCooldownMaxSec: 30 * 24 * 60 * 60,
         disableCrossProtocolFallback: false,
         channelRecoveryProbeEnabled: false,
@@ -244,7 +246,7 @@ describe('Settings route cooldown cap', () => {
     }
   });
 
-  it('saves the per-shape response timeouts independently', async () => {
+  it('saves the per-shape response timeouts and the strict-timeout toggle', async () => {
     let root!: ReactTestRenderer;
     try {
       await act(async () => {
@@ -264,10 +266,17 @@ describe('Settings route cooldown cap', () => {
         && node.props['aria-label'] === label
       ));
 
+      const strictToggle = root.root.find((node) => (
+        node.type === 'input'
+        && node.props.type === 'checkbox'
+        && node.props['aria-label'] === '超时计入通道失败'
+      ));
+
       await act(async () => {
         numberInput('首字超时秒数').props.onChange({ target: { value: '45' } });
         numberInput('非流式响应超时秒数').props.onChange({ target: { value: '120' } });
         numberInput('媒体生成响应超时秒数').props.onChange({ target: { value: '600' } });
+        strictToggle.props.onChange({ target: { checked: true } });
       });
 
       const saveButton = root.root.find((node) => (
@@ -287,6 +296,7 @@ describe('Settings route cooldown cap', () => {
         proxyFirstByteTimeoutSec: 45,
         proxyNonStreamTimeoutSec: 120,
         proxyMediaTimeoutSec: 600,
+        timeoutCountsAsChannelFailure: true,
       }));
     } finally {
       root?.unmount();

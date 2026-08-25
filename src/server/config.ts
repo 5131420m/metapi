@@ -122,6 +122,7 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     proxyFirstByteTimeoutSec: Math.max(0, Math.trunc(parseNumber(env.PROXY_FIRST_BYTE_TIMEOUT_SEC, 0))),
     proxyNonStreamTimeoutSec: Math.max(0, Math.trunc(parseNumber(env.PROXY_NON_STREAM_TIMEOUT_SEC, 0))),
     proxyMediaTimeoutSec: Math.max(0, Math.trunc(parseNumber(env.PROXY_MEDIA_TIMEOUT_SEC, 0))),
+    timeoutCountsAsChannelFailure: parseBoolean(env.TIMEOUT_COUNTS_AS_CHANNEL_FAILURE, false),
     tokenRouterFailureCooldownMaxSec: normalizeTokenRouterFailureCooldownMaxSec(
       parseNumber(env.TOKEN_ROUTER_FAILURE_COOLDOWN_MAX_SEC, TOKEN_ROUTER_FAILURE_COOLDOWN_MAX_SEC_CEILING),
     ) ?? TOKEN_ROUTER_FAILURE_COOLDOWN_MAX_SEC_CEILING,

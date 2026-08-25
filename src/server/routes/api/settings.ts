@@ -108,6 +108,7 @@ interface RuntimeSettingsBody {
   proxyFirstByteTimeoutSec?: number;
   proxyNonStreamTimeoutSec?: number;
   proxyMediaTimeoutSec?: number;
+  timeoutCountsAsChannelFailure?: boolean;
   tokenRouterFailureCooldownMaxSec?: number;
   routingWeights?: Partial<RoutingWeights>;
   proxyErrorKeywords?: string[] | string;
@@ -749,6 +750,11 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       config.proxyMediaTimeoutSec = Math.max(0, Math.trunc(n));
       return;
     }
+    case 'timeout_counts_as_channel_failure': {
+      if (typeof value !== 'boolean') return;
+      config.timeoutCountsAsChannelFailure = value;
+      return;
+    }
     case 'token_router_failure_cooldown_max_sec': {
       const normalized = normalizeTokenRouterFailureCooldownMaxSec(value);
       if (normalized == null) return;
@@ -794,6 +800,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     proxyFirstByteTimeoutSec: config.proxyFirstByteTimeoutSec,
     proxyNonStreamTimeoutSec: config.proxyNonStreamTimeoutSec,
     proxyMediaTimeoutSec: config.proxyMediaTimeoutSec,
+    timeoutCountsAsChannelFailure: config.timeoutCountsAsChannelFailure,
     tokenRouterFailureCooldownMaxSec: config.tokenRouterFailureCooldownMaxSec,
     routingWeights: config.routingWeights,
     webhookUrl: config.webhookUrl,
@@ -1939,6 +1946,15 @@ export async function settingsRoutes(app: FastifyInstance) {
       }
       config.proxyMediaTimeoutSec = normalized;
       await upsertSetting('proxy_media_timeout_sec', normalized);
+    }
+
+    if (body.timeoutCountsAsChannelFailure !== undefined) {
+      const next = !!body.timeoutCountsAsChannelFailure;
+      if (next !== config.timeoutCountsAsChannelFailure) {
+        changedLabels.push(`超时计入通道失败（${config.timeoutCountsAsChannelFailure ? '开' : '关'} -> ${next ? '开' : '关'}）`);
+      }
+      config.timeoutCountsAsChannelFailure = next;
+      await upsertSetting('timeout_counts_as_channel_failure', next);
     }
 
     if (body.tokenRouterFailureCooldownMaxSec !== undefined) {

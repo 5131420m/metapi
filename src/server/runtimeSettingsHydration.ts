@@ -265,6 +265,11 @@ export function applyRuntimeSettings(
     config.proxyMediaTimeoutSec = Math.max(0, Math.trunc(proxyMediaTimeoutSec));
   }
 
+  const timeoutCountsAsChannelFailure = parseSettingFromMap<boolean>(settingsMap, 'timeout_counts_as_channel_failure');
+  if (typeof timeoutCountsAsChannelFailure === 'boolean') {
+    config.timeoutCountsAsChannelFailure = timeoutCountsAsChannelFailure;
+  }
+
   const tokenRouterFailureCooldownMaxSec = parseSettingFromMap<number>(settingsMap, 'token_router_failure_cooldown_max_sec');
   const normalizedFailureCooldownMaxSec = normalizeTokenRouterFailureCooldownMaxSec(tokenRouterFailureCooldownMaxSec);
   if (normalizedFailureCooldownMaxSec != null) {

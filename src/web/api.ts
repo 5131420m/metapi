@@ -413,6 +413,7 @@ export type RuntimeSettingsPayload = {
   proxyFirstByteTimeoutSec?: number;
   proxyNonStreamTimeoutSec?: number;
   proxyMediaTimeoutSec?: number;
+  timeoutCountsAsChannelFailure?: boolean;
   tokenRouterFailureCooldownMaxSec?: number;
   routingWeights?: RuntimeRoutingWeightsPayload;
   proxyErrorKeywords?: string[] | string;
@@ -955,8 +956,6 @@ export const api = {
     request(`/api/routes/${id}`, { method: "DELETE" }),
   clearRouteCooldown: (id: number) =>
     request(`/api/routes/${id}/cooldown/clear`, { method: "POST" }),
-  clearChannelCooldown: (channelId: number) =>
-    request(`/api/channels/${channelId}/cooldown/clear`, { method: "POST" }),
   batchUpdateRoutes: (data: { ids: number[]; action: "enable" | "disable" }) =>
     request("/api/routes/batch", {
       method: "POST",

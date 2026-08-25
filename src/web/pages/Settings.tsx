@@ -78,6 +78,7 @@ type RuntimeSettings = {
   proxyFirstByteTimeoutSec: number;
   proxyNonStreamTimeoutSec: number;
   proxyMediaTimeoutSec: number;
+  timeoutCountsAsChannelFailure: boolean;
   routeFailureCooldownMaxValue: number;
   routeFailureCooldownMaxUnit: RouteCooldownUnit;
   routingWeights: RoutingWeights;
@@ -389,6 +390,7 @@ export default function Settings() {
     proxyFirstByteTimeoutSec: 0,
     proxyNonStreamTimeoutSec: 0,
     proxyMediaTimeoutSec: 0,
+    timeoutCountsAsChannelFailure: false,
     routeFailureCooldownMaxValue: 30,
     routeFailureCooldownMaxUnit: 'day',
     routingWeights: defaultWeights,
@@ -737,6 +739,7 @@ export default function Settings() {
         proxyMediaTimeoutSec: Number(runtimeInfo.proxyMediaTimeoutSec) >= 0
           ? Math.trunc(Number(runtimeInfo.proxyMediaTimeoutSec))
           : 0,
+        timeoutCountsAsChannelFailure: runtimeInfo.timeoutCountsAsChannelFailure === true,
         routeFailureCooldownMaxValue: routeCooldownInput.value,
         routeFailureCooldownMaxUnit: routeCooldownInput.unit,
         routingWeights: {
@@ -1128,6 +1131,7 @@ export default function Settings() {
         proxyMediaTimeoutSec: Number.isFinite(runtime.proxyMediaTimeoutSec)
           ? Math.max(0, Math.trunc(runtime.proxyMediaTimeoutSec))
           : 0,
+        timeoutCountsAsChannelFailure: runtime.timeoutCountsAsChannelFailure,
         tokenRouterFailureCooldownMaxSec: toRouteCooldownSeconds(
           runtime.routeFailureCooldownMaxValue,
           runtime.routeFailureCooldownMaxUnit,
@@ -2424,6 +2428,27 @@ export default function Settings() {
               `0` 表示关闭（默认）。作用于 `/v1/images/*`、`/v1/videos` 以及声明了 `image_generation` 工具的 Responses 请求；生图动辄数十秒到数分钟，用上面两项的秒数会打断正常请求。
             </div>
           </div>
+
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              aria-label="超时计入通道失败"
+              checked={runtime.timeoutCountsAsChannelFailure}
+              onChange={(e) => setRuntime((prev) => ({
+                ...prev,
+                timeoutCountsAsChannelFailure: e.target.checked,
+              }))}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                超时计入通道失败与冷却
+              </span>
+              <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
+                默认关闭：超时只切换地址 / 协议 / 通道，不累计通道失败次数、不写冷却、不降低站点权重。开启后超时与普通上游错误同等对待，连续超时会让通道进入指数冷却。
+              </span>
+            </span>
+          </label>
 
           <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()}>
             <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
