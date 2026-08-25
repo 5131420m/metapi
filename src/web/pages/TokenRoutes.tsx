@@ -212,6 +212,7 @@ export default function TokenRoutes() {
   const [savingPriorityByRoute, setSavingPriorityByRoute] = useState<Record<number, boolean>>({});
   const [updatingRoutingStrategyByRoute, setUpdatingRoutingStrategyByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByRoute, setClearingCooldownByRoute] = useState<Record<number, boolean>>({});
+  const [clearingCooldownByChannel, setClearingCooldownByChannel] = useState<Record<number, boolean>>({});
 
   const [decisionByRoute, setDecisionByRoute] = useState<Record<number, RouteDecision | null>>({});
   const [loadingDecision, setLoadingDecision] = useState(false);
@@ -1257,6 +1258,27 @@ export default function TokenRoutes() {
     }
   };
 
+  const handleClearChannelCooldown = async (channelId: number, routeId: number) => {
+    if (clearingCooldownByChannel[channelId]) return;
+    setClearingCooldownByChannel((prev) => ({ ...prev, [channelId]: true }));
+    try {
+      await api.clearChannelCooldown(channelId);
+      toast.success('通道冷却已清除');
+
+      try {
+        await loadChannels(routeId, true);
+        const route = routeSummaries.find((item) => item.id === routeId);
+        if (route) await loadRouteDecision(route);
+      } catch {
+        toast.error('已清除，但刷新失败');
+      }
+    } catch (e: any) {
+      toast.error(e.message || '清除通道冷却失败');
+    } finally {
+      setClearingCooldownByChannel((prev) => ({ ...prev, [channelId]: false }));
+    }
+  };
+
   const handleClearRouteCooldown = async (routeId: number) => {
     if (clearingCooldownByRoute[routeId]) return;
     setClearingCooldownByRoute((prev) => ({ ...prev, [routeId]: true }));
@@ -1519,6 +1541,12 @@ export default function TokenRoutes() {
   handleSiteBlockModelRef.current = handleSiteBlockModel;
   const stableSiteBlockModel = useCallback(
     (channelId: number, routeId: number) => handleSiteBlockModelRef.current(channelId, routeId),
+    [],
+  );
+  const handleClearChannelCooldownRef = useRef(handleClearChannelCooldown);
+  handleClearChannelCooldownRef.current = handleClearChannelCooldown;
+  const stableClearChannelCooldown = useCallback(
+    (channelId: number, routeId: number) => handleClearChannelCooldownRef.current(channelId, routeId),
     [],
   );
   const handleClearRouteCooldownRef = useRef(handleClearRouteCooldown);
@@ -1890,6 +1918,8 @@ export default function TokenRoutes() {
                     onCreateTokenForMissing={stableCreateTokenForMissing}
                     onAddChannel={stableAddChannel}
                     onSiteBlockModel={stableSiteBlockModel}
+                    clearingCooldownByChannel={clearingCooldownByChannel}
+                    onClearChannelCooldown={stableClearChannelCooldown}
                     expandedSourceGroupMap={expandedSourceGroupMap}
                     onToggleSourceGroup={stableToggleSourceGroup}
                   />
@@ -1930,6 +1960,8 @@ export default function TokenRoutes() {
               onCreateTokenForMissing={stableCreateTokenForMissing}
               onAddChannel={stableAddChannel}
               onSiteBlockModel={stableSiteBlockModel}
+                    clearingCooldownByChannel={clearingCooldownByChannel}
+                    onClearChannelCooldown={stableClearChannelCooldown}
               expandedSourceGroupMap={expandedSourceGroupMap}
               onToggleSourceGroup={stableToggleSourceGroup}
             />
@@ -1969,6 +2001,8 @@ export default function TokenRoutes() {
                   onCreateTokenForMissing={stableCreateTokenForMissing}
                   onAddChannel={stableAddChannel}
                   onSiteBlockModel={stableSiteBlockModel}
+                    clearingCooldownByChannel={clearingCooldownByChannel}
+                    onClearChannelCooldown={stableClearChannelCooldown}
                   expandedSourceGroupMap={expandedSourceGroupMap}
                   onToggleSourceGroup={stableToggleSourceGroup}
                 />

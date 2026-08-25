@@ -985,16 +985,23 @@ export async function flushSiteRuntimeHealthPersistence(): Promise<void> {
   }
 }
 
+/**
+ * `scope: 'site'` drops the whole site's runtime health as well as the per-model entries —
+ * correct for a route-wide clear, where the intent is "forget everything about this route".
+ * `scope: 'model'` keeps the site-level penalty/breaker intact and only forgets the models
+ * the given channels serve, so releasing ONE channel cannot silently reset a site-wide
+ * breaker that other routes are still relying on.
+ */
 function clearRuntimeHealthStatesForChannels(rows: Array<{
   siteId: number;
   sourceModel: string | null;
   routeModelPattern: string;
-}>): boolean {
+}>, scope: 'site' | 'model' = 'site'): boolean {
   let changed = false;
   const modelKeysBySiteId = new Map<number, Set<string>>();
 
   for (const row of rows) {
-    if (siteRuntimeHealthStates.delete(row.siteId)) {
+    if (scope === 'site' && siteRuntimeHealthStates.delete(row.siteId)) {
       changed = true;
     }
 
@@ -2693,7 +2700,10 @@ export class TokenRouter {
   /**
    * Clear persisted failure and cooldown state for the given channels.
    */
-  async clearChannelFailureState(channelIds: number[]): Promise<number> {
+  async clearChannelFailureState(
+    channelIds: number[],
+    options: { runtimeHealthScope?: 'site' | 'model' } = {},
+  ): Promise<number> {
     const normalizedChannelIds = Array.from(new Set(
       channelIds
         .filter((channelId): channelId is number => Number.isFinite(channelId) && channelId > 0)
@@ -2702,10 +2712,11 @@ export class TokenRouter {
     if (normalizedChannelIds.length === 0) return 0;
 
     await ensureSiteRuntimeHealthStateLoaded();
-    const runtimeHealthRows = await db.select({
+    const channelRows = await db.select({
       siteId: schema.accounts.siteId,
       sourceModel: schema.routeChannels.sourceModel,
       routeModelPattern: schema.tokenRoutes.modelPattern,
+      oauthRouteUnitId: schema.routeChannels.oauthRouteUnitId,
     }).from(schema.routeChannels)
       .innerJoin(schema.accounts, eq(schema.routeChannels.accountId, schema.accounts.id))
       .innerJoin(schema.tokenRoutes, eq(schema.routeChannels.routeId, schema.tokenRoutes.id))
@@ -2720,7 +2731,25 @@ export class TokenRouter {
       cooldownUntil: null,
     }).where(inArray(schema.routeChannels.id, normalizedChannelIds)).run();
 
-    if (clearRuntimeHealthStatesForChannels(runtimeHealthRows)) {
+    // A route-unit channel keeps its cooldown on the member rows, so clearing only the
+    // channel row left those channels cooling with nothing in the UI able to release them.
+    const routeUnitIds: number[] = Array.from(new Set<number>(
+      channelRows
+        .map((row) => Number(row.oauthRouteUnitId))
+        .filter((unitId): unitId is number => Number.isFinite(unitId) && unitId > 0),
+    ));
+    if (routeUnitIds.length > 0) {
+      await db.update(schema.oauthRouteUnitMembers).set({
+        failCount: 0,
+        lastFailAt: null,
+        consecutiveFailCount: 0,
+        cooldownLevel: 0,
+        cooldownUntil: null,
+        updatedAt: new Date().toISOString(),
+      }).where(inArray(schema.oauthRouteUnitMembers.unitId, routeUnitIds)).run();
+    }
+
+    if (clearRuntimeHealthStatesForChannels(channelRows, options.runtimeHealthScope ?? 'site')) {
       await persistSiteRuntimeHealthState();
     }
 

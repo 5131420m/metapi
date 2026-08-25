@@ -112,6 +112,40 @@ async function clearDependentExplicitGroupSnapshotsBySourceRouteIds(sourceRouteI
   await clearRouteDecisionSnapshots(dependentRouteIds);
 }
 
+/**
+ * Release ONE channel instead of the whole route.
+ *
+ * Runtime health is cleared with `scope: 'model'`: a single-channel release must not reset
+ * the site-level penalty/breaker that other routes on the same site are still relying on.
+ * Route-wide clearing keeps the broader `'site'` scope below.
+ */
+export async function clearChannelCooldown(
+  channelId: number,
+): Promise<{ success: true; clearedChannels: number; routeId: number } | null> {
+  if (!Number.isFinite(channelId) || channelId <= 0) return null;
+
+  const channel = await db.select({
+    id: schema.routeChannels.id,
+    routeId: schema.routeChannels.routeId,
+  }).from(schema.routeChannels)
+    .where(eq(schema.routeChannels.id, Math.trunc(channelId)))
+    .get();
+  if (!channel) return null;
+
+  const clearedChannels = await tokenRouter.clearChannelFailureState([channel.id], {
+    runtimeHealthScope: 'model',
+  });
+
+  await clearRouteDecisionSnapshot(channel.routeId);
+  await clearDependentExplicitGroupSnapshotsBySourceRouteIds([channel.routeId]);
+
+  return {
+    success: true,
+    clearedChannels,
+    routeId: channel.routeId,
+  };
+}
+
 export async function clearRouteCooldown(routeId: number): Promise<{ success: true; clearedChannels: number } | null> {
   const route = await getRouteWithSources(routeId);
   if (!route) return null;

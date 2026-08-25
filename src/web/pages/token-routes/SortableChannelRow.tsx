@@ -42,6 +42,8 @@ export function SortableChannelRow({
   onDeleteChannel,
   onToggleEnabled,
   onSiteBlockModel,
+  clearingCooldown = false,
+  onClearCooldown,
 }: SortableChannelRowProps) {
   const resolvedPriority = displayPriority ?? channel.priority ?? 0;
   const managementLocked = readOnly || channelManagementDisabled;
@@ -331,6 +333,16 @@ export function SortableChannelRow({
                     {channel.enabled === false ? '启用' : '禁用'}
                   </button>
 
+                  {onClearCooldown ? (
+                    <button
+                      onClick={onClearCooldown}
+                      disabled={clearingCooldown}
+                      className="btn btn-link btn-link-info"
+                    >
+                      {clearingCooldown ? '清除中...' : '清除冷却'}
+                    </button>
+                  ) : null}
+
                   {onSiteBlockModel && channel.site?.id ? (
                     <button
                       onClick={onSiteBlockModel}
@@ -567,6 +579,17 @@ export function SortableChannelRow({
           </button>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+            {onClearCooldown ? (
+              <button
+                onClick={onClearCooldown}
+                disabled={clearingCooldown}
+                className="btn btn-link btn-link-info"
+                data-tooltip={suppressTooltips ? undefined : '清空此通道的失败计数与冷却，使其立即可被选中'}
+              >
+                {clearingCooldown ? '清除中...' : '清除冷却'}
+              </button>
+            ) : null}
+
             {onSiteBlockModel && channel.site?.id ? (
               <button
                 onClick={onSiteBlockModel}

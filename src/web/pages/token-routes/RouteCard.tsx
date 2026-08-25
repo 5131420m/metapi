@@ -96,6 +96,9 @@ type RouteCardProps = {
   onAddChannel: (routeId: number) => void;
   // Site block model
   onSiteBlockModel: (channelId: number, routeId: number) => void;
+  // Per-channel cooldown release
+  onClearChannelCooldown: (channelId: number, routeId: number) => void;
+  clearingCooldownByChannel: Record<number, boolean>;
   // Source group expansion
   expandedSourceGroupMap: Record<string, boolean>;
   onToggleSourceGroup: (groupKey: string) => void;
@@ -374,6 +377,8 @@ type SortableChannelShellProps = {
   onDeleteChannel: (channelId: number, routeId: number) => void;
   onToggleChannelEnabled: (channelId: number, routeId: number, enabled: boolean) => void;
   onSiteBlockModel: (channelId: number, routeId: number) => void;
+  onClearChannelCooldown: (channelId: number, routeId: number) => void;
+  clearingCooldownByChannel: Record<number, boolean>;
   railLabel: string;
   mobileRailLabel: string;
   railNodeStyle: CSSProperties;
@@ -404,6 +409,8 @@ function SortableChannelShell({
   onDeleteChannel,
   onToggleChannelEnabled,
   onSiteBlockModel,
+  onClearChannelCooldown,
+  clearingCooldownByChannel,
   railLabel,
   mobileRailLabel,
   railNodeStyle,
@@ -528,6 +535,8 @@ function SortableChannelShell({
         onDeleteChannel={() => onDeleteChannel(channel.id, routeId)}
         onToggleEnabled={(enabled) => onToggleChannelEnabled(channel.id, routeId, enabled)}
         onSiteBlockModel={channelManagementDisabled ? undefined : () => onSiteBlockModel(channel.id, routeId)}
+        onClearCooldown={readOnlyRoute ? undefined : () => onClearChannelCooldown(channel.id, routeId)}
+        clearingCooldown={!!clearingCooldownByChannel[channel.id]}
       />
     </div>
   );
@@ -566,6 +575,8 @@ function RouteCardInner({
   onCreateTokenForMissing,
   onAddChannel,
   onSiteBlockModel,
+  onClearChannelCooldown,
+  clearingCooldownByChannel,
   expandedSourceGroupMap,
   onToggleSourceGroup,
 }: RouteCardProps) {
@@ -1212,6 +1223,8 @@ function RouteCardInner({
                             onDeleteChannel={onDeleteChannel}
                             onToggleChannelEnabled={onToggleChannelEnabled}
                             onSiteBlockModel={onSiteBlockModel}
+                            onClearChannelCooldown={onClearChannelCooldown}
+                            clearingCooldownByChannel={clearingCooldownByChannel}
                             railLabel={railSection ? `P${bucketIndex} · ${railSection.channelCount}` : railLabel}
                             mobileRailLabel={mobileRailLabel}
                             railNodeStyle={railNodeStyle}
@@ -1297,6 +1310,8 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.onCreateTokenForMissing !== next.onCreateTokenForMissing
     || prev.onAddChannel !== next.onAddChannel
     || prev.onSiteBlockModel !== next.onSiteBlockModel
+    || prev.onClearChannelCooldown !== next.onClearChannelCooldown
+    || prev.clearingCooldownByChannel !== next.clearingCooldownByChannel
     || prev.onToggleSourceGroup !== next.onToggleSourceGroup
     || prev.clearingCooldown !== next.clearingCooldown
     || prev.updatingRoutingStrategy !== next.updatingRoutingStrategy

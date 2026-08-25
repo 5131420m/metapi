@@ -21,7 +21,7 @@ import {
   parseRouteDecisionSnapshot,
   saveRouteDecisionSnapshots,
 } from '../../services/routeDecisionSnapshotStore.js';
-import { clearRouteCooldown } from '../../services/routeCooldownService.js';
+import { clearChannelCooldown, clearRouteCooldown } from '../../services/routeCooldownService.js';
 import {
   refreshAllRouteDecisionSnapshots,
   ROUTE_DECISION_REFRESH_DEDUPE_KEY,
@@ -851,6 +851,16 @@ export async function tokensRoutes(app: FastifyInstance) {
     const result = await clearRouteCooldown(routeId);
     if (!result) {
       return reply.code(404).send({ success: false, message: '路由不存在' });
+    }
+    return result;
+  });
+
+  // Release ONE channel. Route-level clearing above stays a separate, wider action.
+  app.post<{ Params: { channelId: string } }>('/api/channels/:channelId/cooldown/clear', async (request, reply) => {
+    const channelId = parseInt(request.params.channelId, 10);
+    const result = await clearChannelCooldown(channelId);
+    if (!result) {
+      return reply.code(404).send({ success: false, message: '通道不存在' });
     }
     return result;
   });
