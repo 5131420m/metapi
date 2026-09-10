@@ -11,12 +11,12 @@ import {
 import {
   getCredentialModeFromExtraConfig,
   getProxyUrlFromExtraConfig,
-  guessPlatformUserIdFromUsername,
   hasOauthProvider,
   getSub2ApiAuthFromExtraConfig,
   mergeAccountExtraConfig,
   normalizeCredentialMode as normalizeCredentialModeInput,
   resolvePlatformUserId,
+  resolvePlatformUserIdFromLogin,
   type AccountCredentialMode,
 } from "../../services/accountExtraConfig.js";
 import { encryptAccountPassword } from "../../services/accountCredentialService.js";
@@ -59,6 +59,10 @@ import {
   parseBatchApiKeys,
 } from "../../services/apiKeyBatch.js";
 import { createManualAccount } from "../../services/manualAccountCreationService.js";
+import {
+  AccountManualModelServiceError,
+  removeManualModelsFromAccount,
+} from "../../services/accountManualModelService.js";
 
 type AccountWithSiteRow = {
   accounts: typeof schema.accounts.$inferSelect;
@@ -536,7 +540,13 @@ export async function accountsRoutes(app: FastifyInstance) {
         };
       }
 
-      const guessedPlatformUserId = guessPlatformUserIdFromUsername(username);
+      // The id reported by the site itself is authoritative; guessing from the
+      // username only works when it ends with the id (e.g. `linuxdo_80305`)
+      // and silently fails for addresses like `alice@example.com`.
+      const guessedPlatformUserId = resolvePlatformUserIdFromLogin(
+        loginResult.platformUserId,
+        username,
+      );
 
       // Auto-fetch API token(s)
       let apiToken: string | null = null;
@@ -1936,6 +1946,49 @@ export async function accountsRoutes(app: FastifyInstance) {
         return reply
           .code(500)
           .send({ success: false, message: err?.message || "保存失败" });
+      }
+    },
+  );
+
+  // Remove manually added models from an account
+  app.delete<{ Params: { id: string }; Body: unknown }>(
+    "/api/accounts/:id/models/manual",
+    async (request, reply) => {
+      const parsedBody = parseAccountManualModelsPayload(request.body);
+      if (!parsedBody.success) {
+        return reply.code(400).send({ message: parsedBody.error });
+      }
+
+      const accountId = parseInt(request.params.id, 10);
+      if (!Number.isFinite(accountId) || accountId <= 0) {
+        return reply.code(400).send({ message: "账号 ID 无效" });
+      }
+
+      const { models } = parsedBody.data;
+      if (!Array.isArray(models) || models.length === 0) {
+        return reply.code(400).send({ message: "模型列表不能为空" });
+      }
+
+      const normalizedModels = Array.from(
+        new Set(
+          models.map((m) => String(m).trim()).filter((m) => m.length > 0),
+        ),
+      );
+      if (normalizedModels.length === 0) {
+        return reply.code(400).send({ message: "模型列表不能为空" });
+      }
+
+      try {
+        await removeManualModelsFromAccount(accountId, normalizedModels);
+
+        return { success: true };
+      } catch (err: any) {
+        if (err instanceof AccountManualModelServiceError) {
+          return reply.code(err.statusCode).send({ message: err.message });
+        }
+        return reply
+          .code(500)
+          .send({ success: false, message: err?.message || "删除失败" });
       }
     },
   );

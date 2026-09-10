@@ -211,6 +211,20 @@
       "when": 1787062502105,
       "tag": "0030_site_codex_identity_mode",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "6",
+      "when": 1787062503105,
+      "tag": "0031_site_custom_headers_override_request_headers",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "6",
+      "when": 1787062504105,
+      "tag": "0032_site_max_concurrency",
+      "breakpoints": true
     }
   ]
 }

@@ -1,7 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { and, asc, eq, isNull, ne, or, sql } from 'drizzle-orm';
+import { Headers, Response } from 'undici';
 import { db, schema } from '../db/index.js';
 import { RETRYABLE_TIMEOUT_PATTERNS } from './proxyRetryPolicy.js';
+import { proxyChannelCoordinator, type ProxySiteLease } from './proxyChannelCoordinator.js';
+import { copyObservedResponseMeta } from '../proxy-core/firstByteTimeout.js';
 
 const ROTATABLE_STATUS_CODES = new Set([408, 500, 502, 503, 504]);
 const GATEWAY_FAILURE_STATUS_CODES = new Set([502, 503, 504]);
@@ -66,12 +69,14 @@ export class SiteApiEndpointRequestError extends Error {
   readonly rawErrText: string | null;
   readonly firstByteLatencyMs: number | null;
   readonly failureKind: SiteApiEndpointFailureKind | null;
+  readonly siteConcurrencyTimeout: boolean;
 
   constructor(message: string, options?: {
     status?: number | null;
     rawErrText?: string | null;
     firstByteLatencyMs?: number | null;
     failureKind?: SiteApiEndpointFailureKind | null;
+    siteConcurrencyTimeout?: boolean;
     cause?: unknown;
   }) {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
@@ -84,6 +89,7 @@ export class SiteApiEndpointRequestError extends Error {
       ? options.firstByteLatencyMs
       : null;
     this.failureKind = options?.failureKind ?? null;
+    this.siteConcurrencyTimeout = options?.siteConcurrencyTimeout === true;
   }
 }
 
@@ -95,6 +101,113 @@ export interface SiteApiEndpointPoolOptions {
   deadlineAtMs?: number;
   timeoutMessage?: string;
   requestScopeId?: string;
+}
+
+function buildSiteConcurrencyBusyMessage(waitMs: number): string {
+  return waitMs > 0
+    ? `Site busy: waited ${waitMs}ms for an available concurrency slot`
+    : 'Site busy: no concurrency slot available';
+}
+
+function isResponseLike(value: unknown): value is Response {
+  return !!value
+    && typeof value === 'object'
+    && typeof (value as { body?: unknown }).body !== 'undefined'
+    && typeof (value as { status?: unknown }).status === 'number';
+}
+
+function wrapResponseWithSiteLease(response: Response, lease: ProxySiteLease): Response {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    lease.release();
+  };
+
+  if (!response.body || response.bodyUsed) {
+    release();
+    return response;
+  }
+
+  // 请求已完成，后续只根据真实的流读取进度续租，避免客户端停止读取后永久占用站点槽位。
+  lease.pauseKeepalive();
+  const reader = response.body.getReader();
+  const wrappedBody = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const result = await reader.read();
+        if (result.done) {
+          release();
+          controller.close();
+          return;
+        }
+        lease.touch();
+        controller.enqueue(result.value);
+      } catch (error) {
+        try {
+          await reader.cancel(error);
+        } catch {
+          // 读取失败时尽力取消底层 reader，随后仍必须释放站点租约。
+        } finally {
+          release();
+          controller.error(error);
+        }
+      }
+    },
+    async cancel(reason) {
+      try {
+        await reader.cancel(reason);
+      } finally {
+        release();
+      }
+    },
+  });
+  let wrappedBodyResponse: Response | null = null;
+  const getWrappedBodyResponse = () => {
+    if (!wrappedBodyResponse) {
+      wrappedBodyResponse = new Response(wrappedBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: new Headers(response.headers),
+      });
+    }
+    return wrappedBodyResponse;
+  };
+
+  const wrappedResponse = new Proxy(response, {
+    get(target, property, receiver) {
+      if (property === 'body') return wrappedBody;
+      if (property === 'text' || property === 'json' || property === 'arrayBuffer' || property === 'blob' || property === 'formData') {
+        return (...args: unknown[]) => Promise.resolve(
+          (getWrappedBodyResponse()[property as 'text'] as (...params: unknown[]) => Promise<unknown>)(...args),
+        ).finally(release);
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  copyObservedResponseMeta(response, wrappedResponse);
+  return wrappedResponse;
+}
+
+function attachSiteLeaseToResult<T>(result: T, lease: ProxySiteLease): { result: T; held: boolean } {
+  if (!lease.isActive()) {
+    return { result, held: false };
+  }
+  if (isResponseLike(result)) {
+    return { result: wrapResponseWithSiteLease(result, lease) as T, held: !!result.body && !result.bodyUsed };
+  }
+  if (result && typeof result === 'object') {
+    const record = result as Record<string, unknown>;
+    for (const key of ['upstream', 'response']) {
+      const candidate = record[key];
+      if (!isResponseLike(candidate)) continue;
+      const wrapped = wrapResponseWithSiteLease(candidate, lease);
+      return { result: { ...record, [key]: wrapped } as T, held: !!candidate.body && !candidate.bodyUsed };
+    }
+  }
+  lease.release();
+  return { result, held: false };
 }
 
 export function normalizeSiteApiEndpointBaseUrl(raw: string): string {
@@ -434,100 +547,121 @@ export async function runWithSiteApiEndpointPool<T>(
   operation: (target: SiteApiEndpointTarget, context: SiteApiEndpointOperationContext) => Promise<T>,
   options: SiteApiEndpointPoolOptions = {},
 ): Promise<T> {
+  // 站点级并发闸门（上游）包在端点轮换循环（本 fork）之外：
+  // 一次逻辑请求只占用一个站点槽位，无论内部轮换了多少个端点。
+  const leaseResult = await proxyChannelCoordinator.acquireSiteLease({
+    siteId: site.id,
+    maxConcurrency: site.maxConcurrency,
+  });
+  if (leaseResult.status === 'timeout') {
+    throw new SiteApiEndpointRequestError(buildSiteConcurrencyBusyMessage(leaseResult.waitMs), {
+      status: 503,
+      siteConcurrencyTimeout: true,
+    });
+  }
+  const siteLease = leaseResult.lease;
+  let leaseHeldByResult = false;
   const attemptedEndpointIds = new Set<number>();
   let attemptedSiteFallback = false;
   let lastError: unknown;
   const requestScopeId = options.requestScopeId || randomUUID();
 
-  while (true) {
-    if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) {
-      throw buildDeadlineError(options);
-    }
-    const target = await selectSiteApiEndpointTarget(site, undefined, attemptedEndpointIds);
-    if (!target) {
-      if (lastError) throw normalizePoolTerminalError(lastError);
-      throw new Error('当前站点的 API 请求地址均不可用');
-    }
-    if (target.endpointId && attemptedEndpointIds.has(target.endpointId)) {
-      if (lastError) throw normalizePoolTerminalError(lastError);
-      throw new Error('当前站点的 API 请求地址均不可用');
-    }
-    if (target.kind === 'site-fallback') {
-      if (attemptedSiteFallback) {
+  try {
+    while (true) {
+      if (options.deadlineAtMs !== undefined && Date.now() >= options.deadlineAtMs) {
+        throw buildDeadlineError(options);
+      }
+      const target = await selectSiteApiEndpointTarget(site, undefined, attemptedEndpointIds);
+      if (!target) {
         if (lastError) throw normalizePoolTerminalError(lastError);
-        throw new Error('主站点 API 请求地址不可用');
+        throw new Error('当前站点的 API 请求地址均不可用');
       }
-      attemptedSiteFallback = true;
-    }
+      if (target.endpointId && attemptedEndpointIds.has(target.endpointId)) {
+        if (lastError) throw normalizePoolTerminalError(lastError);
+        throw new Error('当前站点的 API 请求地址均不可用');
+      }
+      if (target.kind === 'site-fallback') {
+        if (attemptedSiteFallback) {
+          if (lastError) throw normalizePoolTerminalError(lastError);
+          throw new Error('主站点 API 请求地址不可用');
+        }
+        attemptedSiteFallback = true;
+      }
 
-    try {
-      const controller = new AbortController();
-      const remainingMs = options.deadlineAtMs !== undefined
-        ? Math.max(0, options.deadlineAtMs - Date.now())
-        : null;
-      let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
-      const deadlinePromise = remainingMs !== null
-        ? new Promise<never>((_, reject) => {
-          deadlineTimer = setTimeout(() => {
-            const deadlineError = buildDeadlineError(options);
-            controller.abort(deadlineError);
-            reject(deadlineError);
-          }, remainingMs);
-        })
-        : null;
-      let result: T;
       try {
-        const operationPromise = operation(target, { signal: controller.signal });
-        result = deadlinePromise
-          ? await Promise.race([operationPromise, deadlinePromise])
-          : await operationPromise;
-      } finally {
-        if (deadlineTimer) clearTimeout(deadlineTimer);
-      }
+        const controller = new AbortController();
+        const remainingMs = options.deadlineAtMs !== undefined
+          ? Math.max(0, options.deadlineAtMs - Date.now())
+          : null;
+        let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+        const deadlinePromise = remainingMs !== null
+          ? new Promise<never>((_, reject) => {
+            deadlineTimer = setTimeout(() => {
+              const deadlineError = buildDeadlineError(options);
+              controller.abort(deadlineError);
+              reject(deadlineError);
+            }, remainingMs);
+          })
+          : null;
+        let result: T;
+        try {
+          const operationPromise = operation(target, { signal: controller.signal });
+          result = deadlinePromise
+            ? await Promise.race([operationPromise, deadlinePromise])
+            : await operationPromise;
+        } finally {
+          if (deadlineTimer) clearTimeout(deadlineTimer);
+        }
 
-      if (target.endpointId) {
-        try {
-          await recordSiteApiEndpointSuccess(target.endpointId);
-        } catch (error) {
-          console.warn('[siteApiEndpointService] failed to record endpoint success', error);
+        if (target.endpointId) {
+          try {
+            await recordSiteApiEndpointSuccess(target.endpointId);
+          } catch (error) {
+            console.warn('[siteApiEndpointService] failed to record endpoint success', error);
+          }
+        } else {
+          try {
+            await recordSiteApiFallbackSuccess(target.siteId);
+          } catch (error) {
+            console.warn('[siteApiEndpointService] failed to record site fallback success', error);
+          }
         }
-      } else {
-        try {
-          await recordSiteApiFallbackSuccess(target.siteId);
-        } catch (error) {
-          console.warn('[siteApiEndpointService] failed to record site fallback success', error);
-        }
-      }
-      return result;
-    } catch (error) {
-      lastError = error;
-      if (error instanceof SiteApiEndpointRequestError && error.failureKind === 'request-deadline-exhausted') {
-        throw error;
-      }
-      const failureInput: SiteApiEndpointFailureInput = {
-        status: error instanceof SiteApiEndpointRequestError ? error.status : undefined,
-        message: error instanceof Error ? error.message : String(error ?? ''),
-        error,
-        failureKind: error instanceof SiteApiEndpointRequestError ? error.failureKind : null,
-        requestScopeId,
-      };
-      if (!target.endpointId) {
-        await recordSiteApiFallbackFailure(target.siteId, failureInput);
-        if (error instanceof SiteApiEndpointRequestError) {
+        // 成功时把站点租约挂到响应流上，让槽位随流读取结束才释放。
+        const attached = attachSiteLeaseToResult(result, siteLease);
+        leaseHeldByResult = attached.held;
+        return attached.result;
+      } catch (error) {
+        lastError = error;
+        if (error instanceof SiteApiEndpointRequestError && error.failureKind === 'request-deadline-exhausted') {
           throw error;
         }
-        throw new SiteApiEndpointRequestError(failureInput.message || 'upstream request failed', {
-          status: failureInput.status,
-          rawErrText: failureInput.message,
-          failureKind: failureInput.failureKind,
-          cause: error,
-        });
-      }
+        const failureInput: SiteApiEndpointFailureInput = {
+          status: error instanceof SiteApiEndpointRequestError ? error.status : undefined,
+          message: error instanceof Error ? error.message : String(error ?? ''),
+          error,
+          failureKind: error instanceof SiteApiEndpointRequestError ? error.failureKind : null,
+          requestScopeId,
+        };
+        if (!target.endpointId) {
+          await recordSiteApiFallbackFailure(target.siteId, failureInput);
+          if (error instanceof SiteApiEndpointRequestError) {
+            throw error;
+          }
+          throw new SiteApiEndpointRequestError(failureInput.message || 'upstream request failed', {
+            status: failureInput.status,
+            rawErrText: failureInput.message,
+            failureKind: failureInput.failureKind,
+            cause: error,
+          });
+        }
 
-      const recordedFailure = await recordSiteApiEndpointFailure(target.endpointId, failureInput);
-      if (!recordedFailure.rotateToNextEndpoint) throw error;
-      attemptedEndpointIds.add(target.endpointId);
+        const recordedFailure = await recordSiteApiEndpointFailure(target.endpointId, failureInput);
+        if (!recordedFailure.rotateToNextEndpoint) throw error;
+        attemptedEndpointIds.add(target.endpointId);
+      }
     }
+  } finally {
+    if (!leaseHeldByResult) siteLease.release();
   }
 }
 

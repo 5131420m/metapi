@@ -4,12 +4,18 @@ import {
   type CheckinResult,
   type UserInfo,
 } from './base.js';
+import {
+  buildEndpointModelContextLengthScope,
+  extractContextLengthsFromPayload,
+  setModelContextLengths,
+} from '../modelContextLengthCache.js';
 
 type FetchModelsOptions = {
   baseUrl: string;
   headers?: Record<string, string>;
   resolveUrl?: (normalizedBaseUrl: string) => string;
   mapResponse?: (payload: any) => unknown[];
+  contextSourceScope?: string;
 };
 
 export function normalizePlatformBaseUrl(baseUrl: string): string {
@@ -74,10 +80,16 @@ export abstract class StandardApiProviderAdapterBase extends BasePlatformAdapter
       : Array.isArray(payload?.data)
         ? payload.data.map((item: any) => item?.id)
         : null;
-
     if (!Array.isArray(rows)) {
       throw new Error('invalid standard models payload');
     }
+
+    // Cache metadata only after confirming the upstream payload is valid.
+    const contextLengths = extractContextLengthsFromPayload(payload);
+    setModelContextLengths(
+      contextLengths,
+      options.contextSourceScope || buildEndpointModelContextLengthScope(normalizedBaseUrl),
+    );
 
     return rows
       .map((item) => (typeof item === 'string' ? item.trim() : ''))

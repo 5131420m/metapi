@@ -42,7 +42,11 @@ describe('k3s deploy assets', () => {
     expect(normalizedServiceTemplate).toContain('{{- if and (or (eq .Values.service.type "NodePort") (eq .Values.service.type "LoadBalancer")) .Values.service.nodePort }}');
     expect(helpersTemplate).toContain('define "metapi.envSecretName"');
     expect(helpersTemplate).toContain('printf "%s-env"');
-    expect(deploymentTemplate).toContain('include "metapi.envSecretName"');
+    // envFrom resolves the chart-managed Secret name unless existingSecret is set,
+    // in which case the operator-supplied Secret is referenced instead.
+    expect(helpersTemplate).toContain('define "metapi.envSecretRefName"');
+    expect(helpersTemplate).toContain('.Values.existingSecret');
+    expect(deploymentTemplate).toContain('include "metapi.envSecretRefName"');
     expect(readRepoFile('deploy/k3s/chart/templates/secret.yaml')).toContain('include "metapi.envSecretName"');
   });
 

@@ -1,6 +1,11 @@
 import { Headers, type HeadersInit } from 'undici';
 
 export type SiteCustomHeadersRecord = Record<string, string>;
+export type SiteCustomHeadersMergePriority = 'request' | 'site';
+
+export type SiteCustomHeadersMergeOptions = {
+  priority?: SiteCustomHeadersMergePriority;
+};
 
 export type ParsedSiteCustomHeadersInput = {
   present: boolean;
@@ -105,15 +110,20 @@ export function readSiteCustomHeaders(input: unknown): SiteCustomHeadersRecord |
 export function mergeHeadersWithSiteCustomHeaders(
   siteCustomHeaders: unknown,
   requestHeaders?: HeadersInit,
+  options: SiteCustomHeadersMergeOptions = {},
 ): HeadersInit | undefined {
   const normalizedSiteHeaders = readSiteCustomHeaders(siteCustomHeaders);
   if (!normalizedSiteHeaders) {
     return requestHeaders;
   }
 
-  const merged = new Headers(requestHeaders || {});
-  for (const [key, value] of Object.entries(normalizedSiteHeaders)) {
+  // 本 fork 默认保持“站点头优先”：站点自定义头覆盖同名请求头。
+  // 站点可通过 customHeadersOverrideRequestHeaders=false 显式切换为请求头优先。
+  const priority = options.priority ?? 'site';
+  const merged = new Headers(priority === 'site' ? requestHeaders : normalizedSiteHeaders);
+  const headersToApplyLast = new Headers(priority === 'site' ? normalizedSiteHeaders : requestHeaders);
+  headersToApplyLast.forEach((value, key) => {
     merged.set(key, value);
-  }
+  });
   return merged;
 }

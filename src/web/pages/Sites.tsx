@@ -63,7 +63,9 @@ type SiteRow = {
   proxyUrl?: string | null;
   useSystemProxy?: boolean;
   customHeaders?: string | null;
+  customHeadersOverrideRequestHeaders?: boolean | null;
   globalWeight?: number;
+  maxConcurrency?: number;
   isPinned?: boolean;
   sortOrder?: number;
   totalBalance?: number;
@@ -240,6 +242,7 @@ const platformColors: Record<string, string> = {
   'one-hub': 'badge-muted',
   'done-hub': 'badge-muted',
   sub2api: 'badge-muted',
+  orcarouter: 'badge-warning',
   openai: 'badge-success',
   codex: 'badge-success',
   claude: 'badge-warning',
@@ -256,6 +259,7 @@ const SITE_PLATFORM_OPTIONS = [
   { value: 'one-hub', label: 'one-hub', description: '聚合面板，偏向多账号统一管理' },
   { value: 'done-hub', label: 'done-hub', description: '聚合面板，适合统一转发与管理' },
   { value: 'sub2api', label: 'sub2api', description: '订阅式中转面板，可同步套餐与余额信息' },
+  { value: 'orcarouter', label: 'orcarouter', description: 'OrcaRouter 官方 OpenAI 兼容网关，sk-orca- API Key 直连' },
   { value: 'openai', label: 'openai', description: '通用 OpenAI 兼容接口，手填 Base URL 即可' },
   { value: 'codex', label: 'codex', description: 'Codex OAuth / Session 优先入口' },
   { value: 'claude', label: 'claude', description: '通用 Claude / Anthropic 兼容接口' },
@@ -756,6 +760,11 @@ export default function Sites() {
       toast.error('全局权重必须是大于 0 的数字');
       return;
     }
+    const parsedMaxConcurrency = Number(form.maxConcurrency);
+    if (!Number.isSafeInteger(parsedMaxConcurrency) || parsedMaxConcurrency < 0 || parsedMaxConcurrency > 100_000) {
+      toast.error('站点最大并发必须是 0 到 100000 的整数，0 表示不限制');
+      return;
+    }
     const serializedCustomHeaders = serializeSiteCustomHeaders(form.customHeaders);
     if (!serializedCustomHeaders.valid) {
       toast.error(serializedCustomHeaders.error || '自定义请求头格式不正确');
@@ -777,10 +786,12 @@ export default function Sites() {
       useSystemProxy: !!form.useSystemProxy,
       apiEndpoints: serializedApiEndpoints.apiEndpoints,
       customHeaders: serializedCustomHeaders.customHeaders,
+      customHeadersOverrideRequestHeaders: !!form.customHeadersOverrideRequestHeaders,
       globalWeight: Number(parsedGlobalWeight.toFixed(3)),
       forcedEndpoint: form.forcedEndpoint || null,
       codexIdentityMode: form.codexIdentityMode || 'off',
       apiEndpointSiteFallbackEnabled: form.apiEndpointSiteFallbackEnabled,
+      maxConcurrency: parsedMaxConcurrency,
       postRefreshProbeEnabled: probeEnabled,
       postRefreshProbeModel: probeModel.trim(),
       postRefreshProbeScope: probeScope,
@@ -1627,8 +1638,37 @@ export default function Sites() {
                 </button>
               </div>
             ))}
+            <label style={{
+              display: 'flex',
+              alignItems: 'flex-start',
+              gap: 10,
+              padding: '10px 12px',
+              border: '1px solid var(--color-border)',
+              borderRadius: 'var(--radius-sm)',
+              background: 'var(--color-bg)',
+              color: 'var(--color-text-primary)',
+              fontSize: 13,
+            }}>
+              <input
+                type="checkbox"
+                checked={form.customHeadersOverrideRequestHeaders}
+                onChange={(e) => setForm((prev) => ({
+                  ...prev,
+                  customHeadersOverrideRequestHeaders: e.target.checked,
+                }))}
+                style={{ marginTop: 2 }}
+              />
+              <span style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <span>允许站点自定义请求头覆盖同名出站请求头</span>
+                <span style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.5 }}>
+                  {form.customHeadersOverrideRequestHeaders
+                    ? '站点自定义请求头将覆盖同名出站请求头，适合强制覆盖 User-Agent、Version 等客户端特征。'
+                    : '关闭时请求本身显式传入的请求头优先级更高。'}
+                </span>
+              </span>
+            </label>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.6 }}>
-              按 key/value 逐条填写。整行留空会自动忽略；同名请求头不允许重复；请求本身显式传入的请求头优先级更高。
+              按 key/value 逐条填写。整行留空会自动忽略；同名请求头不允许重复。
             </div>
             {isEditing && (
               <div style={{ marginTop: 16, padding: '14px', border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', background: 'var(--color-bg)' }}>
@@ -1978,6 +2018,21 @@ export default function Sites() {
                 越大越容易被路由选中。建议 0.5-3，默认 1。
               </div>
             </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <input
+                type="number"
+                min={0}
+                max={100000}
+                step={1}
+                placeholder="站点最大并发（0-100000，0 表示不限制）"
+                value={form.maxConcurrency}
+                onChange={(e) => setForm((prev) => ({ ...prev, maxConcurrency: e.target.value }))}
+                style={formInputStyle}
+              />
+              <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                同一站点的请求会共享该上限，超过后按并发等待时间排队。
+              </div>
+            </div>
           </ResponsiveFormGrid>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 12 }}>
@@ -2114,6 +2169,10 @@ export default function Sites() {
                       )}
                     />
                     <MobileField label="权重" value={(site.globalWeight || 1).toFixed(2)} />
+                    <MobileField
+                      label="最大并发"
+                      value={site.maxConcurrency && site.maxConcurrency > 0 ? String(site.maxConcurrency) : '不限制'}
+                    />
                     {isExpanded ? (
                       <div className="mobile-card-extra">
                         <MobileField
@@ -2254,6 +2313,7 @@ export default function Sites() {
                   <th>状态</th>
                   <th>系统代理</th>
                   <th>权重</th>
+                  <th>最大并发</th>
                   <th>平台</th>
                   <th>创建时间</th>
                   <th className="sites-actions-col" style={{ textAlign: 'right' }}>操作</th>
@@ -2339,6 +2399,9 @@ export default function Sites() {
                     </td>
                     <td style={{ fontVariantNumeric: 'tabular-nums', fontWeight: 600 }}>
                       {(site.globalWeight || 1).toFixed(2)}
+                    </td>
+                    <td style={{ fontVariantNumeric: 'tabular-nums' }}>
+                      {site.maxConcurrency && site.maxConcurrency > 0 ? site.maxConcurrency : '不限制'}
                     </td>
                     <td>
                       <a

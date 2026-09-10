@@ -6,6 +6,7 @@ const adapterMock = {
 };
 
 const selectAllMock = vi.fn();
+const selectGetMock = vi.fn();
 const updateSetMock = vi.fn();
 const insertValuesMock = vi.fn();
 const reportTokenExpiredMock = vi.fn();
@@ -18,6 +19,7 @@ const undiciFetchMock = vi.fn();
 vi.mock('../db/index.js', () => {
   const selectChain = {
     all: () => selectAllMock(),
+    get: () => selectGetMock(),
     where: () => selectChain,
     innerJoin: () => selectChain,
     from: () => selectChain,
@@ -51,7 +53,7 @@ vi.mock('../db/index.js', () => {
       insert: () => insertChain,
     },
     schema: {
-      accounts: { id: 'id', siteId: 'siteId', status: 'status' },
+      accounts: { id: 'id', siteId: 'siteId', status: 'status', extraConfig: 'extraConfig' },
       sites: { id: 'id' },
       events: {},
     },
@@ -88,6 +90,7 @@ describe('balanceService auto relogin', () => {
     adapterMock.getBalance.mockReset();
     adapterMock.login.mockReset();
     selectAllMock.mockReset();
+    selectGetMock.mockReset();
     updateSetMock.mockReset();
     insertValuesMock.mockReset();
     reportTokenExpiredMock.mockReset();
@@ -142,6 +145,137 @@ describe('balanceService auto relogin', () => {
     expect(adapterMock.getBalance.mock.calls[1][1]).toBe('fresh-token');
     expect(updateSetMock.mock.calls.some((call) => call[0]?.accessToken === 'fresh-token')).toBe(true);
     expect(reportTokenExpiredMock).not.toHaveBeenCalled();
+  });
+
+  it('does not replay the relogin config snapshot after the balance retry', async () => {
+    const autoRelogin = { username: 'alice@example.com', passwordCipher: 'cipher' };
+    let currentExtraConfig = JSON.stringify({
+      autoRelogin,
+      proxyUrl: 'http://old-proxy.example',
+    });
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 14,
+          username: 'alice@example.com',
+          accessToken: 'stale-token',
+          status: 'active',
+          extraConfig: currentExtraConfig,
+        },
+        sites: {
+          id: 14,
+          name: 'concurrent-settings',
+          url: 'https://example.com',
+          platform: 'new-api',
+        },
+      },
+    ]);
+    selectGetMock.mockImplementation(() => ({ extraConfig: currentExtraConfig }));
+
+    adapterMock.getBalance
+      .mockRejectedValueOnce(new Error('HTTP 401: access token required'))
+      .mockImplementationOnce(async () => {
+        currentExtraConfig = JSON.stringify({
+          autoRelogin,
+          platformUserId: 500123,
+          proxyUrl: 'http://changed-during-retry.example',
+        });
+        return { balance: 12, used: 1, quota: 13 };
+      });
+    decryptPasswordMock.mockReturnValue('plain-password');
+    adapterMock.login.mockImplementation(async () => {
+      currentExtraConfig = JSON.stringify({
+        autoRelogin,
+        proxyUrl: 'http://changed-during-login.example',
+      });
+      return {
+        success: true,
+        accessToken: 'fresh-token',
+        platformUserId: 500123,
+      };
+    });
+
+    const { refreshBalance } = await import('./balanceService.js');
+    await refreshBalance(14);
+
+    expect(selectGetMock).toHaveBeenCalledTimes(1);
+    const reloginWrite = updateSetMock.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => payload.accessToken === 'fresh-token');
+    expect(JSON.parse(String(reloginWrite?.extraConfig))).toMatchObject({
+      autoRelogin,
+      platformUserId: 500123,
+      proxyUrl: 'http://changed-during-login.example',
+    });
+
+    const finalBalanceWrite = updateSetMock.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => payload.balance === 12);
+    expect(finalBalanceWrite?.extraConfig).toBeUndefined();
+  });
+
+  it('merges final balance metadata into configuration changed during the retry', async () => {
+    const autoRelogin = { username: 'alice@example.com', passwordCipher: 'cipher' };
+    let currentExtraConfig = JSON.stringify({
+      autoRelogin,
+      proxyUrl: 'http://old-proxy.example',
+    });
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 16,
+          username: 'alice@example.com',
+          accessToken: 'stale-token',
+          status: 'active',
+          extraConfig: currentExtraConfig,
+        },
+        sites: {
+          id: 16,
+          name: 'concurrent-settings-with-income',
+          url: 'https://example.com',
+          platform: 'new-api',
+        },
+      },
+    ]);
+    selectGetMock.mockImplementation(() => ({ extraConfig: currentExtraConfig }));
+
+    adapterMock.getBalance
+      .mockRejectedValueOnce(new Error('HTTP 401: access token required'))
+      .mockImplementationOnce(async () => {
+        currentExtraConfig = JSON.stringify({
+          autoRelogin,
+          platformUserId: 500123,
+          proxyUrl: 'http://changed-during-retry.example',
+        });
+        return { balance: 12, used: 1, quota: 13, todayIncome: 2.5 };
+      });
+    decryptPasswordMock.mockReturnValue('plain-password');
+    adapterMock.login.mockImplementation(async () => {
+      currentExtraConfig = JSON.stringify({
+        autoRelogin,
+        proxyUrl: 'http://changed-during-login.example',
+      });
+      return {
+        success: true,
+        accessToken: 'fresh-token',
+        platformUserId: 500123,
+      };
+    });
+
+    const { refreshBalance } = await import('./balanceService.js');
+    await refreshBalance(16);
+
+    expect(selectGetMock).toHaveBeenCalledTimes(2);
+    const finalBalanceWrite = updateSetMock.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .find((payload) => payload.balance === 12);
+    const finalExtraConfig = JSON.parse(String(finalBalanceWrite?.extraConfig));
+    expect(finalExtraConfig).toMatchObject({
+      autoRelogin,
+      platformUserId: 500123,
+      proxyUrl: 'http://changed-during-retry.example',
+    });
+    expect(finalExtraConfig.todayIncomeSnapshot?.latest).toBe(2.5);
   });
 
   it('reports token expired when relogin is unavailable', async () => {

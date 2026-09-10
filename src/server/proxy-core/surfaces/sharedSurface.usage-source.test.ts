@@ -34,6 +34,7 @@ vi.mock('../../services/alertRules.js', () => ({
 }));
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
+  RETRYABLE_TIMEOUT_PATTERNS: [],
   shouldRetryProxyRequest: vi.fn(() => false),
 }));
 
@@ -73,6 +74,7 @@ vi.mock('../../services/proxyChannelCoordinator.js', () => ({
     bindStickyChannel: vi.fn(),
     clearStickyChannel: vi.fn(),
     acquireChannelLease: vi.fn(),
+    acquireSiteLease: vi.fn(),
   },
 }));
 

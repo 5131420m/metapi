@@ -208,7 +208,22 @@ async function fetchTodayIncomeFromLogs(params: {
   return Math.round(totalIncome * 1_000_000) / 1_000_000;
 }
 
-async function tryAutoRelogin(account: any, site: any): Promise<string | null> {
+/**
+ * Result of a successful automatic re-login.
+ *
+ * The access token alone is not enough: the login may also have reported the
+ * authoritative `platformUserId`. Callers need it for the retry that follows,
+ * and they need the merged `extraConfig` so their own later
+ * `mergeAccountExtraConfig(account.extraConfig, ...)` writes do not put the
+ * pre-login copy back and undo what was just persisted.
+ */
+type AutoReloginResult = {
+  accessToken: string;
+  platformUserId?: number;
+  extraConfig?: string;
+};
+
+async function tryAutoRelogin(account: any, site: any): Promise<AutoReloginResult | null> {
   const adapter = getAdapter(site.platform);
   if (!adapter) return null;
 
@@ -224,16 +239,37 @@ async function tryAutoRelogin(account: any, site: any): Promise<string | null> {
   );
   if (!loginResult.success || !loginResult.accessToken) return null;
 
+  // Re-read after the network request: account settings may have changed while
+  // login was in flight, and merging into the original snapshot would overwrite
+  // those newer fields when the whole extraConfig value is persisted.
+  const latestAccount = loginResult.platformUserId
+    ? await db.select({ extraConfig: schema.accounts.extraConfig })
+      .from(schema.accounts)
+      .where(eq(schema.accounts.id, account.id))
+      .get()
+    : undefined;
+  const reloginExtraConfig = loginResult.platformUserId
+    ? mergeAccountExtraConfig(
+      latestAccount ? latestAccount.extraConfig : account.extraConfig,
+      { platformUserId: loginResult.platformUserId },
+    )
+    : undefined;
+
   await db.update(schema.accounts)
     .set({
       accessToken: loginResult.accessToken,
+      ...(reloginExtraConfig ? { extraConfig: reloginExtraConfig } : {}),
       status: account.status === 'expired' ? 'active' : account.status,
       updatedAt: new Date().toISOString(),
     })
     .where(eq(schema.accounts.id, account.id))
     .run();
 
-  return loginResult.accessToken;
+  return {
+    accessToken: loginResult.accessToken,
+    platformUserId: loginResult.platformUserId,
+    extraConfig: reloginExtraConfig,
+  };
 }
 
 export async function refreshBalance(accountId: number) {
@@ -277,7 +313,7 @@ export async function refreshBalance(accountId: number) {
     };
   }
 
-  const platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
+  let platformUserId = resolvePlatformUserId(account.extraConfig, account.username);
   let activeAccessToken = account.accessToken;
   let activeExtraConfig = account.extraConfig;
   let balanceInfo: BalanceInfo | null = null;
@@ -343,9 +379,16 @@ export async function refreshBalance(accountId: number) {
         await handleBalanceError(retryErr);
       }
     } else if (shouldAttemptAutoRelogin(message)) {
-      const refreshedAccessToken = await tryAutoRelogin(account, site);
-      if (refreshedAccessToken) {
-        activeAccessToken = refreshedAccessToken;
+      const relogin = await tryAutoRelogin(account, site);
+      if (relogin) {
+        activeAccessToken = relogin.accessToken;
+        // Adopt the id the re-login reported and advance activeExtraConfig.
+        // `readBalance` closes over `platformUserId`, so without this the retry
+        // still sends the stale `New-Api-User`; and `nextExtraConfig` further down
+        // starts from `activeExtraConfig`, so the pre-login copy would be written
+        // back over the id tryAutoRelogin() just persisted.
+        if (relogin.platformUserId) platformUserId = relogin.platformUserId;
+        if (relogin.extraConfig) activeExtraConfig = relogin.extraConfig;
         try {
           balanceInfo = await readBalance(activeAccessToken);
         } catch (retryErr: any) {
@@ -380,14 +423,32 @@ export async function refreshBalance(accountId: number) {
     } catch {}
   }
 
+  const hasTodayIncomeUpdate =
+    typeof balanceInfo.todayIncome === 'number' && Number.isFinite(balanceInfo.todayIncome);
+  const hasSubscriptionUpdate =
+    !!balanceInfo.subscriptionSummary && isSub2ApiPlatform(site.platform);
   let nextExtraConfig = activeExtraConfig;
-  if (typeof balanceInfo.todayIncome === 'number' && Number.isFinite(balanceInfo.todayIncome)) {
-    nextExtraConfig = updateTodayIncomeSnapshot(nextExtraConfig, balanceInfo.todayIncome);
-  }
-  if (balanceInfo.subscriptionSummary && isSub2ApiPlatform(site.platform)) {
-    nextExtraConfig = mergeAccountExtraConfig(nextExtraConfig, {
-      sub2apiSubscription: buildStoredSub2ApiSubscriptionSummary(balanceInfo.subscriptionSummary),
-    });
+  let shouldPersistNextExtraConfig = false;
+
+  if (hasTodayIncomeUpdate || hasSubscriptionUpdate) {
+    // A retried balance request or income fallback may outlive another settings
+    // update. Merge only the new balance metadata into the latest configuration
+    // instead of replaying the snapshot captured immediately after re-login.
+    const latestAccount = await db.select({ extraConfig: schema.accounts.extraConfig })
+      .from(schema.accounts)
+      .where(eq(schema.accounts.id, account.id))
+      .get();
+    nextExtraConfig = latestAccount ? latestAccount.extraConfig : activeExtraConfig;
+
+    if (hasTodayIncomeUpdate) {
+      nextExtraConfig = updateTodayIncomeSnapshot(nextExtraConfig, balanceInfo.todayIncome!);
+    }
+    if (hasSubscriptionUpdate) {
+      nextExtraConfig = mergeAccountExtraConfig(nextExtraConfig, {
+        sub2apiSubscription: buildStoredSub2ApiSubscriptionSummary(balanceInfo.subscriptionSummary!),
+      });
+    }
+    shouldPersistNextExtraConfig = true;
   }
 
   const existingRuntimeHealth = extractRuntimeHealth(nextExtraConfig);
@@ -401,7 +462,7 @@ export async function refreshBalance(accountId: number) {
     lastBalanceRefresh: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
-  if (nextExtraConfig !== account.extraConfig) {
+  if (shouldPersistNextExtraConfig) {
     updates.extraConfig = nextExtraConfig;
   }
 

@@ -16,6 +16,8 @@
   <img alt="GitHub Release" src="https://img.shields.io/github/v/release/cita-777/metapi?label=Release&logo=github&style=flat">
 </a><a href="https://github.com/cita-777/metapi/stargazers">
   <img alt="GitHub Stars" src="https://img.shields.io/github/stars/cita-777/metapi?style=flat&logo=github&label=Stars">
+</a><a href="https://github.com/cita-777/metapi/graphs/contributors">
+  <img alt="Contributors" src="https://img.shields.io/github/contributors/cita-777/metapi?style=flat">
 </a><a href="https://atomgit.com/cita-777/metapi">
   <img alt="AtomGit Stars" src="https://atomgit.com/cita-777/metapi/star/badge.svg">
 </a><a href="https://deepwiki.com/cita-777/metapi">
@@ -71,8 +73,8 @@
 **Metapi** 作为这些中转站之上的**元聚合层（Meta-Aggregation Layer）**，把多个站点统一到 **一个入口（可按项目配置多个下游 API Key）**——下游所有工具（Cursor、Claude Code、Codex、Open WebUI 等）即可无感接入全部模型。当前支持的上游范围已经不止传统聚合面板，还包括：
 
 - 聚合面板： [New API](https://github.com/QuantumNous/new-api)、[One API](https://github.com/songquanpeng/one-api)、[OneHub](https://github.com/MartialBE/one-hub)、[DoneHub](https://github.com/deanxv/done-hub)、[Veloera](https://github.com/Veloera/Veloera)、[AnyRouter](https://anyrouter.top)、[Sub2API](https://github.com/Wei-Shaw/sub2api)
-- 通用兼容接口：OpenAI / Claude / Gemini compatible endpoints，以及 `cliproxyapi` / CPA
-- 官方预设：阿里云 / 智谱 / 豆包 Coding Plan，DeepSeek，Moonshot(Kimi)，MiniMax，ModelScope
+- 通用兼容接口：OpenAI / Claude / Gemini compatible endpoints，以及 `cliproxyapi` / CPA、[OrcaRouter](https://www.orcarouter.ai)
+- 官方预设：阿里云 / 智谱 / 豆包 Coding Plan，DeepSeek，Moonshot(Kimi)，MiniMax，ModelScope，OrcaRouter，无限星河
 - OAuth 连接：Codex、Claude、Gemini CLI、Antigravity
 
 详细接法见 [上游接入](./docs/upstream-integration.md) 与 [OAuth 管理](./docs/oauth.md)。
@@ -85,6 +87,36 @@
 | 📊 余额分散在各处，不知道还剩多少     | **集中看板** 一目了然，余额不足自动告警                          |
 | ✅ 每天得去各站签到领额度             | **自动签到** 定时执行，奖励自动追踪                              |
 | 🤷 不知道哪个站有什么模型             | **自动模型发现**，上游新增模型零配置出现在你的模型列表里         |
+
+---
+
+<a id="sponsors"></a>
+## ❤️ 赞助商
+
+感谢所有赞助者对本项目的支持，这些支持助力项目长期的功能更新与维护。也感谢每一位用户、贡献者和社区伙伴的使用、反馈、测试、分享与贡献。
+
+<div>
+  <p>
+    <a href="https://www.ipwo.net/?ref=githubmetapi">
+      <img src="docs/sponsors/ipwo.png" alt="IPWO 住宅代理" width="100%">
+    </a>
+  </p>
+  <p>
+    IPWO 覆盖 195+ 地区动态住宅代理、静态住宅代理和不限量住宅代理，支持 HTTP、HTTPS 及 SOCKS5 协议，适用于 AI 开发者及 API 应用的多地区网络访问。可用于 AI 模型调用、API 访问、自动化及数据采集等场景。支持免费测试，专属折扣码：<code>0205</code>，欢迎通过<a href="https://www.ipwo.net/?ref=githubmetapi">专属链接</a>体验。
+  </p>
+  <p>
+    <a href="https://www.infistar.cc/register?aff=JK4FA3JK&ref_source=link">
+      <img src="docs/sponsors/infistar-banner.png" alt="Infistar.cc 无限星河" width="100%">
+    </a>
+  </p>
+  <p>
+    感谢 <a href="https://www.infistar.cc/register?aff=JK4FA3JK&ref_source=link">Infistar.cc 无限星河</a> 赞助本项目，为 Metapi 智能路由补充稳定上游：<br>
+    ⚡ 稳定高效的模型通道：价格低至官方渠道 1 折，模型倍率公开透明，多节点冗余保障，有效降低限流、429 与断连影响。<br>
+    🧠 主流模型一站式接入：一个 API Key 即可调用 Claude、ChatGPT、Gemini、Kimi、GLM、DeepSeek 等主流模型。<br>
+    🔀 契合 Metapi 智能路由：可作为 OpenAI、Claude、Gemini 兼容上游接入，配合 Metapi 的模型自动发现、成本优选与故障转移，为 Cursor、Claude Code、Codex、Open WebUI 等工具提供稳定模型服务。<br>
+    🎁 Metapi 用户专属福利：通过<a href="https://www.infistar.cc/register?aff=JK4FA3JK&ref_source=link">专属推广链接</a>注册即可领取 5 美元等值测试额度 / 首充专属优惠，快速添加上游并开始调用。
+  </p>
+</div>
 
 ---
 
@@ -196,8 +228,9 @@
 | **Veloera**   | `veloera`   | API 网关平台         |
 | **AnyRouter** | `anyrouter` | 通用路由平台         |
 | **Sub2API**   | `sub2api`   | 订阅制中转平台       |
+| **OrcaRouter** | `orcarouter` | 官方 OpenAI 兼容网关 |
 
-各平台适配器覆盖模型枚举、余额查询、Token 管理、代理接入等通用能力；登录、签到、用户信息等能力按平台而异。
+各平台适配器覆盖模型枚举、代理接入等通用能力；余额查询和 Token 管理仅在上游提供相应接口的平台可用（OrcaRouter 目前不提供这两项能力）；登录、签到、用户信息等能力按平台而异。
 
 ### 👥 账号与 Token 管理
 
@@ -464,7 +497,7 @@ Metapi 完全自托管，所有数据（账号、令牌、路由、日志）均�
 
 ## ⭐ Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=cita-777/metapi&type=date&legend=top-left&v=2)](https://www.star-history.com/#cita-777/metapi&type=date&legend=top-left)
+[![Star History Chart](https://star-history.dera.page/svg?repos=cita-777/metapi&type=date&legend=top-left&v=2)](https://star-history.dera.page/#cita-777/metapi&type=date&legend=top-left)
 
 ---
 

@@ -484,7 +484,7 @@ export function buildUpstreamEndpointRequest(input: {
   headers: Record<string, string>;
   body: Record<string, unknown>;
   runtime?: {
-    executor: 'default' | 'codex' | 'gemini-cli' | 'antigravity' | 'claude';
+    executor: 'default' | 'codex' | 'gemini-native' | 'gemini-cli' | 'antigravity' | 'claude';
     modelName?: string;
     stream?: boolean;
     oauthProjectId?: string | null;
@@ -499,6 +499,45 @@ export function buildUpstreamEndpointRequest(input: {
   const isAntigravityUpstream = sitePlatform === 'antigravity';
   const isInternalGeminiUpstream = isGeminiCliUpstream || isAntigravityUpstream;
   const isClaudeOauthUpstream = isClaudeUpstream && input.oauthProvider === 'claude';
+
+  const hasAssistantToolCallHistory = (body: Record<string, unknown>): boolean => {
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    return messages.some((message) => (
+      isRecord(message)
+      && asTrimmedString(message.role).toLowerCase() === 'assistant'
+      && Array.isArray(message.tool_calls)
+      && message.tool_calls.length > 0
+    ));
+  };
+
+  const resolveGeminiNativeEndpointPath = (stream: boolean): string => {
+    if (input.siteUrl) {
+      let parsedSiteUrl: URL;
+      try {
+        parsedSiteUrl = new URL(input.siteUrl);
+      } catch {
+        throw new Error('Gemini native API requires a valid HTTPS site URL');
+      }
+      if (parsedSiteUrl.protocol !== 'https:') {
+        throw new Error('Gemini native API requires an HTTPS site URL');
+      }
+    }
+    const normalizedModel = asTrimmedString(input.modelName).replace(/^models\//, '');
+    const encodedModel = normalizedModel
+      .split('/')
+      .map((segment) => encodeURIComponent(segment))
+      .join('/');
+    const params = new URLSearchParams();
+    if (stream) params.set('alt', 'sse');
+    // Gemini's native API-key authentication is query based. The compatibility
+    // path normally uses an OpenAI-style bearer header, but this fallback is
+    // dispatched to /v1beta/models and must carry the key explicitly.
+    params.set('key', input.tokenValue);
+    const suffix = params.toString();
+    return `${stream
+      ? `/v1beta/models/${encodedModel}:streamGenerateContent`
+      : `/v1beta/models/${encodedModel}:generateContent`}${suffix ? `?${suffix}` : ''}`;
+  };
 
   const resolveGeminiEndpointPath = (endpoint: UpstreamEndpoint): string => {
     const normalizedSiteUrl = asTrimmedString(input.siteUrl).toLowerCase();
@@ -589,7 +628,7 @@ export function buildUpstreamEndpointRequest(input: {
             : sitePlatform === 'claude'
               ? 'claude'
               : 'default'
-    ) as 'default' | 'codex' | 'gemini-cli' | 'antigravity' | 'claude',
+    ) as 'default' | 'codex' | 'gemini-native' | 'gemini-cli' | 'antigravity' | 'claude',
     modelName: input.modelName,
     stream: input.stream,
     oauthProjectId: asTrimmedString(input.oauthProjectId) || null,
@@ -634,6 +673,31 @@ export function buildUpstreamEndpointRequest(input: {
       body: configuredGeminiRequest,
       action: input.stream ? 'streamGenerateContent' : 'generateContent',
     });
+  }
+
+  if (isGeminiUpstream && input.endpoint === 'chat' && hasAssistantToolCallHistory(openaiBody)) {
+    const geminiRequest = buildGeminiGenerateContentRequestFromOpenAi({
+      body: openaiBody,
+      modelName: input.modelName,
+    });
+    const configuredGeminiRequest = applyConfiguredPayloadRules(geminiRequest);
+    const action = input.stream ? 'streamGenerateContent' : 'generateContent';
+    const nativeHeaders = { ...ensureStreamAcceptHeader(commonHeaders, input.stream) };
+    // Do not send the compatibility bearer credential to the native endpoint;
+    // the API key in the query string above is the canonical Gemini auth mode.
+    delete nativeHeaders.Authorization;
+    return {
+      path: resolveGeminiNativeEndpointPath(input.stream),
+      headers: nativeHeaders,
+      body: configuredGeminiRequest,
+      runtime: {
+        executor: 'gemini-native',
+        modelName: input.modelName,
+        stream: input.stream,
+        oauthProjectId: null,
+        action,
+      },
+    };
   }
 
   if (input.endpoint === 'messages') {

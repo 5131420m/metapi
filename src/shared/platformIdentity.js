@@ -17,6 +17,7 @@ export const PLATFORM_ALIASES = Object.assign(Object.create(null), {
   'done-hub': 'done-hub',
   veloera: 'veloera',
   sub2api: 'sub2api',
+  orcarouter: 'orcarouter',
   openai: 'openai',
   codex: 'codex',
   'chatgpt-codex': 'codex',
@@ -89,6 +90,11 @@ export function detectPlatformByUrlHint(url) {
   if (host.includes('onehub') || host.includes('one-hub')) return 'one-hub';
   if (host.includes('veloera')) return 'veloera';
   if (host.includes('sub2api')) return 'sub2api';
+  // OrcaRouter is an upstream API host, not a free-form URL marker. Keep the
+  // match bounded to the official host (and its explicitly delegated
+  // subdomains) so a token is never routed to an unrelated URL containing the
+  // provider name in a path, query, or userinfo component.
+  if (host === 'api.orcarouter.ai' || host.endsWith('.orcarouter.ai')) return 'orcarouter';
 
   return undefined;
 }

@@ -37,11 +37,18 @@ export interface BalanceInfo {
   subscriptionSummary?: SubscriptionSummary;
 }
 
-interface LoginResult {
+export interface LoginResult {
   success: boolean;
   accessToken?: string;
   username?: string;
   message?: string;
+  /**
+   * Site-side user id (the value of the `New-Api-User` header).
+   * Most New API compatible sites return it in the login payload as
+   * `data.id`, so adapters can surface it here instead of forcing callers
+   * to guess it from the username or re-discover it on every request.
+   */
+  platformUserId?: number;
 }
 
 export interface UserInfo {
@@ -79,6 +86,19 @@ export interface SiteAnnouncement {
   rawPayload?: unknown;
 }
 
+/**
+ * Options for model discovery.
+ *
+ * `signal` lets a caller abort an in-flight discovery scan (fork behavior).
+ * `contextSourceScope` names the cache scope that discovered context lengths
+ * are recorded under (upstream behavior). Both are optional and independent,
+ * so they share one options bag instead of competing for the 4th parameter.
+ */
+export interface GetModelsOptions {
+  signal?: AbortSignal;
+  contextSourceScope?: string;
+}
+
 export interface CreateApiTokenOptions {
   name?: string;
   group?: string;
@@ -98,7 +118,7 @@ export interface PlatformAdapter {
   verifyToken(baseUrl: string, token: string, platformUserId?: number): Promise<TokenVerifyResult>;
   checkin(baseUrl: string, accessToken: string, platformUserId?: number): Promise<CheckinResult>;
   getBalance(baseUrl: string, accessToken: string, platformUserId?: number): Promise<BalanceInfo>;
-  getModels(baseUrl: string, token: string, platformUserId?: number, options?: { signal?: AbortSignal }): Promise<string[]>;
+  getModels(baseUrl: string, token: string, platformUserId?: number, options?: GetModelsOptions): Promise<string[]>;
   getApiToken(baseUrl: string, accessToken: string, platformUserId?: number): Promise<string | null>;
   getApiTokens(baseUrl: string, accessToken: string, platformUserId?: number): Promise<ApiTokenInfo[]>;
   getSiteAnnouncements(baseUrl: string, accessToken: string, platformUserId?: number): Promise<SiteAnnouncement[]>;
@@ -113,7 +133,7 @@ export abstract class BasePlatformAdapter implements PlatformAdapter {
   abstract detect(url: string): Promise<boolean>;
   abstract checkin(baseUrl: string, accessToken: string): Promise<CheckinResult>;
   abstract getBalance(baseUrl: string, accessToken: string): Promise<BalanceInfo>;
-  abstract getModels(baseUrl: string, token: string, platformUserId?: number, options?: { signal?: AbortSignal }): Promise<string[]>;
+  abstract getModels(baseUrl: string, token: string, platformUserId?: number, options?: GetModelsOptions): Promise<string[]>;
 
   async verifyToken(baseUrl: string, token: string, _platformUserId?: number): Promise<TokenVerifyResult> {
     // 1. Try as session/access token first (for management APIs)
@@ -156,6 +176,42 @@ export abstract class BasePlatformAdapter implements PlatformAdapter {
     }
   }
 
+  /**
+   * Pull the site-side user id out of the login payload.
+   *
+   * New API compatible sites return `{ success: true, data: { id, ... } }` on
+   * `/api/user/login`, so the id is already there at login time. Without it,
+   * callers fall back to `guessPlatformUserIdFromUsername()`, which only works
+   * when the username happens to end with the id.
+   *
+   * This lives on the base adapter so every subclass benefits. Veloera, for
+   * one, inherits `login()` as-is, yet its `authHeaders()` only sends
+   * `Veloera-User` / `New-API-User` / `User-id` when an id was resolved — so
+   * without this it hits the same e-mail-login failure.
+   */
+  protected extractLoginUserId(payload: any): number | undefined {
+    const candidates: unknown[] = [
+      payload?.data?.id,
+      payload?.data?.user?.id,
+      payload?.user?.id,
+      payload?.id,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'number') {
+        if (Number.isSafeInteger(candidate) && candidate > 0) return candidate;
+        continue;
+      }
+      // Only accept a string that is *entirely* digits. `Number.parseInt` would
+      // happily turn "80305abc" or "80305.9" into 80305 and we would then send a
+      // wrong `New-Api-User` header.
+      if (typeof candidate === 'string' && /^\d+$/.test(candidate.trim())) {
+        const value = Number(candidate.trim());
+        if (Number.isSafeInteger(value) && value > 0) return value;
+      }
+    }
+    return undefined;
+  }
+
   async login(baseUrl: string, username: string, password: string): Promise<LoginResult> {
     try {
       const res = await this.fetchJson<any>(`${baseUrl}/api/user/login`, {
@@ -167,6 +223,7 @@ export abstract class BasePlatformAdapter implements PlatformAdapter {
           success: true,
           accessToken: typeof res.data === 'string' ? res.data : res.data.token || res.data.access_token,
           username,
+          platformUserId: this.extractLoginUserId(res),
         };
       }
       return { success: false, message: res?.message || '登录失败' };

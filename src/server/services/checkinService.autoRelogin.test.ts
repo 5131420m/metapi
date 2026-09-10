@@ -11,12 +11,14 @@ const refreshBalanceMock = vi.fn();
 const decryptPasswordMock = vi.fn();
 
 const selectAllMock = vi.fn();
+const selectGetMock = vi.fn();
 const insertValuesMock = vi.fn();
 const updateSetMock = vi.fn();
 
 vi.mock('../db/index.js', () => {
   const selectChain = {
     all: () => selectAllMock(),
+    get: () => selectGetMock(),
     where: () => selectChain,
     innerJoin: () => selectChain,
     from: () => selectChain,
@@ -50,7 +52,7 @@ vi.mock('../db/index.js', () => {
       }),
     },
     schema: {
-      accounts: { id: 'id', siteId: 'siteId', checkinEnabled: 'checkinEnabled', status: 'status' },
+      accounts: { id: 'id', siteId: 'siteId', checkinEnabled: 'checkinEnabled', status: 'status', extraConfig: 'extraConfig' },
       sites: { id: 'id' },
       checkinLogs: {},
       events: {},
@@ -87,6 +89,7 @@ describe('checkinService auto relogin', () => {
     refreshBalanceMock.mockReset();
     decryptPasswordMock.mockReset();
     selectAllMock.mockReset();
+    selectGetMock.mockReset();
     insertValuesMock.mockReset();
     updateSetMock.mockReset();
   });
@@ -128,6 +131,130 @@ describe('checkinService auto relogin', () => {
     expect(adapterMock.checkin.mock.calls[1][1]).toBe('fresh-token');
     expect(adapterMock.checkin.mock.calls[0][2]).toBe(7659);
     expect(updateSetMock).toHaveBeenCalledWith(expect.objectContaining({ accessToken: 'fresh-token' }));
+  });
+
+  it('prefers the id reported by relogin over the guess, and never writes the guess back', async () => {
+    // `alice_1999` ends in digits that are not the account id — precisely the case
+    // guessPlatformUserIdFromUsername() gets wrong, since its /(\d{3,8})$/ only
+    // knows how to read a trailing number.
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 1,
+          username: 'alice_1999',
+          accessToken: 'expired-token',
+          status: 'active',
+          extraConfig: JSON.stringify({
+            autoRelogin: { username: 'alice_1999', passwordCipher: 'cipher' },
+          }),
+        },
+        sites: {
+          id: 3,
+          name: 'kfc',
+          url: 'https://kfc-api.sxxe.net',
+          platform: 'new-api',
+        },
+      },
+    ]);
+
+    adapterMock.checkin
+      .mockResolvedValueOnce({ success: false, message: '无权进行此操作，未登录且未提供 access token' })
+      .mockResolvedValueOnce({ success: true, message: 'checked in' });
+    decryptPasswordMock.mockReturnValue('plain-password');
+    adapterMock.login.mockResolvedValue({
+      success: true,
+      accessToken: 'fresh-token',
+      platformUserId: 500123,
+    });
+
+    const { checkinAccount } = await import('./checkinService.js');
+    await checkinAccount(1);
+
+    // The first attempt has nothing better than the guess...
+    expect(adapterMock.checkin.mock.calls[0][2]).toBe(1999);
+    // ...but the retry must use the id the site itself reported.
+    expect(adapterMock.checkin.mock.calls[1][2]).toBe(500123);
+
+    // And no later write may put the guess back over it. Parse the whole config,
+    // not just the id: a write that *replaced* extraConfig with only
+    // `{ platformUserId }` would satisfy an id-only assertion while dropping the
+    // autoRelogin credentials, leaving nothing to re-login with next time.
+    const writtenConfigs = updateSetMock.mock.calls
+      .map((call) => (call[0] as Record<string, unknown> | undefined)?.extraConfig)
+      .filter((cfg): cfg is string => typeof cfg === 'string')
+      .map((cfg) => JSON.parse(cfg) as {
+        platformUserId?: number;
+        autoRelogin?: { username?: string; passwordCipher?: string };
+      });
+    expect(writtenConfigs.length).toBeGreaterThan(0);
+    // Credentials must survive *every* write. `toContainEqual` would only prove one
+    // write got it right, while a later one could still drop them — and a single
+    // drop leaves nothing to re-login with next round.
+    for (const cfg of writtenConfigs) {
+      expect(cfg.autoRelogin).toEqual({ username: 'alice_1999', passwordCipher: 'cipher' });
+    }
+    const writtenIds = writtenConfigs.map((cfg) => cfg.platformUserId);
+    expect(writtenIds).toContain(500123);
+    expect(writtenIds).not.toContain(1999);
+  });
+
+  it('preserves account configuration updated while auto relogin is in flight', async () => {
+    const autoRelogin = { username: 'alice@example.com', passwordCipher: 'cipher' };
+    let currentExtraConfig = JSON.stringify({
+      autoRelogin,
+      proxyUrl: 'http://old-proxy.example',
+    });
+    selectAllMock.mockReturnValue([
+      {
+        accounts: {
+          id: 15,
+          username: 'alice@example.com',
+          accessToken: 'expired-token',
+          status: 'active',
+          extraConfig: currentExtraConfig,
+        },
+        sites: {
+          id: 15,
+          name: 'concurrent-settings',
+          url: 'https://example.com',
+          platform: 'new-api',
+        },
+      },
+    ]);
+    selectGetMock.mockImplementation(() => ({ extraConfig: currentExtraConfig }));
+
+    adapterMock.checkin
+      .mockResolvedValueOnce({ success: false, message: 'access token required' })
+      .mockResolvedValueOnce({ success: true, message: 'checked in' });
+    decryptPasswordMock.mockReturnValue('plain-password');
+    adapterMock.login.mockImplementation(async () => {
+      currentExtraConfig = JSON.stringify({
+        autoRelogin,
+        proxyUrl: 'http://new-proxy.example',
+      });
+      return {
+        success: true,
+        accessToken: 'fresh-token',
+        platformUserId: 500123,
+      };
+    });
+
+    const { checkinAccount } = await import('./checkinService.js');
+    await checkinAccount(15);
+
+    expect(selectGetMock).toHaveBeenCalled();
+    const writtenConfigs = updateSetMock.mock.calls
+      .map((call) => call[0]?.extraConfig)
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => JSON.parse(value) as Record<string, unknown>);
+    expect(writtenConfigs.length).toBeGreaterThan(0);
+    for (const config of writtenConfigs) {
+      expect(config).toMatchObject({
+        autoRelogin,
+        proxyUrl: 'http://new-proxy.example',
+      });
+    }
+    expect(writtenConfigs.some((config) => config.platformUserId === 500123)).toBe(true);
   });
 
   it('passes guessed platform user id when config does not include it', async () => {

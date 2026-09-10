@@ -31,3 +31,5 @@ env:
   checkinCron: "0 8 * * *"
   balanceRefreshCron: "0 * * * *"
   deployHelperToken: ""
+
+existingSecret: ""

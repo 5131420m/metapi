@@ -3,6 +3,7 @@ import {
   normalizePlatformBaseUrl,
   resolveVersionedModelsUrl,
 } from './standardApiProvider.js';
+import type { GetModelsOptions } from './base.js';
 
 export class CliProxyApiAdapter extends StandardApiProviderAdapterBase {
   readonly platformName = 'cliproxyapi';
@@ -50,11 +51,13 @@ export class CliProxyApiAdapter extends StandardApiProviderAdapterBase {
     }
   }
 
-  async getModels(baseUrl: string, apiToken: string): Promise<string[]> {
+  async getModels(baseUrl: string, apiToken: string, _platformUserId?: number, options?: GetModelsOptions): Promise<string[]> {
+    const contextSourceScope = options?.contextSourceScope;
     return this.fetchModelsFromStandardEndpoint({
       baseUrl,
       headers: { Authorization: `Bearer ${apiToken}` },
       resolveUrl: resolveVersionedModelsUrl,
+      contextSourceScope,
     });
   }
 }

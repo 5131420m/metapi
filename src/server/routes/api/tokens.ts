@@ -41,6 +41,18 @@ import {
   parseTokenRouteCreatePayload,
   parseTokenRouteUpdatePayload,
 } from '../../contracts/tokenRoutePayloads.js';
+import {
+  populateRouteChannelsByModelPattern,
+  rebuildAutomaticRouteChannelsByModelPattern,
+  syncPatternRouteChannelsAfterAffectedRouteChanges,
+} from '../../services/patternRouteChannelSyncService.js';
+import {
+  createRouteChannel,
+  insertRouteChannelsWithAllocatedPriorities,
+  replaceAutomaticRouteChannels,
+  RouteChannelNotFoundError,
+  updateRouteChannelPriorities,
+} from '../../services/routeChannelService.js';
 
 function createTokenRouteReadLimiter(keyPrefix: string, points = 60) {
   return new RateLimiterMemory({
@@ -317,143 +329,6 @@ async function checkTokenBelongsToAccount(tokenId: number, accountId: number): P
     .where(and(eq(schema.accountTokens.id, tokenId), eq(schema.accountTokens.accountId, accountId)))
     .get();
   return isUsableAccountToken(row ?? null);
-}
-
-async function getPatternTokenCandidates(modelPattern: string): Promise<Array<{ tokenId: number; accountId: number; sourceModel: string }>> {
-  const rows = await db.select().from(schema.tokenModelAvailability)
-    .innerJoin(schema.accountTokens, eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id))
-    .innerJoin(schema.accounts, eq(schema.accountTokens.accountId, schema.accounts.id))
-    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .where(
-      and(
-        eq(schema.tokenModelAvailability.available, true),
-        eq(schema.accountTokens.enabled, true),
-        eq(schema.accountTokens.valueStatus, ACCOUNT_TOKEN_VALUE_STATUS_READY),
-        eq(schema.accounts.status, 'active'),
-        eq(schema.sites.status, 'active'),
-      ),
-    )
-    .all();
-
-  const result: Array<{ tokenId: number; accountId: number; sourceModel: string }> = [];
-  for (const row of rows) {
-    if (!isUsableAccountToken(row.account_tokens)) continue;
-    const modelName = row.token_model_availability.modelName?.trim();
-    if (!modelName) continue;
-    if (!matchesModelPattern(modelName, modelPattern)) continue;
-    result.push({
-      tokenId: row.account_tokens.id,
-      accountId: row.accounts.id,
-      sourceModel: modelName,
-    });
-  }
-
-  return result;
-}
-
-async function getMatchedExactRouteChannelCandidates(modelPattern: string): Promise<Array<{
-  tokenId: number | null;
-  accountId: number;
-  sourceModel: string;
-  priority: number;
-  weight: number;
-  enabled: boolean;
-  manualOverride: boolean;
-}>> {
-  const matchedRoutes = (await db.select().from(schema.tokenRoutes)
-    .where(eq(schema.tokenRoutes.enabled, true))
-    .all())
-    .filter((route) => isExactModelPattern(route.modelPattern) && matchesModelPattern(route.modelPattern, modelPattern));
-
-  if (matchedRoutes.length === 0) return [];
-  const routeMap = new Map<number, typeof matchedRoutes[number]>();
-  for (const route of matchedRoutes) routeMap.set(route.id, route);
-
-  const channels = await db.select().from(schema.routeChannels)
-    .where(inArray(schema.routeChannels.routeId, matchedRoutes.map((route) => route.id)))
-    .all();
-
-  return channels.map((channel) => ({
-    tokenId: channel.tokenId ?? null,
-    accountId: channel.accountId,
-    sourceModel: (channel.sourceModel || routeMap.get(channel.routeId)?.modelPattern || '').trim(),
-    priority: channel.priority ?? 0,
-    weight: channel.weight ?? 10,
-    enabled: !!channel.enabled,
-    manualOverride: !!channel.manualOverride,
-  })).filter((candidate) => candidate.sourceModel.length > 0);
-}
-
-async function populateRouteChannelsByModelPattern(routeId: number, modelPattern: string): Promise<number> {
-  const routeCandidates = await getMatchedExactRouteChannelCandidates(modelPattern);
-  const availabilityCandidates = (await getPatternTokenCandidates(modelPattern)).map((candidate) => ({
-    tokenId: candidate.tokenId,
-    accountId: candidate.accountId,
-    sourceModel: candidate.sourceModel,
-    priority: 0,
-    weight: 10,
-    enabled: true,
-    manualOverride: false,
-  }));
-  const candidates = [...routeCandidates, ...availabilityCandidates];
-  if (candidates.length === 0) return 0;
-
-  const existingChannels = await db.select().from(schema.routeChannels)
-    .where(eq(schema.routeChannels.routeId, routeId))
-    .all();
-  const existingPairs = new Set<string>(
-    existingChannels
-      .map((channel) => {
-        const tokenId = typeof channel.tokenId === 'number' && Number.isFinite(channel.tokenId) ? channel.tokenId : 0;
-        const sourceModel = (channel.sourceModel || '').trim().toLowerCase();
-        return `${channel.accountId}::${tokenId}::${sourceModel}`;
-      }),
-  );
-
-  let created = 0;
-  for (const candidate of candidates) {
-    const tokenId = typeof candidate.tokenId === 'number' && Number.isFinite(candidate.tokenId) ? candidate.tokenId : 0;
-    const pairKey = `${candidate.accountId}::${tokenId}::${candidate.sourceModel.trim().toLowerCase()}`;
-    if (existingPairs.has(pairKey)) continue;
-    await db.insert(schema.routeChannels).values({
-      routeId,
-      accountId: candidate.accountId,
-      tokenId: candidate.tokenId,
-      sourceModel: candidate.sourceModel,
-      priority: candidate.priority,
-      weight: candidate.weight,
-      enabled: candidate.enabled,
-      manualOverride: candidate.manualOverride,
-    }).run();
-    existingPairs.add(pairKey);
-    created += 1;
-  }
-
-  return created;
-}
-
-async function rebuildAutomaticRouteChannelsByModelPattern(routeId: number, modelPattern: string): Promise<{
-  removedChannels: number;
-  createdChannels: number;
-}> {
-  const removableChannels = await db.select().from(schema.routeChannels)
-    .where(
-      and(
-        eq(schema.routeChannels.routeId, routeId),
-        eq(schema.routeChannels.manualOverride, false),
-      ),
-    )
-    .all();
-
-  for (const channel of removableChannels) {
-    await db.delete(schema.routeChannels).where(eq(schema.routeChannels.id, channel.id)).run();
-  }
-
-  const createdChannels = await populateRouteChannelsByModelPattern(routeId, modelPattern);
-  return {
-    removedChannels: removableChannels.length,
-    createdChannels,
-  };
 }
 
 type BatchChannelPriorityUpdate = {
@@ -744,10 +619,23 @@ async function fetchChannelsForRouteRows(
     });
   }
 
+  // API 返回顺序与优先级一致，避免数据库默认行顺序掩盖拖拽后的 P 值。
+  for (const channels of channelsByActualRouteId.values()) {
+    channels.sort((left, right) => {
+      const priorityDiff = (left.priority ?? 0) - (right.priority ?? 0);
+      return priorityDiff !== 0 ? priorityDiff : (left.id ?? 0) - (right.id ?? 0);
+    });
+  }
+
   const channelsByRoute = new Map<number, any[]>();
   for (const route of routes) {
     if (isExplicitGroupRoute(route)) {
-      channelsByRoute.set(route.id, route.sourceRouteIds.flatMap((sourceRouteId) => channelsByActualRouteId.get(sourceRouteId) || []));
+      const channels = route.sourceRouteIds.flatMap((sourceRouteId) => channelsByActualRouteId.get(sourceRouteId) || []);
+      channels.sort((left, right) => {
+        const priorityDiff = (left.priority ?? 0) - (right.priority ?? 0);
+        return priorityDiff !== 0 ? priorityDiff : (left.id ?? 0) - (right.id ?? 0);
+      });
+      channelsByRoute.set(route.id, channels);
       continue;
     }
     channelsByRoute.set(route.id, channelsByActualRouteId.get(route.id) || []);
@@ -883,21 +771,16 @@ export async function tokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: '显式群组不支持直接维护通道' });
     }
 
-    const existingChannels = await db.select().from(schema.routeChannels)
-      .where(eq(schema.routeChannels.routeId, routeId))
-      .all();
-    const existingPairs = new Set<string>(
-      existingChannels.map((channel) => {
-        const tokenId = typeof channel.tokenId === 'number' && Number.isFinite(channel.tokenId) ? channel.tokenId : 0;
-        const sourceModel = (channel.sourceModel || '').trim().toLowerCase();
-        return `${channel.accountId}::${tokenId}::${sourceModel}`;
-      }),
-    );
-
-    let created = 0;
-    let skipped = 0;
+    const candidates: Array<{
+      accountId: number;
+      tokenId: number | null;
+      sourceModel: string;
+      priority?: number;
+      weight?: number;
+      enabled?: boolean;
+      manualOverride?: boolean;
+    }> = [];
     const errors: string[] = [];
-
     for (const item of body.channels) {
       const sourceModel = typeof item.sourceModel === 'string'
         ? item.sourceModel.trim()
@@ -908,38 +791,29 @@ export async function tokensRoutes(app: FastifyInstance) {
         errors.push(`令牌 ${item.tokenId} 不属于账号 ${item.accountId}`);
         continue;
       }
-
-      const tokenIdForKey = typeof effectiveTokenId === 'number' && Number.isFinite(effectiveTokenId) ? effectiveTokenId : 0;
-      const pairKey = `${item.accountId}::${tokenIdForKey}::${sourceModel.toLowerCase()}`;
-      if (existingPairs.has(pairKey)) {
-        skipped += 1;
-        continue;
-      }
-
-      try {
-        await db.insert(schema.routeChannels).values({
-          routeId,
-          accountId: item.accountId,
-          tokenId: effectiveTokenId,
-          sourceModel: sourceModel || null,
-          priority: 0,
-          weight: 10,
-          manualOverride: true,
-        }).run();
-        existingPairs.add(pairKey);
-        created += 1;
-      } catch (e: any) {
-        errors.push(e.message || `添加通道失败: accountId=${item.accountId}`);
-      }
+      candidates.push({
+        accountId: item.accountId,
+        tokenId: effectiveTokenId,
+        sourceModel,
+        weight: 10,
+        enabled: true,
+        manualOverride: true,
+      });
     }
 
-    if (created > 0) {
-      await clearRouteDecisionSnapshot(routeId);
-      await clearDependentExplicitGroupSnapshotsBySourceRouteIds([routeId]);
-      invalidateTokenRouterCache();
+    const result = await insertRouteChannelsWithAllocatedPriorities({ routeId, candidates });
+    if (result.created > 0) {
+      await syncPatternRouteChannelsAfterAffectedRouteChanges({
+        affectedRouteIds: [routeId],
+      });
     }
 
-    return { success: true, created, skipped, errors };
+    return {
+      success: true,
+      created: result.created,
+      skipped: result.skipped,
+      errors: [...errors, ...result.errors],
+    };
   });
 
   // List all routes
@@ -1157,6 +1031,9 @@ export async function tokensRoutes(app: FastifyInstance) {
       }
     } else {
       await populateRouteChannelsByModelPattern(route.id, modelPattern);
+      await syncPatternRouteChannelsAfterAffectedRouteChanges({
+        affectedRouteIds: [route.id],
+      });
     }
     invalidateTokenRouterCache();
     return await getRouteWithSources(routeId);
@@ -1244,6 +1121,16 @@ export async function tokensRoutes(app: FastifyInstance) {
     if (routeMode === 'pattern' && modelPatternChanged) {
       await rebuildAutomaticRouteChannelsByModelPattern(id, nextModelPattern);
     }
+    if (routeMode === 'pattern' && (modelPatternChanged || body.enabled !== undefined)) {
+      await syncPatternRouteChannelsAfterAffectedRouteChanges({
+        affectedRouteIds: [id],
+        removedRoutes: modelPatternChanged ? [{
+          modelPattern: existingRoute.modelPattern,
+          routeMode: existingRoute.routeMode,
+          enabled: existingRoute.enabled,
+        }] : [],
+      });
+    }
     if (routeBehaviorChanged) {
       await clearRouteDecisionSnapshot(id);
       await clearDependentExplicitGroupSnapshotsBySourceRouteIds([id]);
@@ -1259,8 +1146,16 @@ export async function tokensRoutes(app: FastifyInstance) {
   // Delete a route
   app.delete<{ Params: { id: string } }>('/api/routes/:id', async (request) => {
     const id = parseInt(request.params.id, 10);
+    const existingRoute = await db.select().from(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, id)).get();
     await clearDependentExplicitGroupSnapshotsBySourceRouteIds([id]);
     await db.delete(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, id)).run();
+    await syncPatternRouteChannelsAfterAffectedRouteChanges({
+      removedRoutes: existingRoute ? [{
+        modelPattern: existingRoute.modelPattern,
+        routeMode: existingRoute.routeMode,
+        enabled: existingRoute.enabled,
+      }] : [],
+    });
     invalidateTokenRouterCache();
     return { success: true };
   });
@@ -1304,6 +1199,9 @@ export async function tokensRoutes(app: FastifyInstance) {
 
     await clearRouteDecisionSnapshots(ids);
     await clearDependentExplicitGroupSnapshotsBySourceRouteIds(ids);
+    await syncPatternRouteChannelsAfterAffectedRouteChanges({
+      affectedRouteIds: ids,
+    });
     invalidateTokenRouterCache();
 
     return { success: true, updatedCount: Number(updateResult?.changes || 0) };
@@ -1351,22 +1249,25 @@ export async function tokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: '该来源模型的通道已存在' });
     }
 
-    const insertedChannel = await db.insert(schema.routeChannels).values({
-      routeId,
-      accountId: body.accountId,
-      tokenId: body.tokenId,
-      sourceModel: sourceModel || null,
-      priority: body.priority ?? 0,
-      weight: body.weight ?? 10,
-    }).run();
-    const channelId = requireInsertedRowId(insertedChannel, '创建通道失败');
-    const created = await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channelId)).get();
-    if (!created) {
-      return reply.code(500).send({ success: false, message: '创建通道失败' });
+    let created;
+    try {
+      created = await createRouteChannel({
+        routeId,
+        accountId: body.accountId,
+        tokenId: effectiveTokenId,
+        sourceModel: sourceModel || null,
+        priority: body.priority,
+        weight: body.weight,
+      });
+    } catch (error) {
+      return reply.code(400).send({
+        success: false,
+        message: error instanceof Error ? error.message : '创建通道失败',
+      });
     }
-    await clearRouteDecisionSnapshot(routeId);
-    await clearDependentExplicitGroupSnapshotsBySourceRouteIds([routeId]);
-    invalidateTokenRouterCache();
+    await syncPatternRouteChannelsAfterAffectedRouteChanges({
+      affectedRouteIds: [routeId],
+    });
     return created;
   });
 
@@ -1377,28 +1278,18 @@ export async function tokensRoutes(app: FastifyInstance) {
       return reply.code(400).send({ success: false, message: parsed.message });
     }
 
-    const channelIds = Array.from(new Set(parsed.updates.map((update) => update.id)));
-    const existingChannels = await db.select().from(schema.routeChannels)
-      .where(inArray(schema.routeChannels.id, channelIds))
-      .all();
-    if (existingChannels.length !== channelIds.length) {
-      const existingIds = new Set(existingChannels.map((channel) => channel.id));
-      const missingId = channelIds.find((id) => !existingIds.has(id));
-      return reply.code(404).send({ success: false, message: `通道不存在: ${missingId}` });
+    let updatedChannels: typeof schema.routeChannels.$inferSelect[];
+    try {
+      updatedChannels = await updateRouteChannelPriorities(parsed.updates);
+    } catch (error) {
+      if (error instanceof RouteChannelNotFoundError) {
+        return reply.code(404).send({ success: false, message: error.message });
+      }
+      throw error;
     }
-
-    for (const update of parsed.updates) {
-      await db.update(schema.routeChannels).set({
-        priority: update.priority,
-      }).where(eq(schema.routeChannels.id, update.id)).run();
-    }
-
-    const updatedChannels = await db.select().from(schema.routeChannels)
-      .where(inArray(schema.routeChannels.id, channelIds))
-      .all();
-    await clearRouteDecisionSnapshots(existingChannels.map((channel) => channel.routeId));
-    await clearDependentExplicitGroupSnapshotsBySourceRouteIds(existingChannels.map((channel) => channel.routeId));
-    invalidateTokenRouterCache();
+    await syncPatternRouteChannelsAfterAffectedRouteChanges({
+      affectedRouteIds: updatedChannels.map((channel) => channel.routeId),
+    });
     return { success: true, channels: updatedChannels };
   });
 
@@ -1451,6 +1342,9 @@ export async function tokensRoutes(app: FastifyInstance) {
     await db.update(schema.routeChannels).set(updates).where(eq(schema.routeChannels.id, channelId)).run();
     await clearRouteDecisionSnapshot(channel.routeId);
     await clearDependentExplicitGroupSnapshotsBySourceRouteIds([channel.routeId]);
+    await syncPatternRouteChannelsAfterAffectedRouteChanges({
+      affectedRouteIds: [channel.routeId],
+    });
     invalidateTokenRouterCache();
     return await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channelId)).get();
   });
@@ -1463,6 +1357,9 @@ export async function tokensRoutes(app: FastifyInstance) {
     if (channel) {
       await clearRouteDecisionSnapshot(channel.routeId);
       await clearDependentExplicitGroupSnapshotsBySourceRouteIds([channel.routeId]);
+      await syncPatternRouteChannelsAfterAffectedRouteChanges({
+        affectedRouteIds: [channel.routeId],
+      });
     }
     invalidateTokenRouterCache();
     return { success: true };
@@ -1477,12 +1374,12 @@ export async function tokensRoutes(app: FastifyInstance) {
 
     const body = parsedBody.data;
     if (body.refreshModels === false) {
-      const rebuild = await routeRefreshWorkflow.rebuildRoutesOnly();
+      const rebuild = await routeRefreshWorkflow.rebuildRoutesOnly({ rebuildPatternRoutes: true });
       return { success: true, rebuild };
     }
 
     if (body.wait) {
-      const result = await routeRefreshWorkflow.refreshModelsAndRebuildRoutes();
+      const result = await routeRefreshWorkflow.refreshModelsAndRebuildRoutes({ rebuildPatternRoutes: true });
       return { success: true, ...result };
     }
 
@@ -1499,7 +1396,7 @@ export async function tokensRoutes(app: FastifyInstance) {
         },
         failureMessage: (currentTask) => `刷新模型并重建路由失败：${currentTask.error || 'unknown error'}`,
       },
-      async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes(),
+      async () => routeRefreshWorkflow.refreshModelsAndRebuildRoutes({ rebuildPatternRoutes: true }),
     );
 
     return reply.code(202).send({

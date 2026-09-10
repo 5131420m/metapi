@@ -1,4 +1,5 @@
 import { and, eq } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getAdapter } from './platforms/index.js';
@@ -17,16 +18,27 @@ import {
   resolvePlatformUserId,
   supportsDirectAccountRoutingConnection,
 } from './accountExtraConfig.js';
-import { invalidateTokenRouterCache } from './tokenRouter.js';
+import { invalidateTokenRouterCache, normalizeModelAlias } from './tokenRouter.js';
 import { getBlockedBrandRules, isModelBlockedByBrand } from './brandMatcher.js';
 import { config } from '../config.js';
 import { setAccountRuntimeHealth } from './accountHealthService.js';
 import { clearAllRouteDecisionSnapshots } from './routeDecisionSnapshotStore.js';
+import {
+  syncPatternRouteChannelsAfterAffectedRouteChanges,
+} from './patternRouteChannelSyncService.js';
 import { withAccountProxyOverride } from './siteProxy.js';
 import { isCodexPlatform } from './oauth/codexAccount.js';
 import { buildStoredOauthStateFromAccount, getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { refreshOauthAccessTokenSingleflight } from './oauth/refreshSingleflight.js';
 import { listEnabledOauthRouteUnitsWithMembers } from './oauth/routeUnitService.js';
+import {
+  buildAccountModelContextLengthScope,
+  clearModelContextLengthCache,
+  getAllModelContextLengths,
+  setModelContextLengths,
+} from './modelContextLengthCache.js';
+// The fork discovers models through the endpoint pool rather than a single
+// resolved base URL, so requireSiteApiBaseUrl is intentionally not used here.
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from './siteApiEndpointService.js';
 import {
   discoverAntigravityModelsFromCloud,
@@ -44,6 +56,11 @@ import {
 const API_TOKEN_DISCOVERY_TIMEOUT_MS = 8_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
 const MODEL_REFRESH_BATCH_SIZE = 3;
+
+export type RebuildTokenRoutesOptions = {
+  /** Rebuild every enabled pattern group even when exact-route topology is unchanged. */
+  rebuildPatternRoutes?: boolean;
+};
 const GEMINI_CLI_STATIC_MODELS = [
   'gemini-2.5-pro',
   'gemini-2.5-flash',
@@ -237,13 +254,38 @@ function isExactModelPattern(modelPattern: string): boolean {
   return !/[\*\?]/.test(normalized);
 }
 
-async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+async function withTimeout<T>(
+  fn: () => Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+  onLateSettlement?: () => void,
+): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let timedOut = false;
+  let operation: Promise<T>;
+  try {
+    operation = Promise.resolve(fn());
+  } catch (error) {
+    operation = Promise.reject(error);
+  }
+  // A timeout does not cancel the underlying request. Give callers a hook to
+  // clean up resources written after the race has already rejected.
+  operation.then(
+    () => {
+      if (timedOut) onLateSettlement?.();
+    },
+    () => {
+      if (timedOut) onLateSettlement?.();
+    },
+  );
   try {
     return await Promise.race([
-      fn(),
+      operation,
       new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new Error(timeoutMessage));
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -607,8 +649,12 @@ export async function refreshModelsForAccount(
   const oauth = getOauthInfoFromAccount(account);
   const adapter = getAdapter(site.platform);
   const accountProxyUrl = resolveProxyUrlFromExtraConfig(account.extraConfig);
+  const modelContextScope = buildAccountModelContextLengthScope(account.id);
 
   const restoreAvailabilityOnFailure = options?.allowInactive === true;
+  const previousModelContextLengths = restoreAvailabilityOnFailure
+    ? new Map(getAllModelContextLengths(modelContextScope))
+    : null;
   const previousAccountTokens = restoreAvailabilityOnFailure
     ? await db.select()
       .from(schema.accountTokens)
@@ -1106,6 +1152,9 @@ export async function refreshModelsForAccount(
 
   const accountModels = new Map<string, string>();   // case-sensitive full source name → trimmed original name
   const modelLatency = new Map<string, number | null>();
+  const modelContextRefreshScope = `${modelContextScope}:refresh:${randomUUID()}`;
+  const discoveredContextLengths = new Map<string, number>();
+  let modelContextScanCounter = 0;
   let scannedTokenCount = 0;
   let discoveredByCredential = false;
   const attemptedCredentials = new Set<string>();
@@ -1131,7 +1180,28 @@ export async function refreshModelsForAccount(
     }
   };
 
-  const discoverModelsFromPool = async (credential: string): Promise<string[]> => {
+  const beginModelContextScanScope = () => `${modelContextRefreshScope}:scan:${modelContextScanCounter += 1}`;
+
+  const collectModelContextLengthsFromScope = (sourceScope: string) => {
+    for (const [modelName, contextLength] of getAllModelContextLengths(sourceScope)) {
+      const previous = discoveredContextLengths.get(modelName);
+      discoveredContextLengths.set(
+        modelName,
+        previous === undefined ? contextLength : Math.min(previous, contextLength),
+      );
+    }
+    clearModelContextLengthCache(sourceScope);
+  };
+
+  /**
+   * Discover models across the site endpoint pool. The context-length source
+   * scope is threaded into every attempt so discovered context lengths land in
+   * the per-scan scope that the caller later collects and clears.
+   */
+  const discoverModelsFromPool = async (
+    credential: string,
+    contextSourceScope: string,
+  ): Promise<string[]> => {
     const timeoutMessage = `model discovery timeout (${Math.round(MODEL_DISCOVERY_TIMEOUT_MS / 1000)}s)`;
     const deadline = Date.now() + MODEL_DISCOVERY_TIMEOUT_MS;
     return runWithSiteApiEndpointPool(site, (target, { signal }) => {
@@ -1143,7 +1213,10 @@ export async function refreshModelsForAccount(
       }
       return withTimeout(
         () => withAccountProxyOverride(accountProxyUrl,
-          () => adapter.getModels(target.baseUrl, credential, platformUserId, { signal })),
+          () => adapter.getModels(target.baseUrl, credential, platformUserId, {
+            signal,
+            contextSourceScope,
+          })),
         remainingMs,
         timeoutMessage,
       );
@@ -1161,12 +1234,15 @@ export async function refreshModelsForAccount(
     attemptedCredentials.add(credential);
 
     const startedAt = Date.now();
+    const credentialContextScope = beginModelContextScanScope();
     let models: string[] = [];
     try {
-      models = normalizeModels(await discoverModelsFromPool(credential));
+      models = normalizeModels(await discoverModelsFromPool(credential, credentialContextScope));
     } catch (err) {
       recordFailure(err);
       models = [];
+    } finally {
+      collectModelContextLengthsFromScope(credentialContextScope);
     }
     if (models.length === 0) return;
     discoveredByCredential = true;
@@ -1181,13 +1257,16 @@ export async function refreshModelsForAccount(
 
   for (const token of enabledTokens) {
     const startedAt = Date.now();
+    const tokenContextScope = beginModelContextScanScope();
     let models: string[] = [];
 
     try {
-      models = normalizeModels(await discoverModelsFromPool(token.token));
+      models = normalizeModels(await discoverModelsFromPool(token.token, tokenContextScope));
     } catch (err) {
       recordFailure(err);
       models = [];
+    } finally {
+      collectModelContextLengthsFromScope(tokenContextScope);
     }
 
     if (models.length === 0) continue;
@@ -1210,6 +1289,15 @@ export async function refreshModelsForAccount(
   }
 
   if (accountModels.size === 0) {
+    // A failed refresh must not leave context lengths from a previous scan in
+    // the account scope. The model list is rebuilt from scratch above, so any
+    // metadata from a no-longer-available model would otherwise be advertised
+    // on the next /v1/models response.
+    if (previousModelContextLengths) {
+      setModelContextLengths(previousModelContextLengths, modelContextScope);
+    } else {
+      setModelContextLengths(new Map(), modelContextScope);
+    }
     const firstMessage = failureMessages[0] || '';
     const errorCode = firstMessage ? classifyModelDiscoveryError(firstMessage) : 'empty_models';
     const errorMessage = buildModelFailureMessage(errorCode, firstMessage, site.platform);
@@ -1242,6 +1330,11 @@ export async function refreshModelsForAccount(
         checkedAt,
       })),
     ).run();
+  }
+  if (discoveredContextLengths.size > 0) {
+    setModelContextLengths(discoveredContextLengths, modelContextScope);
+  } else {
+    clearModelContextLengthCache(modelContextScope);
   }
 
   await setAccountRuntimeHealth(account.id, {
@@ -1282,7 +1375,9 @@ async function refreshModelsForAllActiveAccounts(): Promise<ModelRefreshResult[]
   return results;
 }
 
-export async function rebuildTokenRoutesFromAvailability() {
+export async function rebuildTokenRoutesFromAvailability(
+  options: RebuildTokenRoutesOptions = {},
+) {
   const tokenRows = await db.select().from(schema.tokenModelAvailability)
     .innerJoin(schema.accountTokens, eq(schema.tokenModelAvailability.tokenId, schema.accountTokens.id))
     .innerJoin(schema.accounts, eq(schema.accountTokens.accountId, schema.accounts.id))
@@ -1437,6 +1532,12 @@ export async function rebuildTokenRoutesFromAvailability() {
   let createdChannels = 0;
   let removedChannels = 0;
   let removedRoutes = 0;
+  const affectedExactRouteIds = new Set<number>();
+  const removedExactRouteSnapshots: Array<{
+    modelPattern: string;
+    routeMode: string | null;
+    enabled: boolean;
+  }> = [];
 
   const protectedAliasRouteIds = new Set<number>();
 
@@ -1478,6 +1579,7 @@ export async function rebuildTokenRoutesFromAvailability() {
       if (!route) continue;
       routes.push(route);
       createdRoutes++;
+      affectedExactRouteIds.add(route.id);
     }
 
     const routeChannels = channels.filter((channel) => channel.routeId === route.id);
@@ -1532,6 +1634,7 @@ export async function rebuildTokenRoutesFromAvailability() {
       if (!created) continue;
       channels.push(created);
       createdChannels++;
+      affectedExactRouteIds.add(route.id);
       desiredKeys.add(candidateKey);
     }
 
@@ -1548,6 +1651,7 @@ export async function rebuildTokenRoutesFromAvailability() {
             .set({ tokenId: preferred.id })
             .where(eq(schema.routeChannels.id, channel.id))
             .run();
+          affectedExactRouteIds.add(route.id);
           continue;
         }
       }
@@ -1555,6 +1659,7 @@ export async function rebuildTokenRoutesFromAvailability() {
       if (!channel.manualOverride) {
         await db.delete(schema.routeChannels).where(eq(schema.routeChannels.id, channel.id)).run();
         removedChannels++;
+        affectedExactRouteIds.add(route.id);
       }
     }
   }
@@ -1582,10 +1687,39 @@ export async function rebuildTokenRoutesFromAvailability() {
     const deleted = (await db.delete(schema.tokenRoutes).where(eq(schema.tokenRoutes.id, route.id)).run()).changes;
     if (deleted > 0) {
       removedRoutes += deleted;
+      if ((route.routeMode || 'pattern') !== 'explicit_group') {
+        removedExactRouteSnapshots.push({
+          modelPattern,
+          routeMode: route.routeMode,
+          enabled: !!route.enabled,
+        });
+      }
     }
   }
 
-  if (createdRoutes > 0 || createdChannels > 0 || removedChannels > 0 || removedRoutes > 0) {
+  const exactRouteTopologyChanged = createdRoutes > 0 || createdChannels > 0 || removedChannels > 0 || removedRoutes > 0;
+  const patternRouteSync = exactRouteTopologyChanged || options.rebuildPatternRoutes
+    ? await syncPatternRouteChannelsAfterAffectedRouteChanges({
+      affectedRouteIds: [...affectedExactRouteIds],
+      removedRoutes: removedExactRouteSnapshots,
+      allowedModelNames: [...modelCandidates.keys()],
+      allowedAvailabilityCandidateKeys: Array.from(modelCandidates.entries()).flatMap(([modelName, entry]) => (
+        Array.from(entry.candidates.values())
+          .filter((candidate) => candidate.tokenId != null)
+          .map((candidate) => `${candidate.accountId}:${candidate.tokenId}:${normalizeModelAlias(modelName)}`)
+      )),
+      rebuildAllPatternRoutes: options.rebuildPatternRoutes === true,
+    })
+    : {
+      rebuiltRoutes: 0,
+      routeIds: [],
+      removedChannels: 0,
+      createdChannels: 0,
+    };
+  createdChannels += patternRouteSync.createdChannels;
+  removedChannels += patternRouteSync.removedChannels;
+
+  if (exactRouteTopologyChanged || patternRouteSync.createdChannels > 0 || patternRouteSync.removedChannels > 0) {
     await clearAllRouteDecisionSnapshots();
   }
 
@@ -1597,23 +1731,26 @@ export async function rebuildTokenRoutesFromAvailability() {
     createdChannels,
     removedChannels,
     removedRoutes,
+    rebuiltPatternRoutes: patternRouteSync.rebuiltRoutes,
+    patternRouteCreatedChannels: patternRouteSync.createdChannels,
+    patternRouteRemovedChannels: patternRouteSync.removedChannels,
   };
 }
 
-async function runRefreshModelsAndRebuildRoutes() {
+async function runRefreshModelsAndRebuildRoutes(options: RebuildTokenRoutesOptions = {}) {
   const refresh = await refreshModelsForAllActiveAccounts();
-  const rebuild = await rebuildTokenRoutesFromAvailability();
+  const rebuild = await rebuildTokenRoutesFromAvailability(options);
   return { refresh, rebuild };
 }
 
-export async function refreshModelsAndRebuildRoutes() {
+export async function refreshModelsAndRebuildRoutes(options: RebuildTokenRoutesOptions = {}) {
   if (inFlightRefreshModelsAndRebuildRoutes) {
     return inFlightRefreshModelsAndRebuildRoutes;
   }
 
   inFlightRefreshModelsAndRebuildRoutes = (async () => {
     try {
-      return await runRefreshModelsAndRebuildRoutes();
+      return await runRefreshModelsAndRebuildRoutes(options);
     } finally {
       inFlightRefreshModelsAndRebuildRoutes = null;
     }

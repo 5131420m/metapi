@@ -1,4 +1,9 @@
-import { BasePlatformAdapter, CheckinResult, BalanceInfo } from './base.js';
+import { BasePlatformAdapter, CheckinResult, BalanceInfo, type GetModelsOptions } from './base.js';
+import {
+  buildEndpointModelContextLengthScope,
+  extractContextLengthsFromPayload,
+  setModelContextLengths,
+} from '../modelContextLengthCache.js';
 
 export class VeloeraAdapter extends BasePlatformAdapter {
   readonly platformName = 'veloera';
@@ -53,10 +58,20 @@ export class VeloeraAdapter extends BasePlatformAdapter {
     return { balance: quota - used, used, quota, todayIncome, todayQuotaConsumption };
   }
 
-  async getModels(baseUrl: string, apiToken: string, _platformUserId?: number): Promise<string[]> {
+  async getModels(
+    baseUrl: string,
+    apiToken: string,
+    _platformUserId?: number,
+    options?: GetModelsOptions,
+  ): Promise<string[]> {
+    const contextSourceScope = options?.contextSourceScope;
     const res = await this.fetchJson<any>(`${baseUrl}/v1/models`, {
       headers: { Authorization: `Bearer ${apiToken}` },
     });
+    setModelContextLengths(
+      extractContextLengthsFromPayload(res),
+      contextSourceScope || buildEndpointModelContextLengthScope(baseUrl),
+    );
     return (res?.data || []).map((m: any) => m.id).filter(Boolean);
   }
 }

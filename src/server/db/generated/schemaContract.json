@@ -2173,6 +2173,18 @@
           "notNull": false,
           "defaultValue": "'off'",
           "primaryKey": false
+        },
+        "custom_headers_override_request_headers": {
+          "logicalType": "boolean",
+          "notNull": false,
+          "defaultValue": "true",
+          "primaryKey": false
+        },
+        "max_concurrency": {
+          "logicalType": "integer",
+          "notNull": true,
+          "defaultValue": "0",
+          "primaryKey": false
         }
       }
     },

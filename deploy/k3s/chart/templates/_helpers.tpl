@@ -19,6 +19,20 @@
 {{- printf "%s-env" (include "metapi.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/*
+Effective Secret name sourced by envFrom.
+When .Values.existingSecret is set the chart does not create its own Secret and
+the Deployment references the operator-supplied one; otherwise the chart-managed
+helper name is used.
+*/}}
+{{- define "metapi.envSecretRefName" -}}
+{{- if .Values.existingSecret -}}
+{{- .Values.existingSecret -}}
+{{- else -}}
+{{- include "metapi.envSecretName" . -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "metapi.labels" -}}
 app.kubernetes.io/name: {{ include "metapi.name" . }}
 helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}

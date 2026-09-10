@@ -24,6 +24,7 @@ describe('buildSiteSaveAction', () => {
           { url: 'https://api-b.example.com', enabled: false, sortOrder: 1 },
         ],
         customHeaders: '{"x-site-token":"alpha"}',
+        customHeadersOverrideRequestHeaders: true,
         useSystemProxy: false,
         globalWeight: 1.2,
         postRefreshProbeEnabled: true,
@@ -46,6 +47,7 @@ describe('buildSiteSaveAction', () => {
           { url: 'https://api-b.example.com', enabled: false, sortOrder: 1 },
         ],
         customHeaders: '{"x-site-token":"alpha"}',
+        customHeadersOverrideRequestHeaders: true,
         useSystemProxy: false,
         globalWeight: 1.2,
         postRefreshProbeEnabled: true,
@@ -68,6 +70,7 @@ describe('buildSiteSaveAction', () => {
         useSystemProxy: true,
         apiEndpoints: [],
         customHeaders: '',
+        customHeadersOverrideRequestHeaders: false,
         globalWeight: 0.8,
       },
     );
@@ -84,6 +87,7 @@ describe('buildSiteSaveAction', () => {
         useSystemProxy: true,
         apiEndpoints: [],
         customHeaders: '',
+        customHeadersOverrideRequestHeaders: false,
         globalWeight: 0.8,
       },
     });
@@ -102,6 +106,7 @@ describe('buildSiteSaveAction', () => {
           useSystemProxy: false,
           apiEndpoints: [],
           customHeaders: '',
+          customHeadersOverrideRequestHeaders: false,
           globalWeight: 1,
         },
       ),
@@ -130,6 +135,7 @@ describe('buildSiteSaveAction', () => {
 
     expect(emptySiteForm()).not.toHaveProperty('apiKey');
     expect(emptySiteForm().customHeaders).toEqual([emptySiteCustomHeader()]);
+    expect(emptySiteForm().customHeadersOverrideRequestHeaders).toBe(true);
     expect(emptySiteForm().apiEndpoints).toEqual([emptySiteApiEndpoint()]);
     expect(emptySiteForm().proxyUrl).toBe('');
     expect(emptySiteForm().apiEndpointSiteFallbackEnabled).toBe(true);
@@ -148,6 +154,9 @@ describe('buildSiteSaveAction', () => {
       apiEndpointSiteFallbackCooldownUntil: '2026-04-01T00:05:00.000Z',
       apiEndpointSiteFallbackLastFailureReason: 'HTTP 502',
     });
+    expect(siteFormFromSite({
+      customHeadersOverrideRequestHeaders: true,
+    }).customHeadersOverrideRequestHeaders).toBe(true);
     expect(siteFormFromSite(legacySite).apiEndpoints).toEqual([
       {
         url: 'https://api.example.com',

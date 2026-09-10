@@ -44,6 +44,9 @@ function createDbSelectChain() {
     where() {
       return this;
     },
+    orderBy() {
+      return this;
+    },
     all: (...args: unknown[]) => dbSelectAllMock(...args),
     get: (...args: unknown[]) => dbSelectGetMock(...args),
   };
@@ -91,6 +94,13 @@ vi.mock('../../db/index.js', () => ({
   db: {
     select: (..._args: unknown[]) => createDbSelectChain(),
     insert: (arg: unknown) => dbInsertMock(arg),
+    update: () => ({
+      set: () => ({
+        where: () => ({
+          run: async () => undefined,
+        }),
+      }),
+    }),
   },
   hasProxyLogBillingDetailsColumn: async () => false,
   hasProxyLogClientColumns: async () => false,
@@ -111,6 +121,11 @@ vi.mock('../../db/index.js', () => ({
     sites: {
       id: Symbol('sites.id'),
       status: Symbol('sites.status'),
+    },
+    siteApiEndpoints: {
+      siteId: Symbol('siteApiEndpoints.siteId'),
+      sortOrder: Symbol('siteApiEndpoints.sortOrder'),
+      id: Symbol('siteApiEndpoints.id'),
     },
     tokenRoutes: {
       displayName: Symbol('tokenRoutes.displayName'),

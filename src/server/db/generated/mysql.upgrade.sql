@@ -1,1 +1,2 @@
-ALTER TABLE `sites` ADD COLUMN `codex_identity_mode` VARCHAR(191) DEFAULT 'off';
+ALTER TABLE `sites` ADD COLUMN `custom_headers_override_request_headers` BOOLEAN DEFAULT true;
+ALTER TABLE `sites` ADD COLUMN `max_concurrency` INT NOT NULL DEFAULT 0;

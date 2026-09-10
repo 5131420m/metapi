@@ -272,7 +272,51 @@ helm template metapi /opt/metapi-k3s/chart \
 
 那说明这份 chart 还是 tag 语义，先不要继续配置更新中心。
 
-### 2. 让主 Metapi 和 helper 用同一个 token
+### 1.2 自带 chart 的 Secret：自建 vs 引用已有 Secret
+
+仓库自带的 `deploy/k3s/chart` 默认行为是：chart 自己创建一个名为 `<release>-env` 的 Secret，把 `values.yaml` 里的 `env.*` 写进去，Deployment 再通过 `envFrom` 引用它。
+
+但很多自托管 K3s 场景下，运维方已经有自己的密钥交付方式（External Secrets、Sealed Secrets、GitOps 等），并不想把敏感值写进 `values.yaml`。这时可以设置：
+
+```yaml
+existingSecret: "ops-metapi-env"
+```
+
+`existingSecret` 非空时：
+
+- chart **不再创建自带 Secret**，Deployment 的 `envFrom` 改为引用你指定的 Secret 名称。
+- `values.yaml` 里的 `env.*` **被忽略**，且其 `required` 校验会被跳过——即使 `env.*` 为空也不会报错。(共存时也会静默忽略 `env.*`，chart 不报冲突。)
+- 你引用的那个外部 Secret 必须提供**完整固定的 11 个键**，chart 不做逐键映射，仍用 `envFrom` 整体注入：
+  - `AUTH_TOKEN`、`PROXY_TOKEN`、`DB_TYPE`、`DB_URL`、`DB_SSL`、`DATA_DIR`、`PORT`、`TZ`、`CHECKIN_CRON`、`BALANCE_REFRESH_CRON`、`DEPLOY_HELPER_TOKEN`
+
+> [!IMPORTANT]
+> 启用 `existingSecret` 后，chart **不会在 Secret 内容变化时自动滚动 Pod**。
+>
+> 这是因为自建 Secret 模式下，chart 会在 Pod 模板上实时写入一个 `checksum/env-secret` 注解（对 Secret 内容取哈希），Secret 一变、注解一变、Deployment 就会自动滚动。而 `existingSecret` 模式下 chart 不接触该 Secret 内容，自然无法算哈希，这个注解会被省略。
+>
+> 所以你的外部 Secret 轮换后，需要自行触发滚动——例如：
+>
+> - 用 [Reloader](https://github.com/stakater/Reloader) 之类的机制监听 Secret 变化自动滚动；或
+> - 手动 `kubectl rollout restart deployment/<release> -n <namespace>`。
+>
+> 否则会出现「Secret 已经更新，但 Pod 还在用旧值」的静默不一致，更新中心也不会察觉。
+
+`existingSecret` 留空（默认）时，行为与上一节一致，完全向后兼容——chart 自建 `<release>-env` 并写入 `checksum/env-secret` 注解，Secret 变更会自动滚动 Pod。
+
+你可以在接入前先跑一次自检，确认两种模式各自的渲染产物符合预期：
+
+```bash
+# 自建 Secret 模式（默认）：Secret 资源存在，checksum 注解存在，envFrom 指向 <release>-env
+helm template metapi /opt/metapi-k3s/chart \
+  --set env.authToken=demo --set env.proxyToken=demo --set env.dbType=sqlite \
+  | grep -nE 'checksum/env-secret|secretRef|kind: Secret'
+
+# existingSecret 模式：无 Secret 资源、无 checksum 注解，envFrom 指向 ops-metapi-env
+helm template metapi /opt/metapi-k3s/chart --set existingSecret=ops-metapi-env \
+  | grep -nE 'checksum/env-secret|secretRef|kind: Secret|ops-metapi-env'
+```
+
+
 
 主 Metapi 端支持这两个环境变量，设置一个即可：
 

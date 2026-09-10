@@ -1,6 +1,6 @@
 import { StandardApiProviderAdapterBase } from './standardApiProvider.js';
-
-const CLAUDE_DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
+import type { GetModelsOptions } from './base.js';
+import { CLAUDE_DEFAULT_ANTHROPIC_VERSION } from '../oauth/claudeProvider.js';
 
 function resolveOpenAiCompatibleBaseUrl(baseUrl: string): string | null {
   const normalized = (baseUrl || '').trim().replace(/\/+$/, '');
@@ -16,7 +16,8 @@ export class ClaudeAdapter extends StandardApiProviderAdapterBase {
     return normalized.includes('api.anthropic.com') || normalized.includes('anthropic.com/v1');
   }
 
-  async getModels(baseUrl: string, apiToken: string): Promise<string[]> {
+  async getModels(baseUrl: string, apiToken: string, _platformUserId?: number, options?: GetModelsOptions): Promise<string[]> {
+    const contextSourceScope = options?.contextSourceScope;
     const openAiCompatibleBaseUrl = resolveOpenAiCompatibleBaseUrl(baseUrl);
     try {
       const claudeModels = await this.fetchModelsFromStandardEndpoint({
@@ -25,6 +26,7 @@ export class ClaudeAdapter extends StandardApiProviderAdapterBase {
           'x-api-key': apiToken,
           'anthropic-version': CLAUDE_DEFAULT_ANTHROPIC_VERSION,
         },
+        contextSourceScope,
       });
       if (claudeModels.length > 0) return claudeModels;
     } catch (error) {
@@ -34,6 +36,7 @@ export class ClaudeAdapter extends StandardApiProviderAdapterBase {
     if (!openAiCompatibleBaseUrl) return [];
 
     return this.fetchModelsFromStandardEndpoint({
+      contextSourceScope,
       baseUrl: openAiCompatibleBaseUrl,
       headers: { Authorization: `Bearer ${apiToken}` },
     });

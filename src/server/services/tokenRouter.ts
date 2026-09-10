@@ -1417,8 +1417,12 @@ function hasCustomDisplayName(route: Pick<RouteRow, 'modelPattern' | 'displayNam
 function buildVisibleEnabledRoutes(routes: RouteRow[]): RouteRow[] {
   const exactModelNames = new Set(
     routes
-      .filter((route) => !isExplicitGroupRoute(route) && isExactRouteModelPattern(route.modelPattern))
-      .map((route) => (route.modelPattern || '').trim())
+      .filter((route) => (
+        !isExplicitGroupRoute(route)
+        && isExactRouteModelPattern(route.modelPattern)
+        && !!normalizeRouteDisplayName(route.displayName)
+      ))
+      .map((route) => (route.modelPattern || '').trim().toLowerCase())
       .filter(Boolean),
   );
   const coveringGroups = routes.filter((route) => (
@@ -1444,7 +1448,17 @@ function buildVisibleEnabledRoutes(routes: RouteRow[]): RouteRow[] {
     return !coveringGroups.some((groupRoute) => {
       if (groupRoute.id === route.id) return false;
       const groupDisplayName = normalizeRouteDisplayName(groupRoute.displayName);
-      if (!groupDisplayName || exactModelNames.has(groupDisplayName)) return false;
+      if (
+        !groupDisplayName
+        || exactModelNames.has(groupDisplayName.toLowerCase())
+        // A pattern alias that is identical to an unnamed exact route cannot
+        // replace that route in dispatch: findRoute() gives exact matches
+        // precedence. Keep the exact route visible so the UI reflects this.
+        || (
+          !isExplicitGroupRoute(groupRoute)
+          && groupDisplayName.toLowerCase() === exactModel.toLowerCase()
+        )
+      ) return false;
       if (isExplicitGroupRoute(groupRoute)) {
         return groupRoute.sourceRouteIds.includes(route.id);
       }
@@ -1453,7 +1467,7 @@ function buildVisibleEnabledRoutes(routes: RouteRow[]): RouteRow[] {
   });
 }
 
-function normalizeModelAlias(modelName: string): string {
+export function normalizeModelAlias(modelName: string): string {
   const normalized = (modelName || '').trim().toLowerCase();
   if (!normalized) return '';
   const slashIndex = normalized.lastIndexOf('/');
@@ -2068,6 +2082,12 @@ export class TokenRouter {
         username: row.account.username || `account-${row.account.id}`,
         siteName: row.site.name || 'unknown',
         tokenName: row.token?.name || 'default',
+        sourceModel: resolveActualModelForSelectedChannel(
+          requestedModel,
+          match.route,
+          mappedModel,
+          row.channel.sourceModel,
+        ),
         priority: row.channel.priority ?? 0,
         weight: row.channel.weight ?? 10,
         eligible,
@@ -2847,7 +2867,10 @@ export class TokenRouter {
           cooldownUntil,
           updatedAt: nowIso,
         }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
-        recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+        // 用量限流属于凭据/渠道级状态，不把单个成员的冷却扩散到整个站点。
+        if (!shortWindowLimitCooldownUntil) {
+          recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
+        }
         invalidateRouteScopedCache(route.id);
         return;
       }
@@ -2915,7 +2938,10 @@ export class TokenRouter {
       });
     }
 
-    recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+    // 用量限流属于凭据/渠道级状态，不把单次限流扩散成站点级健康惩罚。
+    if (!shortWindowLimitCooldownUntil) {
+      recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
+    }
   }
 
   /**

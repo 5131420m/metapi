@@ -7,6 +7,9 @@ export type RouteListVisibilityItem = {
   routeMode?: string | null;
   sourceRouteIds?: number[];
   enabled: boolean;
+  kind?: string;
+  readOnly?: boolean;
+  isVirtual?: boolean;
 };
 
 function normalizeRouteMode(routeMode: string | null | undefined): 'pattern' | 'explicit_group' {
@@ -30,8 +33,12 @@ export function buildVisibleRouteList<T extends RouteListVisibilityItem>(
 ): T[] {
   const exactModelNames = new Set(
     routes
-      .filter((route) => !isExplicitGroupRoute(route) && isExactModelPattern(route.modelPattern))
-      .map((route) => (route.modelPattern || '').trim())
+      .filter((route) => (
+        !isExplicitGroupRoute(route)
+        && isExactModelPattern(route.modelPattern)
+        && !!(route.displayName || '').trim()
+      ))
+      .map((route) => (route.modelPattern || '').trim().toLowerCase())
       .filter(Boolean),
   );
   const coveringGroups = routes.filter((route) => (
@@ -47,18 +54,29 @@ export function buildVisibleRouteList<T extends RouteListVisibilityItem>(
   return routes.filter((route) => {
     if (isExplicitGroupRoute(route)) return true;
     if (!isExactModelPattern(route.modelPattern)) return true;
+    if (!route.enabled && route.kind !== 'zero_channel' && route.readOnly !== true && route.isVirtual !== true) return true;
     if (hasCustomDisplayName(route)) return true;
 
     const exactModel = (route.modelPattern || '').trim();
     if (!exactModel) return true;
 
-    return !coveringGroups.some((groupRoute) => (
-      groupRoute.id !== route.id
-      && !exactModelNames.has((groupRoute.displayName || '').trim())
-      && (
-        (isExplicitGroupRoute(groupRoute) && (groupRoute.sourceRouteIds || []).includes(route.id))
-        || (!isExplicitGroupRoute(groupRoute) && matchesModelPattern(exactModel, groupRoute.modelPattern))
-      )
-    ));
+    return !coveringGroups.some((groupRoute) => {
+      if (groupRoute.id === route.id) return false;
+      const groupDisplayName = (groupRoute.displayName || '').trim();
+      if (
+        !groupDisplayName
+        || exactModelNames.has(groupDisplayName.toLowerCase())
+        // Pattern aliases do not override exact dispatch matches; keep a
+        // colliding unnamed exact route visible in the management UI.
+        || (
+          !isExplicitGroupRoute(groupRoute)
+          && groupDisplayName.toLowerCase() === exactModel.toLowerCase()
+        )
+      ) return false;
+      if (isExplicitGroupRoute(groupRoute)) {
+        return (groupRoute.sourceRouteIds || []).includes(route.id);
+      }
+      return matchesModelPattern(exactModel, groupRoute.modelPattern);
+    });
   });
 }

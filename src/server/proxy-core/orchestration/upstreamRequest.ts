@@ -104,35 +104,68 @@ export function buildUpstreamUrl(siteUrl: string, requestPath: string): string {
   const baseRaw = typeof siteUrl === 'string' ? siteUrl.trim() : '';
   const pathRaw = typeof requestPath === 'string' ? requestPath.trim() : '';
   const fallbackBase = baseRaw.replace(/\/+$/, '');
-  let path = pathRaw.startsWith('/') ? pathRaw : `/${pathRaw}`;
+  const requestHashIndex = pathRaw.indexOf('#');
+  const requestHash = requestHashIndex >= 0 ? pathRaw.slice(requestHashIndex) : '';
+  const pathWithQuery = requestHashIndex >= 0 ? pathRaw.slice(0, requestHashIndex) : pathRaw;
+  const requestQueryIndex = pathWithQuery.indexOf('?');
+  const requestQuery = requestQueryIndex >= 0 ? pathWithQuery.slice(requestQueryIndex + 1) : '';
+  let path = (requestQueryIndex >= 0 ? pathWithQuery.slice(0, requestQueryIndex) : pathWithQuery);
+  path = path.startsWith('/') ? path : `/${path}`;
+
+  const stripVersionPrefix = (baseVersion?: string) => {
+    const requestVersionMatch = path.match(/^\/(v\d+(?:beta)?)(?=\/|$)/i);
+    if (!requestVersionMatch) return;
+    const requestVersion = requestVersionMatch[1];
+    const normalizedRequestVersion = requestVersion.toLowerCase();
+    const normalizedBaseVersion = baseVersion?.toLowerCase();
+    // Compatibility endpoints conventionally receive a /v1 request prefix,
+    // while native Gemini paths use /v1beta and must remain intact when the
+    // configured base is a different API version.
+    if (normalizedRequestVersion !== 'v1' && normalizedRequestVersion !== normalizedBaseVersion) return;
+    path = path.slice(requestVersion.length + 1) || '/';
+  };
 
   if (!fallbackBase) return path || '/';
   if (!path || path === '/') return fallbackBase;
 
   try {
     const parsed = new URL(baseRaw);
-    const basePath = parsed.pathname.replace(/\/+$/, '');
-    const baseHasVersionSuffix = /\/(?:api\/)?v1$/i.test(basePath);
-    if (baseHasVersionSuffix) {
-      if (path === '/v1') {
-        path = '/';
-      } else if (path.startsWith('/v1/')) {
-        path = path.slice('/v1'.length) || '/';
+    let basePath = parsed.pathname.replace(/\/+$/, '');
+    // Native Gemini fallbacks use /v1beta/models even when the configured
+    // compatibility base is /v1beta/openai. Remove only that known suffix so
+    // the request is not sent to /v1beta/openai/v1beta/models.
+    const nativeGeminiPath = /^\/(v\d+(?:beta)?)\/models(?:\/|$)/i.test(path);
+    if (nativeGeminiPath) {
+      const compatibilitySuffix = basePath.match(/\/(?:api\/)?v\d+(?:beta)?\/openai$/i);
+      if (compatibilitySuffix?.index !== undefined) {
+        basePath = basePath.slice(0, compatibilitySuffix.index).replace(/\/+$/, '');
+      } else if (/\/openai$/i.test(basePath)) {
+        basePath = basePath.slice(0, -'/openai'.length).replace(/\/+$/, '');
       }
+    }
+    const baseVersionMatch = basePath.match(/\/(?:api\/)?(v\d+(?:beta)?)$/i);
+    const baseHasVersionSuffix = !!baseVersionMatch;
+    if (baseHasVersionSuffix) {
+      const baseVersion = baseVersionMatch?.[1] || 'v1';
+      stripVersionPrefix(baseVersion);
     }
 
     const joinedPath = joinPath(basePath, path);
-    return `${formatUrlOrigin(parsed)}${joinedPath}${parsed.search}${parsed.hash}`;
+    const mergedQuery = new URLSearchParams(parsed.search);
+    for (const [key, value] of new URLSearchParams(requestQuery)) {
+      mergedQuery.set(key, value);
+    }
+    const query = mergedQuery.toString();
+    return `${formatUrlOrigin(parsed)}${joinedPath}${query ? `?${query}` : ''}${requestHash || parsed.hash}`;
   } catch {
-    const baseHasVersionSuffix = /\/(?:api\/)?v1$/i.test(fallbackBase);
+    const baseVersionMatch = fallbackBase.match(/\/(?:api\/)?(v\d+(?:beta)?)$/i);
+    const baseHasVersionSuffix = !!baseVersionMatch;
     if (baseHasVersionSuffix) {
-      if (path === '/v1') {
-        path = '/';
-      } else if (path.startsWith('/v1/')) {
-        path = path.slice('/v1'.length) || '/';
-      }
+      const baseVersion = baseVersionMatch?.[1] || 'v1';
+      stripVersionPrefix(baseVersion);
     }
 
-    return `${fallbackBase}${path}`;
+    const query = requestQuery ? `?${requestQuery}` : '';
+    return `${fallbackBase}${path}${query}${requestHash}`;
   }
 }

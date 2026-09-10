@@ -1,4 +1,5 @@
 import { OneApiAdapter } from './oneApi.js';
+import type { GetModelsOptions } from './base.js';
 
 export class OneHubAdapter extends OneApiAdapter {
   readonly platformName: string = 'one-hub';
@@ -13,10 +14,16 @@ export class OneHubAdapter extends OneApiAdapter {
    * The /api/available_model endpoint returns { data: { model_name: { price: ... }, ... } }
    * where the keys are model names.
    */
-  override async getModels(baseUrl: string, apiToken: string, platformUserId?: number): Promise<string[]> {
+  override async getModels(
+    baseUrl: string,
+    apiToken: string,
+    platformUserId?: number,
+    options?: GetModelsOptions,
+  ): Promise<string[]> {
+    const contextSourceScope = options?.contextSourceScope;
     let openAiModels: string[] = [];
     try {
-      openAiModels = await super.getModels(baseUrl, apiToken, platformUserId);
+      openAiModels = await super.getModels(baseUrl, apiToken, platformUserId, options);
     } catch {}
     if (openAiModels.length > 0) return openAiModels;
 
