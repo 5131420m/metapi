@@ -590,28 +590,6 @@ function resolveShortWindowLimitCooldown(
   return new Date(nowMs + SHORT_WINDOW_LIMIT_COOLDOWN_MS).toISOString();
 }
 
-async function loadCredentialScopedChannelIds(
-  channel: typeof schema.routeChannels.$inferSelect,
-  accountId: number,
-): Promise<number[]> {
-  if (typeof channel.tokenId === 'number' && channel.tokenId > 0) {
-    const rows = await db.select({ id: schema.routeChannels.id })
-      .from(schema.routeChannels)
-      .where(eq(schema.routeChannels.tokenId, channel.tokenId))
-      .all();
-    return rows.map((row) => row.id);
-  }
-
-  const rows = await db.select({ id: schema.routeChannels.id })
-    .from(schema.routeChannels)
-    .where(and(
-      eq(schema.routeChannels.accountId, accountId),
-      isNull(schema.routeChannels.tokenId),
-    ))
-    .all();
-  return rows.map((row) => row.id);
-}
-
 function getDecayedSiteRuntimePenalty(state: SiteRuntimeHealthState, nowMs: number): number {
   if (!Number.isFinite(state.penaltyScore) || state.penaltyScore <= 0) return 0;
   const elapsedMs = Math.max(0, nowMs - state.lastUpdatedAtMs);
@@ -2653,7 +2631,7 @@ export class TokenRouter {
       return;
     }
 
-    const affectedChannelIds = await loadCredentialScopedChannelIds(ch, account.id);
+    // 与上游一致：成功恢复只清除当前通道的失败/冷却状态，不扩散到同凭据的兄弟通道。
     const needsChannelReset = !!ch.cooldownUntil
       || !!ch.lastFailAt
       || (ch.consecutiveFailCount ?? 0) > 0
@@ -2665,53 +2643,13 @@ export class TokenRouter {
         lastFailAt: null,
         consecutiveFailCount: 0,
         cooldownLevel: 0,
-      }).where(inArray(schema.routeChannels.id, affectedChannelIds)).run();
-
-      for (const affectedChannelId of affectedChannelIds) {
-        patchCachedChannel(affectedChannelId, (channel) => {
-          channel.cooldownUntil = null;
-          channel.lastFailAt = null;
-          channel.consecutiveFailCount = 0;
-          channel.cooldownLevel = 0;
-        });
-      }
-    } else if (affectedChannelIds.length > 1) {
-      const scopedRows = await db.select({
-        id: schema.routeChannels.id,
-        cooldownUntil: schema.routeChannels.cooldownUntil,
-        lastFailAt: schema.routeChannels.lastFailAt,
-        consecutiveFailCount: schema.routeChannels.consecutiveFailCount,
-        cooldownLevel: schema.routeChannels.cooldownLevel,
-      })
-        .from(schema.routeChannels)
-        .where(inArray(schema.routeChannels.id, affectedChannelIds))
-        .all();
-      const siblingIdsToReset = scopedRows
-        .filter((candidate) => candidate.id !== channelId && (
-          !!candidate.cooldownUntil
-          || !!candidate.lastFailAt
-          || (candidate.consecutiveFailCount ?? 0) > 0
-          || (candidate.cooldownLevel ?? 0) > 0
-        ))
-        .map((candidate) => candidate.id);
-
-      if (siblingIdsToReset.length > 0) {
-        await db.update(schema.routeChannels).set({
-          cooldownUntil: null,
-          lastFailAt: null,
-          consecutiveFailCount: 0,
-          cooldownLevel: 0,
-        }).where(inArray(schema.routeChannels.id, siblingIdsToReset)).run();
-
-        for (const siblingId of siblingIdsToReset) {
-          patchCachedChannel(siblingId, (channel) => {
-            channel.cooldownUntil = null;
-            channel.lastFailAt = null;
-            channel.consecutiveFailCount = 0;
-            channel.cooldownLevel = 0;
-          });
-        }
-      }
+      }).where(eq(schema.routeChannels.id, channelId)).run();
+      patchCachedChannel(channelId, (channel) => {
+        channel.cooldownUntil = null;
+        channel.lastFailAt = null;
+        channel.consecutiveFailCount = 0;
+        channel.cooldownLevel = 0;
+      });
     }
 
     recordSiteRuntimeSuccess(account.siteId, latencyMs, modelName);
@@ -2894,9 +2832,8 @@ export class TokenRouter {
     const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(account, normalizedContext, nowMs);
     const failCount = shortWindowLimitCooldownUntil ? 0 : ((ch.failCount ?? 0) + 1);
     const routeStrategy = resolveRouteStrategy(route);
-    const affectedChannelIds = shortWindowLimitCooldownUntil
-      ? await loadCredentialScopedChannelIds(ch, account.id)
-      : [channelId];
+    // 与上游一致：每次失败只更新实际发起请求的通道，限流状态不扩散到同凭据的其他通道。
+    const affectedChannelIds = [channelId];
     let cooldownUntil: string | null = null;
     let consecutiveFailCount = Math.max(0, ch.consecutiveFailCount ?? 0) + 1;
     let cooldownLevel = Math.max(0, ch.cooldownLevel ?? 0);

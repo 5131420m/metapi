@@ -748,7 +748,7 @@ describe('TokenRouter selection scoring', () => {
     expect((candidateB?.probability || 0)).toBeLessThan(60);
   });
 
-  it('spreads a usage-limit cooldown across channels sharing the credential', async () => {
+  it('isolates a usage-limit cooldown to the channel that failed', async () => {
     const routeA = await createRoute('gpt-5.4');
     const routeB = await createRoute('gpt-5.4-alt');
     const site = await createSite('isolated-limit');
@@ -780,9 +780,10 @@ describe('TokenRouter selection scoring', () => {
 
     const updatedA = await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channelA.id)).get();
     const updatedB = await db.select().from(schema.routeChannels).where(eq(schema.routeChannels.id, channelB.id)).get();
-    // 同一令牌下的通道共享配额，故限流冷却按凭据扩散（本 fork 语义）。
+    // 与上游一致：限流冷却只作用于实际失败的通道。
     expect(updatedA?.cooldownUntil).toBeTruthy();
-    expect(updatedB?.cooldownUntil).toBe(updatedA?.cooldownUntil);
+    expect(updatedB?.cooldownUntil).toBeNull();
+    expect(updatedB?.lastFailAt).toBeNull();
   });
 
   it('opens a site breaker after repeated transient failures and closes it after recovery', async () => {

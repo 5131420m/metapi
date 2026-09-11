@@ -541,7 +541,7 @@ describe('TokenRouter runtime cache', () => {
     expect(record?.failCount).toBe(1);
   });
 
-  it('spreads short-window cooldown to sibling channels sharing the credential', async () => {
+  it('keeps short-window cooldown scoped to the channel that received the failure', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'shared-credential-site',
       url: 'https://shared-credential.example.com',
@@ -613,10 +613,12 @@ describe('TokenRouter runtime cache', () => {
       .where(eq(schema.routeChannels.id, primaryChannel.id))
       .get();
 
-    // 本 fork 刻意把短窗限流冷却扩散到共享同一凭据的兄弟通道：用量限流是凭据级
-    // 状态，只冷却单个通道会让路由立刻拿同一枚已耗尽的凭据去重试。
+    // 与上游一致：限流冷却只作用于实际失败的通道，兄弟通道保持可用。
     expect(cooledPrimary?.cooldownUntil).toBeTruthy();
-    expect(cooledSibling?.cooldownUntil).toBe(cooledPrimary?.cooldownUntil);
+    expect(cooledSibling?.cooldownUntil).toBeNull();
+    expect(cooledSibling?.lastFailAt).toBeNull();
+    expect(cooledSibling?.failCount).toBe(0);
+    expect((await router.selectChannel('gpt-4o-mini'))?.channel.id).toBe(siblingChannel.id);
   });
 
   it('clears short-window cooldown on sibling channels after a successful recovery probe', async () => {
