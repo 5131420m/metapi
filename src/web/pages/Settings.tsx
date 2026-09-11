@@ -2311,6 +2311,41 @@ export default function Settings() {
             </button>
           </div>
 
+          <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()} style={{ marginBottom: 12 }}>
+            <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
+              {([
+                ['baseWeightFactor', '基础权重因子'],
+                ['valueScoreFactor', '价值分因子'],
+                ['costWeight', '成本权重'],
+                ['balanceWeight', '余额权重'],
+                ['usageWeight', '使用频次权重'],
+              ] as Array<[keyof RoutingWeights, string]>).map(([key, label]) => (
+                <div key={key}>
+                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>{label}</div>
+                  <input
+                    type="number"
+                    min={0}
+                    step={0.1}
+                    value={runtime.routingWeights[key]}
+                    onChange={(e) => {
+                      const v = Number(e.target.value);
+                      setRuntime((prev) => ({
+                        ...prev,
+                        routingWeights: {
+                          ...prev.routingWeights,
+                          [key]: Number.isFinite(v) ? v : 0,
+                        },
+                      }));
+                    }}
+                    style={inputStyle}
+                  />
+                </div>
+              ))}
+              </div>
+            </div>
+          </div>
+
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12, cursor: 'pointer' }}>
             <input
               type="checkbox"
@@ -2449,41 +2484,6 @@ export default function Settings() {
               </span>
             </span>
           </label>
-
-          <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()}>
-            <div className="anim-collapse-inner" style={{ paddingTop: 2 }}>
-              <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 12 }}>
-              {([
-                ['baseWeightFactor', '基础权重因子'],
-                ['valueScoreFactor', '价值分因子'],
-                ['costWeight', '成本权重'],
-                ['balanceWeight', '余额权重'],
-                ['usageWeight', '使用频次权重'],
-              ] as Array<[keyof RoutingWeights, string]>).map(([key, label]) => (
-                <div key={key}>
-                  <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>{label}</div>
-                  <input
-                    type="number"
-                    min={0}
-                    step={0.1}
-                    value={runtime.routingWeights[key]}
-                    onChange={(e) => {
-                      const v = Number(e.target.value);
-                      setRuntime((prev) => ({
-                        ...prev,
-                        routingWeights: {
-                          ...prev.routingWeights,
-                          [key]: Number.isFinite(v) ? v : 0,
-                        },
-                      }));
-                    }}
-                    style={inputStyle}
-                  />
-                </div>
-              ))}
-              </div>
-            </div>
-          </div>
 
           <div style={{ marginTop: 12 }}>
             <button onClick={saveRouting} disabled={savingRouting} className="btn btn-primary">
