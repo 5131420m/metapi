@@ -277,7 +277,7 @@ describe('Sub2ApiAdapter', () => {
     });
 
     const scope = 'account:sub2api-context-test';
-    await adapter.getModels(baseUrl, 'jwt-token', undefined, scope);
+    await adapter.getModels(baseUrl, 'jwt-token', undefined, { contextSourceScope: scope });
 
     expect(getModelContextLength('gpt-4o', scope)).toBe(128000);
   });

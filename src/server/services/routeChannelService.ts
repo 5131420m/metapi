@@ -228,9 +228,10 @@ export async function updateRouteChannelPriorities(
     }
 
     for (const update of updates) {
+      // 本 fork 不在批量调优先级时设置 manualOverride：批量调优是运维手段，
+      // 通道应继续接受自动同步管理。只有单通道编辑端点才代表人工接管。
       await tx.update(schema.routeChannels).set({
         priority: update.priority,
-        manualOverride: true,
       }).where(eq(schema.routeChannels.id, update.id)).run();
     }
     return await tx.select().from(schema.routeChannels)

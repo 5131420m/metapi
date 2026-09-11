@@ -36,9 +36,10 @@ describe('schema contract generation', () => {
       logicalType: 'boolean',
       defaultValue: 'false',
     });
+    // 本 fork 默认“站点头优先”，故该列默认值为 true（上游为 false）。
     expect(contract.tables.sites.columns.custom_headers_override_request_headers).toMatchObject({
       logicalType: 'boolean',
-      defaultValue: 'false',
+      defaultValue: 'true',
     });
     expect(contract.tables.token_routes.columns.routing_strategy).toMatchObject({
       logicalType: 'text',
