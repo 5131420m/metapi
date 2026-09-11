@@ -229,7 +229,7 @@ describe('gemini native proxy routes', () => {
         captureStreamChunks: false,
         targetSessionId: '',
         targetClientKind: '',
-        targetModel: '',
+        targetModels: [],
         retentionHours: 24,
         maxBodyBytes: 262144,
       },

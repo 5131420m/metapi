@@ -160,7 +160,7 @@ describe('claude count_tokens proxy route', () => {
         captureStreamChunks: false,
         targetSessionId: '',
         targetClientKind: '',
-        targetModel: '',
+        targetModels: [],
         retentionHours: 24,
         maxBodyBytes: 262144,
       },

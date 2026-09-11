@@ -15,6 +15,7 @@ const { apiMock } = vi.hoisted(() => ({
     getProxyDebugTraceDetail: vi.fn(),
     getRuntimeSettings: vi.fn(),
     getSites: vi.fn(),
+    getModelTokenCandidates: vi.fn(),
     updateRuntimeSettings: vi.fn(),
   },
 }));
@@ -138,9 +139,12 @@ describe('ProxyLogs server-driven page', () => {
       proxyDebugCaptureStreamChunks: false,
       proxyDebugTargetSessionId: '',
       proxyDebugTargetClientKind: '',
-      proxyDebugTargetModel: '',
+      proxyDebugTargetModels: [],
       proxyDebugRetentionHours: 24,
       proxyDebugMaxBodyBytes: 262144,
+    });
+    apiMock.getModelTokenCandidates.mockResolvedValue({
+      models: { 'gpt-4o': {}, 'claude-sonnet-4-5': {} },
     });
     apiMock.getProxyLogs.mockResolvedValue(buildListResponse());
     apiMock.getProxyLogsQuery.mockImplementation((params: any) =>
@@ -240,7 +244,7 @@ describe('ProxyLogs server-driven page', () => {
       proxyDebugCaptureStreamChunks: false,
       proxyDebugTargetSessionId: 'sess-debug-1',
       proxyDebugTargetClientKind: 'codex',
-      proxyDebugTargetModel: 'gpt-4o',
+      proxyDebugTargetModels: ['gpt-4o'],
       proxyDebugRetentionHours: 12,
       proxyDebugMaxBodyBytes: 131072,
     });
@@ -347,6 +351,28 @@ describe('ProxyLogs server-driven page', () => {
         retentionInput.props.onChange({ target: { value: '12' } });
       });
 
+      // Pick one model from the candidate list and add a second by hand, so the
+      // saved payload has to carry both instead of a single string.
+      const candidateBadge = root.root.find((node) => (
+        node.type === 'button'
+        && node.props['aria-pressed'] === false
+        && collectText(node).trim() === 'gpt-4o'
+      ));
+      await act(async () => {
+        candidateBadge.props.onClick();
+      });
+
+      const modelInput = root.root.find((node) => (
+        node.type === 'input'
+        && node.props['data-debug-setting'] === 'target-model'
+      ));
+      await act(async () => {
+        modelInput.props.onChange({ target: { value: 'gemini-2.5-pro' } });
+      });
+      await act(async () => {
+        modelInput.props.onKeyDown({ key: 'Enter', preventDefault: () => {} });
+      });
+
       const saveButton = root.root.find((node) => (
         node.type === 'button'
         && typeof node.props.onClick === 'function'
@@ -362,6 +388,7 @@ describe('ProxyLogs server-driven page', () => {
         proxyDebugTraceEnabled: true,
         proxyDebugCaptureBodies: true,
         proxyDebugTargetSessionId: 'sess-debug-1',
+        proxyDebugTargetModels: ['gpt-4o', 'gemini-2.5-pro'],
         proxyDebugRetentionHours: 12,
       }));
     } finally {
@@ -600,7 +627,7 @@ describe('ProxyLogs server-driven page', () => {
       proxyDebugCaptureStreamChunks: false,
       proxyDebugTargetSessionId: '',
       proxyDebugTargetClientKind: '',
-      proxyDebugTargetModel: '',
+      proxyDebugTargetModels: [],
       proxyDebugRetentionHours: 24,
       proxyDebugMaxBodyBytes: 262144,
     });
@@ -645,7 +672,7 @@ describe('ProxyLogs server-driven page', () => {
       proxyDebugCaptureStreamChunks: false,
       proxyDebugTargetSessionId: '',
       proxyDebugTargetClientKind: '',
-      proxyDebugTargetModel: '',
+      proxyDebugTargetModels: [],
       proxyDebugRetentionHours: 24,
       proxyDebugMaxBodyBytes: 262144,
     });

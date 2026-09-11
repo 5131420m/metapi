@@ -61,7 +61,7 @@ type ProxyDebugSettingsState = {
   proxyDebugCaptureStreamChunks: boolean;
   proxyDebugTargetSessionId: string;
   proxyDebugTargetClientKind: string;
-  proxyDebugTargetModel: string;
+  proxyDebugTargetModels: string[];
   proxyDebugRetentionHours: number;
   proxyDebugMaxBodyBytes: number;
 };
@@ -106,7 +106,7 @@ const DEFAULT_PROXY_DEBUG_SETTINGS: ProxyDebugSettingsState = {
   proxyDebugCaptureStreamChunks: false,
   proxyDebugTargetSessionId: "",
   proxyDebugTargetClientKind: "",
-  proxyDebugTargetModel: "",
+  proxyDebugTargetModels: [],
   proxyDebugRetentionHours: 24,
   proxyDebugMaxBodyBytes: 262144,
 };
@@ -593,6 +593,32 @@ function toApiTimeBoundary(value: string): string | undefined {
   return parsed.toISOString();
 }
 
+/**
+ * Normalizes the target-model value into a deduplicated list.
+ *
+ * Tolerates the legacy single-string form so a server that still returns
+ * `proxyDebugTargetModel` hydrates as a one-entry list.
+ */
+function normalizeTargetModelList(value: unknown): string[] {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(",")
+      : [];
+
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const raw of rawValues) {
+    const normalized = typeof raw === "string" ? raw.trim() : "";
+    if (!normalized) continue;
+    const dedupeKey = normalized.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    models.push(normalized);
+  }
+  return models;
+}
+
 function normalizeProxyDebugSettings(value: any): ProxyDebugSettingsState {
   return {
     proxyDebugTraceEnabled: !!value?.proxyDebugTraceEnabled,
@@ -601,7 +627,9 @@ function normalizeProxyDebugSettings(value: any): ProxyDebugSettingsState {
     proxyDebugCaptureStreamChunks: !!value?.proxyDebugCaptureStreamChunks,
     proxyDebugTargetSessionId: String(value?.proxyDebugTargetSessionId || ""),
     proxyDebugTargetClientKind: String(value?.proxyDebugTargetClientKind || ""),
-    proxyDebugTargetModel: String(value?.proxyDebugTargetModel || ""),
+    proxyDebugTargetModels: normalizeTargetModelList(
+      value?.proxyDebugTargetModels ?? value?.proxyDebugTargetModel,
+    ),
     proxyDebugRetentionHours: Number(value?.proxyDebugRetentionHours || 24),
     proxyDebugMaxBodyBytes: Number(value?.proxyDebugMaxBodyBytes || 262144),
   };
@@ -617,7 +645,9 @@ function buildProxyDebugSettingsPayload(
     proxyDebugCaptureStreamChunks: settings.proxyDebugCaptureStreamChunks,
     proxyDebugTargetSessionId: settings.proxyDebugTargetSessionId.trim(),
     proxyDebugTargetClientKind: settings.proxyDebugTargetClientKind.trim(),
-    proxyDebugTargetModel: settings.proxyDebugTargetModel.trim(),
+    proxyDebugTargetModels: normalizeTargetModelList(
+      settings.proxyDebugTargetModels,
+    ),
     proxyDebugRetentionHours: Math.max(
       1,
       Math.trunc(Number(settings.proxyDebugRetentionHours || 24)),
@@ -645,8 +675,8 @@ function formatProxyDebugTargetSummary(settings: ProxyDebugSettingsState) {
     settings.proxyDebugTargetClientKind
       ? `客户端 ${settings.proxyDebugTargetClientKind}`
       : null,
-    settings.proxyDebugTargetModel
-      ? `模型 ${settings.proxyDebugTargetModel}`
+    settings.proxyDebugTargetModels.length > 0
+      ? `模型 ${settings.proxyDebugTargetModels.join(" / ")}`
       : null,
   ].filter(Boolean);
   return parts.length > 0 ? parts.join("，") : "不过滤，记录所有命中的新请求";
@@ -814,6 +844,8 @@ export default function ProxyLogs() {
   );
   const [debugDraftSettings, setDebugDraftSettings] =
     useState<ProxyDebugSettingsState>(DEFAULT_PROXY_DEBUG_SETTINGS);
+  const [debugModelInput, setDebugModelInput] = useState("");
+  const [debugModelOptions, setDebugModelOptions] = useState<string[]>([]);
   const [debugTraces, setDebugTraces] = useState<ProxyDebugTraceListItem[]>([]);
   const [debugTracePage, setDebugTracePage] = useState(1);
   const [selectedDebugTraceId, setSelectedDebugTraceId] = useState<
@@ -1315,6 +1347,65 @@ export default function ProxyLogs() {
   useEffect(() => {
     persistDebugTracePanelExpanded(debugTracePanelExpanded);
   }, [debugTracePanelExpanded]);
+
+  // Best-effort model list for the target-model picker. A failure here only
+  // removes the convenience selector; the manual input still works.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response: any = await api.getModelTokenCandidates();
+        if (cancelled) return;
+        const models = response?.models || {};
+        setDebugModelOptions(
+          Object.keys(models).sort((left, right) => left.localeCompare(right)),
+        );
+      } catch {
+        if (!cancelled) setDebugModelOptions([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const toggleDebugTargetModel = useCallback((model: string) => {
+    const normalized = model.trim();
+    if (!normalized) return;
+    setDebugDraftSettings((current) => {
+      const selected = current.proxyDebugTargetModels;
+      const exists = selected.some(
+        (item) => item.toLowerCase() === normalized.toLowerCase(),
+      );
+      return {
+        ...current,
+        proxyDebugTargetModels: exists
+          ? selected.filter(
+              (item) => item.toLowerCase() !== normalized.toLowerCase(),
+            )
+          : [...selected, normalized],
+      };
+    });
+  }, []);
+
+  const addDebugTargetModel = useCallback((rawValue: string) => {
+    const normalized = rawValue.trim();
+    if (!normalized) return;
+    setDebugDraftSettings((current) => {
+      const exists = current.proxyDebugTargetModels.some(
+        (item) => item.toLowerCase() === normalized.toLowerCase(),
+      );
+      if (exists) return current;
+      return {
+        ...current,
+        proxyDebugTargetModels: [
+          ...current.proxyDebugTargetModels,
+          normalized,
+        ],
+      };
+    });
+    setDebugModelInput("");
+  }, []);
 
   const persistDebugSettings = useCallback(
     async (
@@ -1988,24 +2079,130 @@ export default function ProxyLogs() {
               style={formInputStyle}
             />
           </label>
-          <label style={{ display: "grid", gap: 6 }}>
+          <div style={{ display: "grid", gap: 6 }}>
             <span style={{ fontSize: 12, color: "var(--color-text-muted)" }}>
               目标模型
             </span>
-            <input
-              type="text"
-              value={debugDraftSettings.proxyDebugTargetModel}
-              data-debug-setting="target-model"
-              onChange={(e) =>
-                setDebugDraftSettings((current) => ({
-                  ...current,
-                  proxyDebugTargetModel: e.target.value,
-                }))
-              }
-              placeholder="如 gpt-4o"
-              style={formInputStyle}
-            />
-          </label>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input
+                type="text"
+                value={debugModelInput}
+                data-debug-setting="target-model"
+                onChange={(e) => setDebugModelInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    addDebugTargetModel(debugModelInput);
+                  }
+                }}
+                placeholder="留空表示不过滤，如 gpt-4o"
+                style={{ ...formInputStyle, flex: 1 }}
+              />
+              <button
+                type="button"
+                className="btn btn-ghost"
+                style={{ border: "1px solid var(--color-border)" }}
+                onClick={() => addDebugTargetModel(debugModelInput)}
+              >
+                添加
+              </button>
+            </div>
+            {debugModelOptions.length > 0 ? (
+              <div style={{ display: "grid", gap: 4 }}>
+                <span
+                  style={{ fontSize: 11, color: "var(--color-text-muted)" }}
+                >
+                  或从当前可用模型中选择：
+                </span>
+                <div
+                  style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: 6,
+                    maxHeight: 120,
+                    overflowY: "auto",
+                    border: "1px solid var(--color-border)",
+                    padding: 8,
+                    borderRadius: 4,
+                  }}
+                >
+                  {debugModelOptions.map((model) => {
+                    // Case-insensitive so a hand-typed "GPT-4o" still shows the
+                    // matching candidate badge as selected, matching how
+                    // toggleDebugTargetModel and the server compare models.
+                    const selected =
+                      debugDraftSettings.proxyDebugTargetModels.some(
+                        (item) => item.toLowerCase() === model.toLowerCase(),
+                      );
+                    return (
+                      <button
+                        key={model}
+                        type="button"
+                        aria-pressed={selected}
+                        onClick={() => toggleDebugTargetModel(model)}
+                        className={`badge ${selected ? "badge-success" : "badge-muted"}`}
+                        style={{
+                          fontSize: 11,
+                          cursor: "pointer",
+                          border: "none",
+                          padding: "4px 10px",
+                        }}
+                      >
+                        {model}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : null}
+            {debugDraftSettings.proxyDebugTargetModels.length > 0 ? (
+              <div style={{ display: "grid", gap: 4 }}>
+                <span
+                  style={{ fontSize: 11, color: "var(--color-text-muted)" }}
+                >
+                  已选 {debugDraftSettings.proxyDebugTargetModels.length}{" "}
+                  个模型，只有这些模型的请求会写入调试信息
+                </span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {debugDraftSettings.proxyDebugTargetModels.map((model) => (
+                    <span
+                      key={model}
+                      className="badge badge-success"
+                      style={{
+                        fontSize: 11,
+                        padding: "4px 10px",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 4,
+                      }}
+                    >
+                      {model}
+                      <button
+                        type="button"
+                        aria-label={`移除 ${model}`}
+                        onClick={() => toggleDebugTargetModel(model)}
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "inherit",
+                          cursor: "pointer",
+                          padding: 0,
+                          fontSize: 14,
+                          lineHeight: 1,
+                        }}
+                      >
+                        ×
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <span style={{ fontSize: 11, color: "var(--color-text-muted)" }}>
+                未选择模型时不按模型过滤；选中后不带模型的请求（如列模型）不再记录。
+              </span>
+            )}
+          </div>
         </div>
 
         <div style={formSectionStyle}>

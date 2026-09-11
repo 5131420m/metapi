@@ -38,6 +38,38 @@ describe('applyRuntimeSettings', () => {
     expect(config.downstreamErrorPolicy).toMatchObject({ mode: 'resilient', downstreamApiKeyIds: [17] });
   });
 
+  it('hydrates the debug target models from a JSON array', () => {
+    config.proxyDebugTargetModels = [];
+
+    applyRuntimeSettings(new Map([
+      ['proxy_debug_target_model', JSON.stringify(['gpt-4o', ' gemini-2.5-pro '])],
+    ]));
+
+    expect(config.proxyDebugTargetModels).toEqual(['gpt-4o', 'gemini-2.5-pro']);
+  });
+
+  it('hydrates a legacy single-string debug target model as a one-entry list', () => {
+    // Rows written before the multi-select change hold a bare JSON string.
+    // They must upgrade in place, without a migration or a second key.
+    config.proxyDebugTargetModels = [];
+
+    applyRuntimeSettings(new Map([
+      ['proxy_debug_target_model', JSON.stringify('gpt-4o')],
+    ]));
+
+    expect(config.proxyDebugTargetModels).toEqual(['gpt-4o']);
+  });
+
+  it('clears the debug model filter when the persisted list is empty', () => {
+    config.proxyDebugTargetModels = ['gpt-4o'];
+
+    applyRuntimeSettings(new Map([
+      ['proxy_debug_target_model', JSON.stringify([])],
+    ]));
+
+    expect(config.proxyDebugTargetModels).toEqual([]);
+  });
+
   it('drops stale downstream key references and disables an empty resilient policy', () => {
     config.downstreamErrorPolicy = { mode: 'off', downstreamApiKeyIds: [] };
 

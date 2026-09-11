@@ -222,9 +222,12 @@ export function applyRuntimeSettings(
     config.proxyDebugTargetClientKind = proxyDebugTargetClientKind.trim();
   }
 
-  const proxyDebugTargetModel = parseSettingFromMap<string>(settingsMap, 'proxy_debug_target_model');
-  if (typeof proxyDebugTargetModel === 'string') {
-    config.proxyDebugTargetModel = proxyDebugTargetModel.trim();
+  // Accepts both the legacy single-string value and the current string[] form,
+  // so an existing `proxy_debug_target_model` row hydrates as a one-entry list
+  // without needing a migration or a second settings key.
+  const proxyDebugTargetModels = parseSettingFromMap<string[] | string>(settingsMap, 'proxy_debug_target_model');
+  if (proxyDebugTargetModels !== undefined) {
+    config.proxyDebugTargetModels = toStringList(proxyDebugTargetModels);
   }
 
   const proxyDebugRetentionHours = parseSettingFromMap<number>(settingsMap, 'proxy_debug_retention_hours');

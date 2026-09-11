@@ -376,7 +376,7 @@ export type RuntimeSettingsPayload = {
   proxyDebugCaptureStreamChunks?: boolean;
   proxyDebugTargetSessionId?: string;
   proxyDebugTargetClientKind?: string;
-  proxyDebugTargetModel?: string;
+  proxyDebugTargetModels?: string[];
   proxyDebugRetentionHours?: number;
   proxyDebugMaxBodyBytes?: number;
   checkinCron?: string;

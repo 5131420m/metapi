@@ -71,7 +71,7 @@ interface RuntimeSettingsBody {
   proxyDebugCaptureStreamChunks?: boolean;
   proxyDebugTargetSessionId?: string;
   proxyDebugTargetClientKind?: string;
-  proxyDebugTargetModel?: string;
+  proxyDebugTargetModels?: string[] | string;
   proxyDebugRetentionHours?: number;
   proxyDebugMaxBodyBytes?: number;
   checkinCron?: string;
@@ -291,6 +291,35 @@ function toStringList(value: unknown): string[] {
       .filter((item) => item.length > 0);
   }
   return [];
+}
+
+/**
+ * Normalizes the debug target-model setting into a deduplicated list.
+ *
+ * Accepts every shape the value can arrive in: an already-parsed `string[]`,
+ * a JSON-encoded array, a JSON-encoded single string, and the legacy plain
+ * comma-separated string. This keeps the existing `proxy_debug_target_model`
+ * row readable as a one-entry list without a migration.
+ */
+function parseDebugTargetModels(value: unknown): string[] {
+  let source: unknown = value;
+  if (typeof source === 'string') {
+    try {
+      source = JSON.parse(source);
+    } catch {
+      // Not JSON — fall through to comma splitting via toStringList.
+    }
+  }
+
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const item of toStringList(source)) {
+    const dedupeKey = item.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    models.push(item);
+  }
+  return models;
 }
 
 function parseProxyErrorKeywords(value: unknown): string[] {
@@ -533,7 +562,7 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       return;
     }
     case 'proxy_debug_target_model': {
-      config.proxyDebugTargetModel = typeof value === 'string' ? value.trim() : '';
+      config.proxyDebugTargetModels = parseDebugTargetModels(value);
       return;
     }
     case 'proxy_debug_retention_hours': {
@@ -793,7 +822,7 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     proxyDebugCaptureStreamChunks: config.proxyDebugCaptureStreamChunks,
     proxyDebugTargetSessionId: config.proxyDebugTargetSessionId,
     proxyDebugTargetClientKind: config.proxyDebugTargetClientKind,
-    proxyDebugTargetModel: config.proxyDebugTargetModel,
+    proxyDebugTargetModels: config.proxyDebugTargetModels,
     proxyDebugRetentionHours: config.proxyDebugRetentionHours,
     proxyDebugMaxBodyBytes: config.proxyDebugMaxBodyBytes,
     routingFallbackUnitCost: config.routingFallbackUnitCost,
@@ -1564,13 +1593,15 @@ export async function settingsRoutes(app: FastifyInstance) {
       await upsertSetting('proxy_debug_target_client_kind', config.proxyDebugTargetClientKind);
     }
 
-    if (body.proxyDebugTargetModel !== undefined) {
-      const nextValue = String(body.proxyDebugTargetModel || '').trim();
-      if (nextValue !== config.proxyDebugTargetModel) {
-        changedLabels.push('代理调试目标模型');
+    if (body.proxyDebugTargetModels !== undefined) {
+      const nextValue = parseDebugTargetModels(body.proxyDebugTargetModels);
+      if (JSON.stringify(nextValue) !== JSON.stringify(config.proxyDebugTargetModels)) {
+        changedLabels.push(nextValue.length > 0
+          ? `代理调试目标模型（${nextValue.length} 个）`
+          : '代理调试目标模型（不过滤）');
       }
-      config.proxyDebugTargetModel = nextValue;
-      await upsertSetting('proxy_debug_target_model', config.proxyDebugTargetModel);
+      config.proxyDebugTargetModels = nextValue;
+      await upsertSetting('proxy_debug_target_model', config.proxyDebugTargetModels);
     }
 
     if (body.proxyDebugRetentionHours !== undefined) {

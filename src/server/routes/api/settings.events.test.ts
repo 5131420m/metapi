@@ -63,7 +63,7 @@ describe('settings and auth events', () => {
     (config as any).proxyDebugCaptureStreamChunks = false;
     (config as any).proxyDebugTargetSessionId = '';
     (config as any).proxyDebugTargetClientKind = '';
-    (config as any).proxyDebugTargetModel = '';
+    (config as any).proxyDebugTargetModels = [];
     (config as any).proxyDebugRetentionHours = 24;
     (config as any).proxyDebugMaxBodyBytes = 262144;
     config.routingFallbackUnitCost = 1;
@@ -180,7 +180,7 @@ describe('settings and auth events', () => {
         proxyDebugCaptureStreamChunks: true,
         proxyDebugTargetSessionId: 'sess-debug-1',
         proxyDebugTargetClientKind: 'codex',
-        proxyDebugTargetModel: 'gpt-4o',
+        proxyDebugTargetModels: ['gpt-4o', 'claude-sonnet-4-5'],
         proxyDebugRetentionHours: 12,
         proxyDebugMaxBodyBytes: 131072,
       },
@@ -194,7 +194,7 @@ describe('settings and auth events', () => {
       proxyDebugCaptureStreamChunks?: boolean;
       proxyDebugTargetSessionId?: string;
       proxyDebugTargetClientKind?: string;
-      proxyDebugTargetModel?: string;
+      proxyDebugTargetModels?: string[];
       proxyDebugRetentionHours?: number;
       proxyDebugMaxBodyBytes?: number;
     };
@@ -205,7 +205,7 @@ describe('settings and auth events', () => {
       proxyDebugCaptureStreamChunks: true,
       proxyDebugTargetSessionId: 'sess-debug-1',
       proxyDebugTargetClientKind: 'codex',
-      proxyDebugTargetModel: 'gpt-4o',
+      proxyDebugTargetModels: ['gpt-4o', 'claude-sonnet-4-5'],
       proxyDebugRetentionHours: 12,
       proxyDebugMaxBodyBytes: 131072,
     });
@@ -225,7 +225,7 @@ describe('settings and auth events', () => {
     expect(savedStreamChunks?.value).toBe(JSON.stringify(true));
     expect(savedTargetSessionId?.value).toBe(JSON.stringify('sess-debug-1'));
     expect(savedTargetClientKind?.value).toBe(JSON.stringify('codex'));
-    expect(savedTargetModel?.value).toBe(JSON.stringify('gpt-4o'));
+    expect(savedTargetModel?.value).toBe(JSON.stringify(['gpt-4o', 'claude-sonnet-4-5']));
     expect(savedRetentionHours?.value).toBe(JSON.stringify(12));
     expect(savedMaxBodyBytes?.value).toBe(JSON.stringify(131072));
   });

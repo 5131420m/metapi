@@ -236,4 +236,87 @@ describe('proxyDebugTraceStore', () => {
       'x-trace-id': 'trace-123',
     });
   });
+
+  describe('shouldTraceProxyDebugRequest model selection', () => {
+    const baseOptions = {
+      enabled: true,
+      captureHeaders: true,
+      captureBodies: false,
+      captureStreamChunks: false,
+      targetSessionId: '',
+      targetClientKind: '',
+      targetModels: [] as string[],
+      retentionHours: 24,
+      maxBodyBytes: 262_144,
+    };
+
+    it('traces every model when no target model is selected', () => {
+      const options = { ...baseOptions, targetModels: [] };
+
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'gpt-4o' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'claude-sonnet-4-5' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: null }, options)).toBe(true);
+    });
+
+    it('traces only the selected models once a selection exists', () => {
+      const options = { ...baseOptions, targetModels: ['gpt-4o', 'gemini-2.5-pro'] };
+
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'gpt-4o' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'gemini-2.5-pro' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'claude-sonnet-4-5' }, options)).toBe(false);
+    });
+
+    it('matches selected models case-insensitively', () => {
+      const options = { ...baseOptions, targetModels: ['DeepSeek-V4-Pro'] };
+
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'deepseek-v4-pro' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'DEEPSEEK-V4-PRO' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'deepseek-v4-flash' }, options)).toBe(false);
+    });
+
+    it('skips requests without a resolved model when a selection exists', () => {
+      const options = { ...baseOptions, targetModels: ['gpt-4o'] };
+
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: null }, options)).toBe(false);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: '' }, options)).toBe(false);
+    });
+
+    it('accepts the legacy single-string target model value', () => {
+      const options = { ...baseOptions, targetModels: 'gpt-4o' as unknown as string[] };
+
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'gpt-4o' }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'claude-sonnet-4-5' }, options)).toBe(false);
+    });
+
+    it('still enforces session and client filters alongside the model list', () => {
+      const options = {
+        ...baseOptions,
+        targetSessionId: 'sess-1',
+        targetClientKind: 'codex',
+        targetModels: ['gpt-4o'],
+      };
+
+      expect(store.shouldTraceProxyDebugRequest({
+        sessionId: 'sess-1',
+        clientKind: 'codex',
+        requestedModel: 'gpt-4o',
+      }, options)).toBe(true);
+      expect(store.shouldTraceProxyDebugRequest({
+        sessionId: 'sess-2',
+        clientKind: 'codex',
+        requestedModel: 'gpt-4o',
+      }, options)).toBe(false);
+      expect(store.shouldTraceProxyDebugRequest({
+        sessionId: 'sess-1',
+        clientKind: 'claude_code',
+        requestedModel: 'gpt-4o',
+      }, options)).toBe(false);
+    });
+
+    it('never traces while the master switch is off', () => {
+      const options = { ...baseOptions, enabled: false, targetModels: ['gpt-4o'] };
+
+      expect(store.shouldTraceProxyDebugRequest({ requestedModel: 'gpt-4o' }, options)).toBe(false);
+    });
+  });
 });

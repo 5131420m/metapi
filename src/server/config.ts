@@ -144,7 +144,7 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     proxyDebugCaptureStreamChunks: parseBoolean(env.PROXY_DEBUG_CAPTURE_STREAM_CHUNKS, false),
     proxyDebugTargetSessionId: (env.PROXY_DEBUG_TARGET_SESSION_ID || '').trim(),
     proxyDebugTargetClientKind: (env.PROXY_DEBUG_TARGET_CLIENT_KIND || '').trim(),
-    proxyDebugTargetModel: (env.PROXY_DEBUG_TARGET_MODEL || '').trim(),
+    proxyDebugTargetModels: parseCsvList(env.PROXY_DEBUG_TARGET_MODEL),
     proxyDebugRetentionHours: Math.max(1, Math.trunc(parseNumber(env.PROXY_DEBUG_RETENTION_HOURS, 24))),
     proxyDebugMaxBodyBytes: Math.max(1024, Math.trunc(parseNumber(env.PROXY_DEBUG_MAX_BODY_BYTES, 262_144))),
     openAiServiceTierRules: parseJsonValue(env.OPENAI_SERVICE_TIER_RULES_JSON || env.OPENAI_SERVICE_TIER_RULES),

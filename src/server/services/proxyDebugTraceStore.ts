@@ -13,7 +13,7 @@ export type ProxyDebugCaptureOptions = {
   captureStreamChunks: boolean;
   targetSessionId: string;
   targetClientKind: string;
-  targetModel: string;
+  targetModels: string[];
   retentionHours: number;
   maxBodyBytes: number;
 };
@@ -174,6 +174,26 @@ function asNormalizedText(value: unknown): string {
   return typeof value === 'string' ? value.trim().toLowerCase() : '';
 }
 
+function normalizeTargetModels(value: unknown): string[] {
+  const rawValues = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(',')
+      : [];
+
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const raw of rawValues) {
+    const normalized = typeof raw === 'string' ? raw.trim() : '';
+    if (!normalized) continue;
+    const dedupeKey = normalized.toLowerCase();
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    models.push(normalized);
+  }
+  return models;
+}
+
 function getCaptureOptions(): ProxyDebugCaptureOptions {
   return {
     enabled: config.proxyDebugTraceEnabled,
@@ -182,7 +202,7 @@ function getCaptureOptions(): ProxyDebugCaptureOptions {
     captureStreamChunks: config.proxyDebugCaptureStreamChunks,
     targetSessionId: (config.proxyDebugTargetSessionId || '').trim(),
     targetClientKind: (config.proxyDebugTargetClientKind || '').trim(),
-    targetModel: (config.proxyDebugTargetModel || '').trim(),
+    targetModels: normalizeTargetModels(config.proxyDebugTargetModels),
     retentionHours: Math.max(1, Math.trunc(config.proxyDebugRetentionHours || 24)),
     maxBodyBytes: Math.max(1024, Math.trunc(config.proxyDebugMaxBodyBytes || 262_144)),
   };
@@ -217,8 +237,12 @@ export function shouldTraceProxyDebugRequest(input: {
     return false;
   }
 
-  const targetModel = asNormalizedText(options.targetModel);
-  if (targetModel && asNormalizedText(input.requestedModel) !== targetModel) {
+  // An empty list means "do not filter by model". Once any model is selected,
+  // only those models are traced; requests without a resolved model (for
+  // example model listing) no longer match and are skipped.
+  const targetModels = normalizeTargetModels(options.targetModels)
+    .map((model) => model.toLowerCase());
+  if (targetModels.length > 0 && !targetModels.includes(asNormalizedText(input.requestedModel))) {
     return false;
   }
 
