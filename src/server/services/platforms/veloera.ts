@@ -4,6 +4,10 @@ import {
   extractContextLengthsFromPayload,
   setModelContextLengths,
 } from '../modelContextLengthCache.js';
+import {
+  markConfirmedEmptyModelList,
+  unreadableModelListError,
+} from './modelListEvidence.js';
 
 export class VeloeraAdapter extends BasePlatformAdapter {
   readonly platformName = 'veloera';
@@ -68,10 +72,16 @@ export class VeloeraAdapter extends BasePlatformAdapter {
     const res = await this.fetchJson<any>(`${baseUrl}/v1/models`, {
       headers: { Authorization: `Bearer ${apiToken}` },
     });
+    // Only a well-formed list counts: an HTTP 200 carrying an error envelope
+    // must not be reported as "this account has no models", or model refresh
+    // would clear the previously synced ones. See modelListEvidence.ts.
+    if (!Array.isArray(res?.data)) {
+      throw unreadableModelListError(`${baseUrl}/v1/models`, res);
+    }
     setModelContextLengths(
       extractContextLengthsFromPayload(res),
       contextSourceScope || buildEndpointModelContextLengthScope(baseUrl),
     );
-    return (res?.data || []).map((m: any) => m.id).filter(Boolean);
+    return markConfirmedEmptyModelList(res.data.map((m: any) => m.id).filter(Boolean));
   }
 }

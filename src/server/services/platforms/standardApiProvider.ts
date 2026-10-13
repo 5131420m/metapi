@@ -9,6 +9,11 @@ import {
   extractContextLengthsFromPayload,
   setModelContextLengths,
 } from '../modelContextLengthCache.js';
+import {
+  looksLikeErrorEnvelope,
+  markConfirmedEmptyModelList,
+  unreadableModelListError,
+} from './modelListEvidence.js';
 
 type FetchModelsOptions = {
   baseUrl: string;
@@ -66,13 +71,15 @@ export abstract class StandardApiProviderAdapterBase extends BasePlatformAdapter
       ? options.resolveUrl(normalizedBaseUrl)
       : resolveVersionedModelsUrl(normalizedBaseUrl);
 
-    let payload: any;
-    try {
-      payload = await this.fetchJson<any>(url, {
-        headers: options.headers,
-      });
-    } catch {
-      return [];
+    // A failed request must not look like "this account has no models": it is
+    // rethrown so model refresh counts it as a failed pull instead of clearing
+    // the previously synced models. See modelListEvidence.ts.
+    const payload = await this.fetchJson<any>(url, {
+      headers: options.headers,
+    });
+
+    if (looksLikeErrorEnvelope(payload)) {
+      throw unreadableModelListError(url, payload);
     }
 
     const rows = options.mapResponse
@@ -91,8 +98,10 @@ export abstract class StandardApiProviderAdapterBase extends BasePlatformAdapter
       options.contextSourceScope || buildEndpointModelContextLengthScope(normalizedBaseUrl),
     );
 
-    return rows
+    // The payload was a well-formed model list, so an empty result here is the
+    // upstream's own answer and counts as evidence.
+    return markConfirmedEmptyModelList(rows
       .map((item) => (typeof item === 'string' ? item.trim() : ''))
-      .filter((item) => item.length > 0);
+      .filter((item) => item.length > 0));
   }
 }

@@ -4,6 +4,13 @@ import { createContext, runInContext } from 'node:vm';
 import { withSiteProxyRequestInit } from '../siteProxy.js';
 import { fetchJsonWithShieldCookieRetry } from './newApiShield.js';
 import {
+  confirmedEmptyModelList,
+  isConfirmedEmptyModelList,
+  looksLikeErrorEnvelope,
+  markConfirmedEmptyModelList,
+  unreadableModelListError,
+} from './modelListEvidence.js';
+import {
   buildEndpointModelContextLengthScope,
   extractContextLengthsFromPayload,
   setModelContextLengths,
@@ -865,35 +872,55 @@ export class NewApiAdapter extends BasePlatformAdapter {
 
   private async getSessionModelsByCookie(baseUrl: string, token: string, userId?: number | null, signal?: AbortSignal): Promise<string[]> {
     let firstFailure: unknown = null;
-    let hadSuccessfulResponse = false;
+    // Confirmed only by a body that was actually a model list: an HTTP 200
+    // carrying { success: false, message } (an expired session, a user-id
+    // mismatch) is a failure, not an empty account. See modelListEvidence.ts.
+    let sawConfirmedEmpty = false;
+    const url = `${baseUrl}/api/user/models`;
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
         const headers: Record<string, string> = { Cookie: cookie };
         this.appendUserIdCompatibilityHeaders(headers, userId);
-        const res = await this.fetchJsonRaw<any>(`${baseUrl}/api/user/models`, { headers, signal });
+        const res = await this.fetchJsonRaw<any>(url, { headers, signal });
         if (res === null) {
           firstFailure ??= new Error('model discovery request failed');
-        } else {
-          hadSuccessfulResponse = true;
+          continue;
         }
-        if (Array.isArray(res?.data) && res.data.length > 0) return res.data.filter(Boolean);
+        if (looksLikeErrorEnvelope(res)) {
+          firstFailure ??= unreadableModelListError(url, res);
+          continue;
+        }
+        if (Array.isArray(res?.data)) {
+          if (res.data.length > 0) return res.data.filter(Boolean);
+          sawConfirmedEmpty = true;
+          continue;
+        }
         if (res?.data && typeof res.data === 'object') {
           const keys = Object.keys(res.data).filter(Boolean);
           if (keys.length > 0) return keys;
+          sawConfirmedEmpty = true;
+          continue;
         }
+        firstFailure ??= unreadableModelListError(url, res);
       } catch (error) {
         firstFailure ??= error;
       }
     }
-    if (!hadSuccessfulResponse && firstFailure) throw firstFailure;
-    return [];
+    if (!sawConfirmedEmpty && firstFailure) throw firstFailure;
+    return confirmedEmptyModelList();
   }
 
-  private extractOpenAiModels(payload: any, sourceScope: string): string[] {
-    if (!Array.isArray(payload?.data)) return [];
+  /**
+   * Parse an OpenAI-shaped model list. Returns null when the payload is not one
+   * (an error envelope, a missing/ill-typed `data`), so callers can treat it as
+   * a failure instead of an empty account. See modelListEvidence.ts.
+   */
+  private extractOpenAiModels(payload: any, sourceScope: string): string[] | null {
+    if (looksLikeErrorEnvelope(payload)) return null;
+    if (!Array.isArray(payload?.data)) return null;
     const contextLengths = extractContextLengthsFromPayload(payload);
     setModelContextLengths(contextLengths, sourceScope);
-    return payload.data.map((m: any) => m?.id).filter(Boolean);
+    return markConfirmedEmptyModelList(payload.data.map((m: any) => m?.id).filter(Boolean));
   }
 
   private async getOpenAiModelsViaShieldCookie(
@@ -903,10 +930,11 @@ export class NewApiAdapter extends BasePlatformAdapter {
     signal?: AbortSignal,
   ): Promise<string[]> {
     let firstFailure: unknown = null;
-    let hadSuccessfulResponse = false;
+    let sawConfirmedEmpty = false;
+    const url = `${baseUrl}/v1/models`;
     for (const cookie of this.buildCookieCandidates(token)) {
       try {
-        const result = await fetchJsonWithShieldCookieRetry<any>(`${baseUrl}/v1/models`, {
+        const result = await fetchJsonWithShieldCookieRetry<any>(url, {
           headers: {
             Authorization: `Bearer ${token}`,
             Cookie: cookie,
@@ -917,15 +945,19 @@ export class NewApiAdapter extends BasePlatformAdapter {
           firstFailure ??= new Error(`HTTP ${result.status || 502}: model discovery failed`);
           continue;
         }
-        hadSuccessfulResponse = true;
         const models = this.extractOpenAiModels(result.data, sourceScope);
+        if (models === null) {
+          firstFailure ??= unreadableModelListError(url, result.data);
+          continue;
+        }
         if (models.length > 0) return models;
+        sawConfirmedEmpty = true;
       } catch (error) {
         firstFailure ??= error;
       }
     }
-    if (!hadSuccessfulResponse && firstFailure) throw firstFailure;
-    return [];
+    if (!sawConfirmedEmpty && firstFailure) throw firstFailure;
+    return confirmedEmptyModelList();
   }
 
   private async getOpenAiModels(
@@ -937,30 +969,32 @@ export class NewApiAdapter extends BasePlatformAdapter {
     const throwOnAllFailures = options?.throwOnAllFailures ?? false;
     const sourceScope = options?.contextSourceScope || buildEndpointModelContextLengthScope(baseUrl);
     let firstFailure: unknown = null;
-    let hadSuccessfulResponse = false;
+    let sawConfirmedEmpty = false;
     const shouldTryShieldCookie = this.platformName === 'anyrouter' || token.includes('=');
     if (shouldTryShieldCookie) {
       try {
         const shieldModels = await this.getOpenAiModelsViaShieldCookie(baseUrl, token, sourceScope, signal);
-        hadSuccessfulResponse = true;
         if (shieldModels.length > 0) return shieldModels;
+        sawConfirmedEmpty ||= isConfirmedEmptyModelList(shieldModels);
       } catch (error) {
         firstFailure ??= error;
       }
     }
 
+    const url = `${baseUrl}/v1/models`;
     try {
-      const res = await this.fetchJson<any>(`${baseUrl}/v1/models`, {
+      const res = await this.fetchJson<any>(url, {
         headers: { Authorization: `Bearer ${token}` },
         signal,
       });
-      hadSuccessfulResponse = true;
-      return this.extractOpenAiModels(res, sourceScope);
+      const models = this.extractOpenAiModels(res, sourceScope);
+      if (models !== null) return models;
+      firstFailure ??= unreadableModelListError(url, res);
     } catch (error) {
       firstFailure ??= error;
     }
-    if (throwOnAllFailures && !hadSuccessfulResponse && firstFailure) throw firstFailure;
-    return [];
+    if (throwOnAllFailures && !sawConfirmedEmpty && firstFailure) throw firstFailure;
+    return sawConfirmedEmpty ? confirmedEmptyModelList() : [];
   }
 
   private async discoverUserId(baseUrl: string, accessToken: string, signal?: AbortSignal): Promise<number | null> {
@@ -1328,7 +1362,12 @@ export class NewApiAdapter extends BasePlatformAdapter {
   ): Promise<string[]> {
     const signal = options?.signal;
     let firstFailure: unknown = null;
-    let hadSuccessfulResponse = false;
+    // Set ONLY by a response that was confirmed to be a model list. An HTTP 200
+    // is not enough: new-api answers 200 with { success: false, message } for
+    // auth and permission failures, and treating that as "this account has no
+    // models" would make model refresh clear the previously synced ones. See
+    // modelListEvidence.ts.
+    let sawConfirmedEmpty = false;
     let openAiModels: string[] = [];
     try {
       openAiModels = await this.getOpenAiModels(baseUrl, token, {
@@ -1336,7 +1375,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
         contextSourceScope: options?.contextSourceScope,
         throwOnAllFailures: true,
       });
-      hadSuccessfulResponse = true;
+      sawConfirmedEmpty ||= isConfirmedEmptyModelList(openAiModels);
     } catch (error) {
       firstFailure = error;
     }
@@ -1344,18 +1383,21 @@ export class NewApiAdapter extends BasePlatformAdapter {
 
     const userId = platformUserId || await this.discoverUserId(baseUrl, token, signal);
     if (userId) {
+      const userModelsUrl = `${baseUrl}/api/user/models`;
       try {
-        const res = await this.fetchJson<any>(`${baseUrl}/api/user/models`, {
+        const res = await this.fetchJson<any>(userModelsUrl, {
           headers: this.authHeaders(token, userId),
           signal,
         });
-        if (Array.isArray(res?.data)) {
-          return res.data.filter(Boolean);
+        if (looksLikeErrorEnvelope(res)) {
+          firstFailure ??= unreadableModelListError(userModelsUrl, res);
+        } else if (Array.isArray(res?.data)) {
+          return markConfirmedEmptyModelList(res.data.filter(Boolean));
+        } else if (res?.data && typeof res.data === 'object') {
+          return markConfirmedEmptyModelList(Object.keys(res.data).filter(Boolean));
+        } else {
+          firstFailure ??= unreadableModelListError(userModelsUrl, res);
         }
-        if (res?.data && typeof res.data === 'object') {
-          return Object.keys(res.data).filter(Boolean);
-        }
-        hadSuccessfulResponse = true;
       } catch (error) {
         firstFailure ??= error;
       }
@@ -1364,7 +1406,7 @@ export class NewApiAdapter extends BasePlatformAdapter {
     let cookieModels: string[] = [];
     try {
       cookieModels = await this.getSessionModelsByCookie(baseUrl, token, userId || platformUserId, signal);
-      hadSuccessfulResponse = true;
+      sawConfirmedEmpty ||= isConfirmedEmptyModelList(cookieModels);
     } catch (error) {
       firstFailure ??= error;
     }
@@ -1375,20 +1417,20 @@ export class NewApiAdapter extends BasePlatformAdapter {
       let fallbackModels: string[] = [];
       try {
         fallbackModels = await this.getSessionModelsByCookie(baseUrl, token, alternateCookieUserId, signal);
-        hadSuccessfulResponse = true;
+        sawConfirmedEmpty ||= isConfirmedEmptyModelList(fallbackModels);
       } catch (error) {
         firstFailure ??= error;
       }
       if (fallbackModels.length > 0) return fallbackModels;
     }
 
-    if (!hadSuccessfulResponse && firstFailure) {
+    if (!sawConfirmedEmpty && firstFailure) {
       throw new NewApiModelDiscoveryError(
         `failed to discover models: ${firstFailure instanceof Error ? firstFailure.message : String(firstFailure)}`,
         firstFailure,
       );
     }
-    return [];
+    return confirmedEmptyModelList();
   }
 
   async getApiToken(baseUrl: string, accessToken: string, platformUserId?: number): Promise<string | null> {

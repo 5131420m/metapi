@@ -4,6 +4,7 @@ import {
   normalizePlatformBaseUrl,
   resolveVersionedModelsUrl,
 } from './standardApiProvider.js';
+import { isConfirmedEmptyModelList } from './modelListEvidence.js';
 
 class TestStandardApiProviderAdapter extends StandardApiProviderAdapterBase {
   readonly platformName = 'test-standard';
@@ -53,7 +54,7 @@ describe('standardApiProvider helpers', () => {
     });
   });
 
-  it('does not swallow mapper bugs while still returning empty lists for network failures', async () => {
+  it('does not swallow mapper bugs or report network failures as no models', async () => {
     const adapter = new TestStandardApiProviderAdapter();
     adapter.fetchJsonImpl = async () => ({ data: [{ id: 'gpt-5' }] });
 
@@ -68,9 +69,12 @@ describe('standardApiProvider helpers', () => {
       throw new Error('network failed');
     };
 
+    // A failed request must not look like "this account has no models", or
+    // model refresh would clear the previously synced ones on the first
+    // upstream hiccup. See modelListEvidence.ts.
     await expect(adapter.fetchModelsForTest({
       baseUrl: 'https://api.example.com',
-    })).resolves.toEqual([]);
+    })).rejects.toThrow('network failed');
   });
 
   it('rejects invalid payload shapes instead of silently treating them as no models', async () => {
@@ -80,5 +84,24 @@ describe('standardApiProvider helpers', () => {
     await expect(adapter.fetchModelsForTest({
       baseUrl: 'https://api.example.com',
     })).rejects.toThrow('invalid standard models payload');
+  });
+
+  it('rejects an HTTP 200 error envelope instead of treating it as no models', async () => {
+    const adapter = new TestStandardApiProviderAdapter();
+    adapter.fetchJsonImpl = async () => ({ success: false, message: '无权进行此操作' }) as any;
+
+    await expect(adapter.fetchModelsForTest({
+      baseUrl: 'https://api.example.com',
+    })).rejects.toThrow('无权进行此操作');
+  });
+
+  it('marks a well-formed empty list as confirmed emptiness', async () => {
+    const adapter = new TestStandardApiProviderAdapter();
+    adapter.fetchJsonImpl = async () => ({ data: [] });
+
+    const models = await adapter.fetchModelsForTest({ baseUrl: 'https://api.example.com' });
+
+    expect(models).toEqual([]);
+    expect(isConfirmedEmptyModelList(models)).toBe(true);
   });
 });

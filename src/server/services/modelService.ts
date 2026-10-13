@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { db, schema } from '../db/index.js';
 import { getInsertedRowId } from '../db/insertHelpers.js';
 import { getAdapter } from './platforms/index.js';
+import { isConfirmedEmptyModelList } from './platforms/modelListEvidence.js';
 import {
   ACCOUNT_TOKEN_VALUE_STATUS_READY,
   ensureDefaultTokenForAccount,
@@ -44,6 +45,8 @@ import {
   discoverAntigravityModelsFromCloud,
   discoverClaudeModelsFromCloud,
   discoverCodexModelsFromCloud,
+  EmptyModelListError,
+  isEmptyModelListError,
   validateGeminiCliOauthConnection,
 } from './platformDiscoveryRegistry.js';
 import { probeRuntimeModel, type RuntimeModelProbeStatus } from './runtimeModelProbe.js';
@@ -56,6 +59,21 @@ import {
 const API_TOKEN_DISCOVERY_TIMEOUT_MS = 8_000;
 const MODEL_DISCOVERY_TIMEOUT_MS = 12_000;
 const MODEL_REFRESH_BATCH_SIZE = 3;
+// A failed model pull keeps the previously discovered models. Only after this
+// many consecutive failed pulls is the account treated as genuinely broken and
+// its synced model rows cleared.
+const MODEL_REFRESH_FAILURE_CLEAR_THRESHOLD = 3;
+// Failures closer together than this count as ONE failure. Refreshes are not
+// only driven by the hourly scheduler: a proxy request that finds no channel
+// (channelSelection) or an empty /v1/models listing triggers a full refresh on
+// demand, so an outage under traffic can fail many pulls within seconds.
+// Without this, the threshold would mean "three quick retries" instead of
+// "failed over a sustained period". The hourly scheduled pass is unaffected.
+// There is deliberately no upper bound ("streak too old, start over"): the
+// refresh cadence is user-configurable (BALANCE_REFRESH_CRON), and with a
+// daily cron any such bound would stop a permanently broken account from
+// ever reaching the threshold. Only a successful pull ends a streak.
+export const MODEL_REFRESH_FAILURE_COUNT_COOLDOWN_MS = 10 * 60_000;
 
 export type RebuildTokenRoutesOptions = {
   /** Rebuild every enabled pattern group even when exact-route topology is unchanged. */
@@ -75,7 +93,10 @@ let inFlightRefreshModelsAndRebuildRoutes: Promise<{
   rebuild: Awaited<ReturnType<typeof rebuildTokenRoutesFromAvailability>>;
 }> | null = null;
 
-type ModelRefreshErrorCode = 'timeout' | 'unauthorized' | 'empty_models' | 'unknown';
+// `empty_models`: a pull ran and the upstream reported zero models.
+// `no_credential`: no pull ran at all, because the account has no usable
+// credential (API key / access token / ready token) to discover with.
+type ModelRefreshErrorCode = 'timeout' | 'unauthorized' | 'empty_models' | 'no_credential' | 'unknown';
 type ModelRefreshSkipCode = 'site_disabled' | 'adapter_or_status';
 
 export type ModelRefreshAccountNotFoundResult = {
@@ -211,6 +232,7 @@ function buildModelFailureMessage(code: ModelRefreshErrorCode, fallback?: string
   if (code === 'timeout') return '模型获取失败（请求超时）';
   if (code === 'unauthorized') return '模型获取失败，API Key 已无效';
   if (code === 'empty_models') return '模型获取失败：未获取到可用模型';
+  if (code === 'no_credential') return '模型获取失败：账号没有可用的凭证（API Key / 访问令牌 / 令牌），无法拉取模型';
   return fallback || '模型获取失败';
 }
 
@@ -631,6 +653,91 @@ async function runPostRefreshProbeIfEnabled(params: {
   };
 }
 
+// Consecutive failed model pulls per account, in memory by design: a restart
+// simply starts tolerating failures again, which keeps previously discovered
+// models instead of wiping them. A successful pull resets the streak.
+//
+// Process-local: with several server instances sharing one MySQL/Postgres
+// database, each instance only counts the pulls it ran itself, so the
+// effective threshold grows to roughly THRESHOLD x instance count. The shipped
+// deployment runs a single server process, where this is exact.
+type ModelRefreshFailureStreak = {
+  count: number;
+  lastCountedAt: number;
+};
+const consecutiveModelRefreshFailures = new Map<number, ModelRefreshFailureStreak>();
+
+export function __resetModelRefreshFailureTrackerForTests() {
+  consecutiveModelRefreshFailures.clear();
+}
+
+function resetModelRefreshFailureCount(accountId: number): void {
+  consecutiveModelRefreshFailures.delete(accountId);
+}
+
+/**
+ * Drop streaks of accounts that are no longer active (deleted, disabled, or
+ * replaced). Accounts disappear through many paths — single and batch delete,
+ * site-delete cascade, OAuth disconnect, backup restore, factory reset — so the
+ * bulk refresh pass, which already reads the active set, prunes in one place
+ * instead of every deletion site having to remember this module. It matters
+ * beyond memory: a backup restore re-inserts accounts with their original ids,
+ * and a leftover streak would otherwise attach to the restored account.
+ */
+function pruneModelRefreshFailureStreaks(activeAccountIds: Iterable<number>): void {
+  const active = new Set(activeAccountIds);
+  for (const accountId of consecutiveModelRefreshFailures.keys()) {
+    if (!active.has(accountId)) consecutiveModelRefreshFailures.delete(accountId);
+  }
+}
+
+/**
+ * Decide whether a failed pull must drop the previously synced model rows.
+ *
+ * - A definitive empty pull (the upstream responded but reported zero models)
+ *   clears them immediately: the upstream itself says the account has no
+ *   models anymore.
+ * - Any other failed pull keeps them, and only clears once failures repeat
+ *   MODEL_REFRESH_FAILURE_CLEAR_THRESHOLD times in a row, so a single
+ *   transient upstream hiccup never wipes the model list. Failures within
+ *   MODEL_REFRESH_FAILURE_COUNT_COOLDOWN_MS of the last counted one do not
+ *   count again.
+ */
+function shouldClearExistingModelsAfterFailedRefresh(input: {
+  accountId: number;
+  definitiveEmpty: boolean;
+}): boolean {
+  if (input.definitiveEmpty) {
+    resetModelRefreshFailureCount(input.accountId);
+    return true;
+  }
+
+  const now = Date.now();
+  const streak = consecutiveModelRefreshFailures.get(input.accountId);
+
+  // Same outage, retried quickly (usually by an on-demand refresh): keep the
+  // rows and do not advance the streak. A clock that moved backwards yields a
+  // negative delta, which counts normally rather than freezing the streak.
+  if (streak) {
+    const sinceLastCounted = now - streak.lastCountedAt;
+    if (sinceLastCounted >= 0 && sinceLastCounted < MODEL_REFRESH_FAILURE_COUNT_COOLDOWN_MS) {
+      return false;
+    }
+  }
+
+  const nextCount = (streak?.count ?? 0) + 1;
+
+  if (nextCount >= MODEL_REFRESH_FAILURE_CLEAR_THRESHOLD) {
+    resetModelRefreshFailureCount(input.accountId);
+    console.warn(
+      `[model-refresh] account ${input.accountId} failed ${MODEL_REFRESH_FAILURE_CLEAR_THRESHOLD} consecutive model pulls, clearing stale synced models`,
+    );
+    return true;
+  }
+  consecutiveModelRefreshFailures.set(input.accountId, { count: nextCount, lastCountedAt: now });
+  return false;
+}
+
 export async function refreshModelsForAccount(
   accountId: number,
   options?: { allowInactive?: boolean },
@@ -651,32 +758,10 @@ export async function refreshModelsForAccount(
   const accountProxyUrl = resolveProxyUrlFromExtraConfig(account.extraConfig);
   const modelContextScope = buildAccountModelContextLengthScope(account.id);
 
-  const restoreAvailabilityOnFailure = options?.allowInactive === true;
-  const previousModelContextLengths = restoreAvailabilityOnFailure
-    ? new Map(getAllModelContextLengths(modelContextScope))
-    : null;
-  const previousAccountTokens = restoreAvailabilityOnFailure
-    ? await db.select()
-      .from(schema.accountTokens)
-      .where(eq(schema.accountTokens.accountId, accountId))
-      .all()
-    : [];
-  const previousModelAvailability = restoreAvailabilityOnFailure
-    ? await db.select()
-      .from(schema.modelAvailability)
-      .where(and(
-        eq(schema.modelAvailability.accountId, accountId),
-        eq(schema.modelAvailability.isManual, false),
-      ))
-      .all()
-    : [];
-  const previousTokenModelAvailability = restoreAvailabilityOnFailure
-    ? (await Promise.all(previousAccountTokens.map(async (token) => db.select()
-      .from(schema.tokenModelAvailability)
-      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
-      .all()))).flat()
-    : [];
-
+  // Previously discovered (synced) models survive a failed pull: they are only
+  // replaced after a successful pull, and cleared when the pull definitively
+  // reports an empty model list or after repeated consecutive failures (see
+  // shouldClearExistingModelsAfterFailedRefresh).
   const clearExistingAvailability = async () => {
     await db.delete(schema.modelAvailability)
       .where(and(
@@ -696,23 +781,6 @@ export async function refreshModelsForAccount(
         .run();
     }
   };
-
-  const restorePreviousAvailability = async () => {
-    if (!restoreAvailabilityOnFailure) return;
-    await clearExistingAvailability();
-    if (previousModelAvailability.length > 0) {
-      await db.insert(schema.modelAvailability).values(
-        previousModelAvailability.map(({ id: _id, ...row }) => row),
-      ).run();
-    }
-    if (previousTokenModelAvailability.length > 0) {
-      await db.insert(schema.tokenModelAvailability).values(
-        previousTokenModelAvailability.map(({ id: _id, ...row }) => row),
-      ).run();
-    }
-  };
-
-  await clearExistingAvailability();
 
   // Collect manual model names so discovered models that collide are skipped (unique index).
   const manualModelNames = new Set(
@@ -750,10 +818,12 @@ export async function refreshModelsForAccount(
       });
       discoveryAccount = refreshedAccount;
       if (codexModels.length === 0) {
-        throw new Error('未获取到可用模型');
+        throw new EmptyModelListError();
       }
 
       const newCodexModels = codexModels.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
+      resetModelRefreshFailureCount(accountId);
+      await clearExistingAvailability();
       if (newCodexModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newCodexModels.map((modelName) => ({
@@ -809,7 +879,15 @@ export async function refreshModelsForAccount(
         source: 'model-discovery',
         checkedAt,
       });
-      await restorePreviousAvailability();
+      // A failed pull keeps the previously synced models; only a definitive
+      // empty result or repeated failures clear them.
+      if (shouldClearExistingModelsAfterFailedRefresh({
+        accountId,
+        definitiveEmpty: isEmptyModelListError(err),
+      })) {
+        await clearExistingAvailability();
+        clearModelContextLengthCache(modelContextScope);
+      }
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -837,9 +915,11 @@ export async function refreshModelsForAccount(
       });
       discoveryAccount = refreshedAccount;
       if (claudeModels.length === 0) {
-        throw new Error('未获取到可用模型');
+        throw new EmptyModelListError();
       }
       const newClaudeModels = claudeModels.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
+      resetModelRefreshFailureCount(accountId);
+      await clearExistingAvailability();
       if (newClaudeModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newClaudeModels.map((modelName) => ({
@@ -895,7 +975,15 @@ export async function refreshModelsForAccount(
         source: 'model-discovery',
         checkedAt,
       });
-      await restorePreviousAvailability();
+      // A failed pull keeps the previously synced models; only a definitive
+      // empty result or repeated failures clear them.
+      if (shouldClearExistingModelsAfterFailedRefresh({
+        accountId,
+        definitiveEmpty: isEmptyModelListError(err),
+      })) {
+        await clearExistingAvailability();
+        clearModelContextLengthCache(modelContextScope);
+      }
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -940,6 +1028,8 @@ export async function refreshModelsForAccount(
         );
       }
       const newGeminiModels = GEMINI_CLI_STATIC_MODELS.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
+      resetModelRefreshFailureCount(accountId);
+      await clearExistingAvailability();
       if (newGeminiModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newGeminiModels.map((modelName) => ({
@@ -994,7 +1084,15 @@ export async function refreshModelsForAccount(
         source: 'model-discovery',
         checkedAt,
       });
-      await restorePreviousAvailability();
+      // A failed validation keeps the previously synced models; only repeated
+      // failures clear them (gemini-cli models are static, never "empty").
+      if (shouldClearExistingModelsAfterFailedRefresh({
+        accountId,
+        definitiveEmpty: false,
+      })) {
+        await clearExistingAvailability();
+        clearModelContextLengthCache(modelContextScope);
+      }
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -1022,10 +1120,12 @@ export async function refreshModelsForAccount(
       });
       discoveryAccount = refreshedAccount;
       if (antigravityModels.length === 0) {
-        throw new Error('未获取到可用模型');
+        throw new EmptyModelListError();
       }
 
       const newAntigravityModels = antigravityModels.filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
+      resetModelRefreshFailureCount(accountId);
+      await clearExistingAvailability();
       if (newAntigravityModels.length > 0) {
         await db.insert(schema.modelAvailability).values(
           newAntigravityModels.map((modelName) => ({
@@ -1081,7 +1181,15 @@ export async function refreshModelsForAccount(
         source: 'model-discovery',
         checkedAt,
       });
-      await restorePreviousAvailability();
+      // A failed pull keeps the previously synced models; only a definitive
+      // empty result or repeated failures clear them.
+      if (shouldClearExistingModelsAfterFailedRefresh({
+        accountId,
+        definitiveEmpty: isEmptyModelListError(err),
+      })) {
+        await clearExistingAvailability();
+        clearModelContextLengthCache(modelContextScope);
+      }
       return buildFailedRefreshResult({
         accountId,
         errorCode,
@@ -1158,10 +1266,32 @@ export async function refreshModelsForAccount(
   let scannedTokenCount = 0;
   let discoveredByCredential = false;
   const attemptedCredentials = new Set<string>();
+  // Per-token rows discovered in this pass. They are written together with the
+  // account rows once the pull has succeeded, so a failed pull leaves the
+  // previously discovered rows untouched.
+  const pendingTokenModelAvailability: Array<{
+    tokenId: number;
+    modelName: string;
+    available: boolean;
+    latencyMs: number;
+    checkedAt: string;
+  }> = [];
   const failureMessages: string[] = [];
   const recordFailure = (err: unknown) => {
     const message = (err as { message?: string })?.message || String(err || '');
     if (message) failureMessages.push(message);
+  };
+
+  // Emptiness evidence per pull (see modelListEvidence.ts): "confirmed" means
+  // the adapter saw a well-formed, explicitly empty model list; "unconfirmed"
+  // means it returned a bare [] it could not vouch for. Only all-confirmed
+  // emptiness may clear the previously synced models.
+  let confirmedEmptyPulls = 0;
+  let unconfirmedEmptyPulls = 0;
+  const recordEmptyPullEvidence = (discovered: string[]) => {
+    if (discovered.length > 0) return;
+    if (isConfirmedEmptyModelList(discovered)) confirmedEmptyPulls++;
+    else unconfirmedEmptyPulls++;
   };
 
   const mergeDiscoveredModels = (models: string[], latencyMs: number | null) => {
@@ -1237,7 +1367,9 @@ export async function refreshModelsForAccount(
     const credentialContextScope = beginModelContextScanScope();
     let models: string[] = [];
     try {
-      models = normalizeModels(await discoverModelsFromPool(credential, credentialContextScope));
+      const discovered = await discoverModelsFromPool(credential, credentialContextScope);
+      recordEmptyPullEvidence(discovered);
+      models = normalizeModels(discovered);
     } catch (err) {
       recordFailure(err);
       models = [];
@@ -1261,7 +1393,9 @@ export async function refreshModelsForAccount(
     let models: string[] = [];
 
     try {
-      models = normalizeModels(await discoverModelsFromPool(token.token, tokenContextScope));
+      const discovered = await discoverModelsFromPool(token.token, tokenContextScope);
+      recordEmptyPullEvidence(discovered);
+      models = normalizeModels(discovered);
     } catch (err) {
       recordFailure(err);
       models = [];
@@ -1274,32 +1408,42 @@ export async function refreshModelsForAccount(
     const latencyMs = Date.now() - startedAt;
     const checkedAt = new Date().toISOString();
 
-    await db.insert(schema.tokenModelAvailability).values(
-      models.map((modelName) => ({
-        tokenId: token.id,
-        modelName,
-        available: true,
-        latencyMs,
-        checkedAt,
-      })),
-    ).run();
+    for (const modelName of models) {
+      pendingTokenModelAvailability.push({ tokenId: token.id, modelName, available: true, latencyMs, checkedAt });
+    }
 
     scannedTokenCount++;
     mergeDiscoveredModels(models, latencyMs);
   }
 
   if (accountModels.size === 0) {
-    // A failed refresh must not leave context lengths from a previous scan in
-    // the account scope. The model list is rebuilt from scratch above, so any
-    // metadata from a no-longer-available model would otherwise be advertised
-    // on the next /v1/models response.
-    if (previousModelContextLengths) {
-      setModelContextLengths(previousModelContextLengths, modelContextScope);
-    } else {
+    // A single failed pull keeps the previously discovered models. Clear them
+    // only when the upstream definitively returned an empty list, or when the
+    // pull has failed MODEL_REFRESH_FAILURE_CLEAR_THRESHOLD times in a row.
+    //
+    // "Definitively empty" requires positive evidence from the adapter (see
+    // modelListEvidence.ts): EVERY attempted credential must have come back
+    // with a confirmed empty model list. An adapter that returns a bare [] —
+    // because a request failed, or because an HTTP 200 carried an error
+    // envelope it could not read — is not evidence, and the pull is counted as
+    // a failure instead.
+    const pullAttempted = attemptedCredentials.size > 0 || enabledTokens.length > 0;
+    const definitiveEmpty = confirmedEmptyPulls > 0
+      && unconfirmedEmptyPulls === 0
+      && failureMessages.length === 0;
+    if (shouldClearExistingModelsAfterFailedRefresh({ accountId, definitiveEmpty })) {
+      await clearExistingAvailability();
+      // Drop context-length metadata together with the model rows it described,
+      // so a later /v1/models response cannot advertise stale metadata.
       setModelContextLengths(new Map(), modelContextScope);
     }
+    // The error code reports WHAT happened; the clear decision above is made
+    // separately from pullAttempted/definitiveEmpty. Without a credential no
+    // pull ran, so "the upstream reported zero models" would be a false claim.
     const firstMessage = failureMessages[0] || '';
-    const errorCode = firstMessage ? classifyModelDiscoveryError(firstMessage) : 'empty_models';
+    const errorCode: ModelRefreshErrorCode = !pullAttempted
+      ? 'no_credential'
+      : (firstMessage ? classifyModelDiscoveryError(firstMessage) : 'empty_models');
     const errorMessage = buildModelFailureMessage(errorCode, firstMessage, site.platform);
     await setAccountRuntimeHealth(account.id, {
       state: 'unhealthy',
@@ -1307,7 +1451,6 @@ export async function refreshModelsForAccount(
       source: 'model-discovery',
       checkedAt: new Date().toISOString(),
     });
-    await restorePreviousAvailability();
     return buildFailedRefreshResult({
       accountId,
       errorCode,
@@ -1319,6 +1462,11 @@ export async function refreshModelsForAccount(
   }
 
   const checkedAt = new Date().toISOString();
+  resetModelRefreshFailureCount(accountId);
+  await clearExistingAvailability();
+  if (pendingTokenModelAvailability.length > 0) {
+    await db.insert(schema.tokenModelAvailability).values(pendingTokenModelAvailability).run();
+  }
   const newAccountModels = Array.from(accountModels.values()).filter((m) => !manualModelNames.has(normalizeFullSourceModelName(m)));
   if (newAccountModels.length > 0) {
     await db.insert(schema.modelAvailability).values(
@@ -1365,6 +1513,8 @@ async function refreshModelsForAllActiveAccounts(): Promise<ModelRefreshResult[]
   const accounts = await db.select({ id: schema.accounts.id }).from(schema.accounts)
     .where(eq(schema.accounts.status, 'active'))
     .all();
+
+  pruneModelRefreshFailureStreaks(accounts.map((account) => account.id));
 
   const results: ModelRefreshResult[] = [];
   for (let offset = 0; offset < accounts.length; offset += MODEL_REFRESH_BATCH_SIZE) {

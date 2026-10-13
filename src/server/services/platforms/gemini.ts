@@ -1,5 +1,11 @@
 import { StandardApiProviderAdapterBase, normalizePlatformBaseUrl } from './standardApiProvider.js';
 import type { GetModelsOptions } from './base.js';
+import {
+  confirmedEmptyModelList,
+  isConfirmedEmptyModelList,
+  looksLikeErrorEnvelope,
+  unreadableModelListError,
+} from './modelListEvidence.js';
 
 function stripModelPrefix(name: string): string {
   const trimmed = name.trim();
@@ -58,34 +64,60 @@ export class GeminiAdapter extends StandardApiProviderAdapterBase {
   ): Promise<string[]> {
     const contextSourceScope = options?.contextSourceScope;
     const normalizedBase = normalizePlatformBaseUrl(baseUrl);
+    // Several endpoint flavours are tried in turn. One of them answering with a
+    // well-formed empty list is the upstream's own answer, so it is kept as
+    // evidence; if none of them answered at all, the failure is rethrown rather
+    // than reported as "no models". See modelListEvidence.ts.
+    let sawConfirmedEmpty = false;
+    let firstFailure: unknown = null;
 
     if (isOpenAiCompatGeminiBase(normalizedBase)) {
-      const openAiModels = await this.fetchModelsFromStandardEndpoint({
-        baseUrl: normalizedBase,
-        headers: { Authorization: `Bearer ${apiToken}` },
-        resolveUrl: resolveGeminiOpenAiModelsUrl,
-        contextSourceScope,
-      });
-      if (openAiModels.length > 0) return normalizeModelList(openAiModels);
+      try {
+        const openAiModels = await this.fetchModelsFromStandardEndpoint({
+          baseUrl: normalizedBase,
+          headers: { Authorization: `Bearer ${apiToken}` },
+          resolveUrl: resolveGeminiOpenAiModelsUrl,
+          contextSourceScope,
+        });
+        if (openAiModels.length > 0) return normalizeModelList(openAiModels);
+        sawConfirmedEmpty ||= isConfirmedEmptyModelList(openAiModels);
+      } catch (error) {
+        firstFailure ??= error;
+      }
     }
 
     try {
       const res = await this.fetchJson<any>(resolveGeminiNativeModelsUrl(normalizedBase, apiToken));
-      const nativeModels = (res?.models || [])
-        .map((m: any) => String(m?.name || '').trim())
-        .filter(Boolean);
-      if (nativeModels.length > 0) return normalizeModelList(nativeModels);
-    } catch {}
-
-    if (!isOpenAiCompatGeminiBase(normalizedBase)) {
-      const openAiModels = await this.fetchModelsFromStandardEndpoint({
-        baseUrl: `${normalizedBase}/v1beta/openai`,
-        headers: { Authorization: `Bearer ${apiToken}` },
-        contextSourceScope,
-      });
-      if (openAiModels.length > 0) return normalizeModelList(openAiModels);
+      if (looksLikeErrorEnvelope(res)) {
+        firstFailure ??= unreadableModelListError('gemini native models endpoint', res);
+      } else if (Array.isArray(res?.models)) {
+        const nativeModels = res.models
+          .map((m: any) => String(m?.name || '').trim())
+          .filter(Boolean);
+        if (nativeModels.length > 0) return normalizeModelList(nativeModels);
+        sawConfirmedEmpty = true;
+      } else {
+        firstFailure ??= unreadableModelListError('gemini native models endpoint', res);
+      }
+    } catch (error) {
+      firstFailure ??= error;
     }
 
-    return [];
+    if (!isOpenAiCompatGeminiBase(normalizedBase)) {
+      try {
+        const openAiModels = await this.fetchModelsFromStandardEndpoint({
+          baseUrl: `${normalizedBase}/v1beta/openai`,
+          headers: { Authorization: `Bearer ${apiToken}` },
+          contextSourceScope,
+        });
+        if (openAiModels.length > 0) return normalizeModelList(openAiModels);
+        sawConfirmedEmpty ||= isConfirmedEmptyModelList(openAiModels);
+      } catch (error) {
+        firstFailure ??= error;
+      }
+    }
+
+    if (!sawConfirmedEmpty && firstFailure) throw firstFailure;
+    return confirmedEmptyModelList();
   }
 }

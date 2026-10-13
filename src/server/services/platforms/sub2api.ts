@@ -16,6 +16,12 @@ import {
   extractContextLengthsFromPayload,
   setModelContextLengths,
 } from '../modelContextLengthCache.js';
+import {
+  confirmedEmptyModelList,
+  isConfirmedEmptyModelList,
+  looksLikeErrorEnvelope,
+  unreadableModelListError,
+} from './modelListEvidence.js';
 
 function normalizeBaseUrl(baseUrl: string): string {
   return stripTrailingSlashes(baseUrl || '');
@@ -432,14 +438,21 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     return [];
   }
 
-  private extractModelIds(payload: any): string[] {
+  /**
+   * Parse a model list in any of the shapes this platform serves. Returns null
+   * when the payload is not a model list at all, so callers can treat it as a
+   * failure instead of an empty account. See modelListEvidence.ts.
+   */
+  private extractModelIds(payload: any): string[] | null {
+    if (looksLikeErrorEnvelope(payload)) return null;
     const source = payload?.data ?? payload;
     const rawModels = (() => {
       if (Array.isArray(source)) return source;
       if (Array.isArray(source?.items)) return source.items;
       if (Array.isArray(source?.models)) return source.models;
-      return [];
+      return null;
     })();
+    if (rawModels === null) return null;
 
     const models = rawModels
       .map((item: any) => (typeof item === 'string' ? item : item?.id ?? item?.name))
@@ -525,21 +538,37 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     const authToken = this.normalizeTokenKeyForCompare(token);
     if (!authToken) return [];
 
+    // Candidate endpoints are probed in turn and most of them legitimately 404.
+    // An empty result counts as the upstream's answer only when one of them
+    // actually returned a model list; otherwise the failure is rethrown so
+    // model refresh does not read it as an empty account. See
+    // modelListEvidence.ts.
+    let sawConfirmedEmpty = false;
+    let firstFailure: unknown = null;
+
     for (const url of this.resolveModelEndpoints(baseUrl)) {
       try {
         const res = await this.fetchJson<any>(url, {
           headers: { Authorization: `Bearer ${authToken}` },
         });
+        const models = this.extractModelIds(res);
+        if (models === null) {
+          firstFailure ??= unreadableModelListError(url, res);
+          continue;
+        }
         setModelContextLengths(
           extractContextLengthsFromPayload(res),
           contextSourceScope || buildEndpointModelContextLengthScope(baseUrl),
         );
-        const models = this.extractModelIds(res);
         if (models.length > 0) return models;
-      } catch {}
+        sawConfirmedEmpty = true;
+      } catch (error) {
+        firstFailure ??= error;
+      }
     }
 
-    return [];
+    if (!sawConfirmedEmpty && firstFailure) throw firstFailure;
+    return sawConfirmedEmpty ? confirmedEmptyModelList() : [];
   }
 
   private resolveExpiresInDays(expiredTime?: number): number | undefined {
@@ -747,16 +776,36 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     const contextSourceScope = options?.contextSourceScope;
     const normalizedBase = normalizeBaseUrl(baseUrl);
     const managementBase = this.resolveManagementBaseUrl(normalizedBase);
-    const directModels = await this.fetchModelsByToken(normalizedBase, apiToken, contextSourceScope);
-    if (directModels.length > 0) return directModels;
-
-    // Session JWT cannot access /v1/models directly; discover a user key first.
-    const discoveredApiToken = await this.getApiToken(managementBase, apiToken);
-    if (!discoveredApiToken) return [];
-    if (this.normalizeTokenKeyForCompare(discoveredApiToken) === this.normalizeTokenKeyForCompare(apiToken)) {
-      return [];
+    // A session JWT cannot read /v1/models, so a failure here is expected and
+    // the user key is discovered instead; the direct attempt's own answer is
+    // only kept when it actually answered.
+    let directEmptyList: string[] | null = null;
+    try {
+      const directModels = await this.fetchModelsByToken(normalizedBase, apiToken, contextSourceScope);
+      if (directModels.length > 0) return directModels;
+      directEmptyList = directModels;
+    } catch (error) {
+      const discovered = await this.getApiToken(managementBase, apiToken).catch(() => null);
+      if (!discovered
+        || this.normalizeTokenKeyForCompare(discovered) === this.normalizeTokenKeyForCompare(apiToken)) {
+        throw error;
+      }
+      return this.fetchModelsByToken(normalizedBase, discovered, contextSourceScope);
     }
-    return this.fetchModelsByToken(normalizedBase, discoveredApiToken, contextSourceScope);
+
+    const discoveredApiToken = await this.getApiToken(managementBase, apiToken);
+    if (!discoveredApiToken) return directEmptyList;
+    if (this.normalizeTokenKeyForCompare(discoveredApiToken) === this.normalizeTokenKeyForCompare(apiToken)) {
+      return directEmptyList;
+    }
+    try {
+      return await this.fetchModelsByToken(normalizedBase, discoveredApiToken, contextSourceScope);
+    } catch (error) {
+      // The direct attempt already answered "no models"; a failing discovered
+      // key does not turn that into a failed pull.
+      if (isConfirmedEmptyModelList(directEmptyList)) return directEmptyList;
+      throw error;
+    }
   }
 
   override async getSiteAnnouncements(baseUrl: string, accessToken: string): Promise<SiteAnnouncement[]> {

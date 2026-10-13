@@ -1,5 +1,11 @@
 import { OneApiAdapter } from './oneApi.js';
 import type { GetModelsOptions } from './base.js';
+import {
+  confirmedEmptyModelList,
+  isConfirmedEmptyModelList,
+  looksLikeErrorEnvelope,
+  unreadableModelListError,
+} from './modelListEvidence.js';
 
 export class OneHubAdapter extends OneApiAdapter {
   readonly platformName: string = 'one-hub';
@@ -21,24 +27,45 @@ export class OneHubAdapter extends OneApiAdapter {
     options?: GetModelsOptions,
   ): Promise<string[]> {
     const contextSourceScope = options?.contextSourceScope;
-    let openAiModels: string[] = [];
-    try {
-      openAiModels = await super.getModels(baseUrl, apiToken, platformUserId, options);
-    } catch {}
-    if (openAiModels.length > 0) return openAiModels;
+    // Either endpoint answering with a well-formed empty list is the upstream's
+    // own answer and is kept as evidence; if neither answered, the failure is
+    // rethrown instead of being reported as "no models". See
+    // modelListEvidence.ts.
+    let sawConfirmedEmpty = false;
+    let firstFailure: unknown = null;
 
     try {
-      const res = await this.fetchJson<any>(`${baseUrl}/api/available_model`, {
+      const openAiModels = await super.getModels(baseUrl, apiToken, platformUserId, options);
+      if (openAiModels.length > 0) return openAiModels;
+      sawConfirmedEmpty ||= isConfirmedEmptyModelList(openAiModels);
+    } catch (error) {
+      firstFailure ??= error;
+    }
+
+    const availableModelUrl = `${baseUrl}/api/available_model`;
+    try {
+      const res = await this.fetchJson<any>(availableModelUrl, {
         headers: { Authorization: `Bearer ${apiToken}` },
       });
-      const payload = res?.data && typeof res.data === 'object' ? res.data : res;
+      // An error envelope has no `data`, and using the envelope itself as the
+      // model map would turn its own keys ("success", "message") into model
+      // names.
+      const payload = looksLikeErrorEnvelope(res)
+        ? null
+        : (res?.data && typeof res.data === 'object' ? res.data : res);
       if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
         const models = Object.keys(payload).filter(Boolean);
         if (models.length > 0) return models;
+        sawConfirmedEmpty = true;
+      } else {
+        firstFailure ??= unreadableModelListError(availableModelUrl, res);
       }
-    } catch {}
+    } catch (error) {
+      firstFailure ??= error;
+    }
 
-    return [];
+    if (!sawConfirmedEmpty && firstFailure) throw firstFailure;
+    return confirmedEmptyModelList();
   }
 
   /**

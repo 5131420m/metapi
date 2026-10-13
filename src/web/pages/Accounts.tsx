@@ -580,6 +580,7 @@ export default function Accounts() {
     if (code === "timeout") return "模型获取失败（请求超时）";
     if (code === "unauthorized") return "模型获取失败，API Key 已无效";
     if (code === "empty_models") return "模型获取失败：未获取到可用模型";
+    if (code === "no_credential") return "模型获取失败：账号没有可用的凭证（API Key / 访问令牌 / 令牌），无法拉取模型";
     return messageFallback || refresh?.errorMessage || "模型获取失败";
   };
 

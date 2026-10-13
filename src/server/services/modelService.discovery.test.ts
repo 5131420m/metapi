@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,7 @@ import {
   setModelContextLengths,
   getModelContextLength,
 } from './modelContextLengthCache.js';
+import { confirmedEmptyModelList } from './platforms/modelListEvidence.js';
 
 const getApiTokenMock = vi.fn();
 const getModelsMock = vi.fn();
@@ -54,6 +55,7 @@ describe('refreshModelsForAccount credential discovery', () => {
   let refreshModelsAndRebuildRoutes: ModelServiceModule['refreshModelsAndRebuildRoutes'];
   let rebuildTokenRoutesFromAvailability: ModelServiceModule['rebuildTokenRoutesFromAvailability'];
   let dataDir = '';
+  let resetModelRefreshFailureTracker: (() => void) | null = null;
 
   beforeAll(async () => {
     dataDir = mkdtempSync(join(tmpdir(), 'metapi-model-discovery-'));
@@ -68,6 +70,7 @@ describe('refreshModelsForAccount credential discovery', () => {
     refreshModelsForAccount = modelService.refreshModelsForAccount;
     refreshModelsAndRebuildRoutes = modelService.refreshModelsAndRebuildRoutes;
     rebuildTokenRoutesFromAvailability = modelService.rebuildTokenRoutesFromAvailability;
+    resetModelRefreshFailureTracker = modelService.__resetModelRefreshFailureTrackerForTests;
   });
 
   beforeEach(async () => {
@@ -77,6 +80,7 @@ describe('refreshModelsForAccount credential discovery', () => {
     proxyAgentCtorMock.mockReset();
     refreshOauthAccessTokenSingleflightMock.mockReset();
     clearModelContextLengthCache();
+    resetModelRefreshFailureTracker?.();
 
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
@@ -96,6 +100,27 @@ describe('refreshModelsForAccount credential discovery', () => {
   afterAll(() => {
     delete process.env.DATA_DIR;
   });
+
+  // Only the Date.now spy is restored here: the module-level vi.fn() mocks are
+  // reset in beforeEach and must keep their hoisted implementations.
+  let restoreClock: (() => void) | null = null;
+  afterEach(() => {
+    restoreClock?.();
+    restoreClock = null;
+  });
+
+  // Failure streaks ignore failures within the count cooldown, so tests that
+  // need several COUNTED failures drive Date.now() forward explicitly.
+  const useControllableClock = (startMs = Date.UTC(2026, 3, 2, 10, 0, 0)) => {
+    let nowMs = startMs;
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
+    restoreClock = () => spy.mockRestore();
+    return {
+      advance(ms: number) {
+        nowMs += ms;
+      },
+    };
+  };
 
   it('discovers models from account session credential without account_tokens', async () => {
     getApiTokenMock.mockResolvedValue(null);
@@ -566,7 +591,7 @@ describe('refreshModelsForAccount credential discovery', () => {
 
   it('clears stale context lengths when a refresh discovers no models', async () => {
     getApiTokenMock.mockResolvedValue(null);
-    getModelsMock.mockResolvedValue([]);
+    getModelsMock.mockImplementation(async () => confirmedEmptyModelList());
 
     const site = await db.insert(schema.sites).values({
       name: 'site-context-fail',
@@ -862,6 +887,436 @@ describe('refreshModelsForAccount credential discovery', () => {
       available: true,
     });
     expect(getModelContextLength('gpt-4.1', contextScope)).toBe(128000);
+  });
+
+  it('keeps previously synced models when a single refresh fails', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('HTTP 502: upstream unavailable'));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-transient-fail',
+      url: 'https://site-transient-fail.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'transient-fail-user',
+      accessToken: 'session-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'default',
+      token: 'sk-stored-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values([
+      {
+        accountId: account.id,
+        modelName: 'gpt-4.1',
+        available: true,
+        latencyMs: 120,
+        checkedAt: '2026-04-02T10:00:00.000Z',
+      },
+      {
+        accountId: account.id,
+        modelName: 'my-custom-model',
+        available: true,
+        isManual: true,
+      },
+    ]).run();
+
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 90,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      accountId: account.id,
+      refreshed: true,
+      status: 'failed',
+      modelCount: 0,
+    });
+
+    const modelRows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(modelRows.map((row) => `${row.modelName}:${row.isManual}`).sort()).toEqual([
+      'gpt-4.1:false',
+      'my-custom-model:true',
+    ]);
+
+    const tokenRows = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(tokenRows.map((row) => row.modelName)).toEqual(['gpt-4.1']);
+  });
+
+  it('clears previously synced models only after repeated refresh failures', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('HTTP 502: upstream unavailable'));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-repeated-fail',
+      url: 'https://site-repeated-fail.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'repeated-fail-user',
+      accessToken: '',
+      apiToken: 'sk-flaky',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values([
+      {
+        accountId: account.id,
+        modelName: 'gpt-4.1',
+        available: true,
+        latencyMs: 120,
+        checkedAt: '2026-04-02T10:00:00.000Z',
+      },
+      {
+        accountId: account.id,
+        modelName: 'my-custom-model',
+        available: true,
+        isManual: true,
+      },
+    ]).run();
+
+    const readModelNames = async () => (await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all()).map((row) => `${row.modelName}:${row.isManual}`).sort();
+
+    // Space the pulls like the hourly scheduler does, so each one counts.
+    const clock = useControllableClock();
+    const ONE_HOUR_MS = 60 * 60_000;
+
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    expect(await readModelNames()).toEqual(['gpt-4.1:false', 'my-custom-model:true']);
+
+    clock.advance(ONE_HOUR_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    expect(await readModelNames()).toEqual(['gpt-4.1:false', 'my-custom-model:true']);
+
+    // The third consecutive failure clears the synced rows; manual rows survive.
+    clock.advance(ONE_HOUR_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    expect(await readModelNames()).toEqual(['my-custom-model:true']);
+  });
+
+  it('counts a burst of quick refresh failures as one failure', async () => {
+    // On-demand refreshes (a proxy request that finds no channel, an empty
+    // /v1/models listing) can retry one outage many times within seconds.
+    // They must not burn the whole failure budget at once.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('HTTP 502: upstream unavailable'));
+    const { MODEL_REFRESH_FAILURE_COUNT_COOLDOWN_MS } = await import('./modelService.js');
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-burst-fail',
+      url: 'https://site-burst-fail.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'burst-fail-user',
+      accessToken: '',
+      apiToken: 'sk-burst',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    const readModelNames = async () => (await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all()).map((row) => row.modelName);
+
+    const clock = useControllableClock();
+
+    // Five failures a few seconds apart: one counted failure, rows kept.
+    for (let i = 0; i < 5; i += 1) {
+      expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+      clock.advance(5_000);
+    }
+    expect(await readModelNames()).toEqual(['gpt-4.1']);
+
+    // Past the cooldown each failure counts again: 2nd counted keeps...
+    clock.advance(MODEL_REFRESH_FAILURE_COUNT_COOLDOWN_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    expect(await readModelNames()).toEqual(['gpt-4.1']);
+
+    // ...and the 3rd counted failure clears.
+    clock.advance(MODEL_REFRESH_FAILURE_COUNT_COOLDOWN_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    expect(await readModelNames()).toEqual([]);
+  });
+
+  it('drops the failure streaks of accounts that are no longer active', async () => {
+    // A backup restore re-inserts accounts with their original ids, so a
+    // streak left over from a deleted account would otherwise attach to the
+    // restored one and clear its models one failure early.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('HTTP 502: upstream unavailable'));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-prune',
+      url: 'https://site-prune.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const accountValues = {
+      siteId: site.id,
+      username: 'prune-user',
+      accessToken: '',
+      apiToken: 'sk-prune',
+      status: 'active' as const,
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    };
+    const account = await db.insert(schema.accounts).values(accountValues).returning().get();
+
+    const clock = useControllableClock();
+    const ONE_HOUR_MS = 60 * 60_000;
+
+    // Two counted failures: the streak is one away from clearing.
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    clock.advance(ONE_HOUR_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+
+    // The account is deleted; the next bulk pass prunes its streak.
+    await db.delete(schema.accounts).where(eq(schema.accounts.id, account.id)).run();
+    await refreshModelsAndRebuildRoutes();
+
+    // Restored under the same id (as a backup import does) with fresh models.
+    await db.insert(schema.accounts).values({ ...accountValues, id: account.id }).run();
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    // Its first failure after the restore starts a new streak and keeps rows.
+    clock.advance(ONE_HOUR_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => row.modelName)).toEqual(['gpt-4.1']);
+  });
+
+  it('resets the consecutive failure counter after a successful refresh', async () => {
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock
+      .mockRejectedValueOnce(new Error('HTTP 502: upstream unavailable'))
+      .mockRejectedValueOnce(new Error('HTTP 502: upstream unavailable'))
+      .mockResolvedValueOnce(['model-a'])
+      .mockRejectedValueOnce(new Error('HTTP 502: upstream unavailable'));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-counter-reset',
+      url: 'https://site-counter-reset.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'counter-reset-user',
+      accessToken: '',
+      apiToken: 'sk-recovering',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    // Spaced pulls, so that without the reset the fourth pull would be the
+    // third counted failure and clear the rows.
+    const clock = useControllableClock();
+    const ONE_HOUR_MS = 60 * 60_000;
+
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+    clock.advance(ONE_HOUR_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+
+    clock.advance(ONE_HOUR_MS);
+    const success = await refreshModelsForAccount(account.id);
+    expect(success.status).toBe('success');
+
+    // The counter was reset by the success, so this single new failure keeps
+    // the freshly discovered models.
+    clock.advance(ONE_HOUR_MS);
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+
+    const modelRows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(modelRows.map((row) => row.modelName)).toEqual(['model-a']);
+  });
+
+  it('keeps synced models when an adapter returns an empty list it cannot vouch for', async () => {
+    // A bare [] is what adapters used to return for a failed request or an
+    // HTTP 200 they could not read. Without the upstream's own "zero models"
+    // answer it must not clear anything. See modelListEvidence.ts.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockResolvedValue([]);
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-unconfirmed-empty',
+      url: 'https://site-unconfirmed-empty.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'unconfirmed-empty-user',
+      accessToken: '',
+      apiToken: 'sk-unconfirmed',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => row.modelName)).toEqual(['gpt-4.1']);
+  });
+
+  it('keeps synced models when only some credentials confirm an empty list', async () => {
+    // One credential confirming "no models" says nothing about another whose
+    // pull could not be read, so the account is not definitively empty.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockImplementation(async (_baseUrl: string, token: string) => (
+      token === 'sk-confirmed' ? confirmedEmptyModelList() : []
+    ));
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-mixed-empty',
+      url: 'https://site-mixed-empty.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    // Both credentials are pulled: the apiToken confirms "no models", the
+    // accessToken comes back with a [] the adapter could not vouch for.
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'mixed-empty-user',
+      accessToken: 'sk-unreadable',
+      apiToken: 'sk-confirmed',
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'apikey' }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    expect((await refreshModelsForAccount(account.id)).status).toBe('failed');
+
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => row.modelName)).toEqual(['gpt-4.1']);
+  });
+
+  it('reports no_credential instead of empty_models when no pull could run', async () => {
+    // With no usable credential nothing was asked upstream, so claiming that
+    // "the upstream returned no models" would send users to debug the site
+    // instead of the account. It is also not a definitive empty result, so
+    // the synced rows are kept.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockResolvedValue(['should-not-be-called']);
+
+    const site = await db.insert(schema.sites).values({
+      name: 'site-no-credential',
+      url: 'https://site-no-credential.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'no-credential-user',
+      accessToken: '',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values({
+      accountId: account.id,
+      modelName: 'gpt-4.1',
+      available: true,
+      latencyMs: 120,
+      checkedAt: '2026-04-02T10:00:00.000Z',
+    }).run();
+
+    const result = await refreshModelsForAccount(account.id);
+
+    expect(result).toMatchObject({
+      status: 'failed',
+      errorCode: 'no_credential',
+      errorMessage: '模型获取失败：账号没有可用的凭证（API Key / 访问令牌 / 令牌），无法拉取模型',
+      tokenScanned: 0,
+    });
+    expect(getModelsMock).not.toHaveBeenCalled();
+
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => row.modelName)).toEqual(['gpt-4.1']);
   });
 
   it('does not scan masked_pending placeholders as token credentials', async () => {
@@ -1624,7 +2079,8 @@ describe('refreshModelsForAccount credential discovery', () => {
     const rows = await db.select().from(schema.modelAvailability)
       .where(eq(schema.modelAvailability.accountId, account.id))
       .all();
-    expect(rows).toEqual([]);
+    // A single failed cloud discovery keeps the previously synced models.
+    expect(rows.map((row) => row.modelName)).toEqual(['gpt-5.2-codex']);
 
     const latest = await db.select().from(schema.accounts)
       .where(eq(schema.accounts.id, account.id))
@@ -2153,6 +2609,137 @@ describe('refreshModelsForAccount credential discovery', () => {
     ]);
   });
 
+  it('keeps synced models when an antigravity upstream fails with an empty body that reads like an empty model list', async () => {
+    // Regression: the upstream failure message used to be matched with
+    // `includes('未获取到可用模型')`, and the HTTP-error branch used that very
+    // phrase as its empty-body fallback. A gateway replying 503 with no body
+    // therefore looked "definitively empty" and wiped the rows on the FIRST
+    // failure, defeating the keep-on-failure policy.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('antigravity oauth discovery should not call adapter.getModels'));
+    undiciFetchMock.mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: async () => ({}),
+      // Empty body: forces the fallback text that used to collide.
+      text: async () => '',
+    });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'antigravity-site-503-empty-body',
+      url: 'https://cloudcode-pa.googleapis.com',
+      platform: 'antigravity',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'antigravity-transient@example.com',
+      accessToken: 'antigravity-access-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'antigravity',
+          email: 'antigravity-transient@example.com',
+          projectId: 'project-demo',
+        },
+      }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values([
+      {
+        accountId: account.id,
+        modelName: 'gemini-3-pro-preview',
+        available: true,
+        latencyMs: 120,
+        checkedAt: '2026-04-02T10:00:00.000Z',
+      },
+      {
+        accountId: account.id,
+        modelName: 'my-custom-model',
+        available: true,
+        isManual: true,
+      },
+    ]).run();
+
+    const result = await refreshModelsForAccount(account.id);
+    expect(result.status).toBe('failed');
+
+    // The transient 503 must leave BOTH the synced row and the manual row.
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => `${row.modelName}:${row.isManual}`).sort()).toEqual([
+      'gemini-3-pro-preview:false',
+      'my-custom-model:true',
+    ]);
+  });
+
+  it('clears synced models at once when antigravity answers 200 with zero models', async () => {
+    // The complement of the regression above: a genuine empty list is still
+    // definitive and clears immediately, without waiting for the retry budget.
+    getApiTokenMock.mockResolvedValue(null);
+    getModelsMock.mockRejectedValue(new Error('antigravity oauth discovery should not call adapter.getModels'));
+    undiciFetchMock.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ models: {} }),
+      text: async () => JSON.stringify({ models: {} }),
+    });
+
+    const site = await db.insert(schema.sites).values({
+      name: 'antigravity-site-200-empty',
+      url: 'https://cloudcode-pa.googleapis.com',
+      platform: 'antigravity',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'antigravity-empty@example.com',
+      accessToken: 'antigravity-access-token',
+      apiToken: null,
+      status: 'active',
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: {
+          provider: 'antigravity',
+          email: 'antigravity-empty@example.com',
+          projectId: 'project-demo',
+        },
+      }),
+    }).returning().get();
+
+    await db.insert(schema.modelAvailability).values([
+      {
+        accountId: account.id,
+        modelName: 'gemini-3-pro-preview',
+        available: true,
+        latencyMs: 120,
+        checkedAt: '2026-04-02T10:00:00.000Z',
+      },
+      {
+        accountId: account.id,
+        modelName: 'my-custom-model',
+        available: true,
+        isManual: true,
+      },
+    ]).run();
+
+    const result = await refreshModelsForAccount(account.id);
+    expect(result.status).toBe('failed');
+
+    // Synced row dropped on the first failure, manual row preserved.
+    const rows = await db.select().from(schema.modelAvailability)
+      .where(eq(schema.modelAvailability.accountId, account.id))
+      .all();
+    expect(rows.map((row) => `${row.modelName}:${row.isManual}`)).toEqual([
+      'my-custom-model:true',
+    ]);
+  });
+
   it('continues antigravity discovery after fetch errors and trims the oauth project id before posting', async () => {
     getApiTokenMock.mockResolvedValue(null);
     getModelsMock.mockRejectedValue(new Error('antigravity oauth discovery should not call adapter.getModels'));
@@ -2391,9 +2978,9 @@ describe('refreshModelsForAccount credential discovery', () => {
     expect(manualRow?.isManual).toBe(true);
   });
 
-  it('preserves manual models when refresh fails and restores previous availability', async () => {
+  it('keeps manual models and clears synced models when the upstream returns no models', async () => {
     getApiTokenMock.mockResolvedValue(null);
-    getModelsMock.mockResolvedValue([]);
+    getModelsMock.mockImplementation(async () => confirmedEmptyModelList());
 
     const site = await db.insert(schema.sites).values({
       name: 'site-fail',
@@ -2408,6 +2995,17 @@ describe('refreshModelsForAccount credential discovery', () => {
       accessToken: 'session-token',
       apiToken: null,
       status: 'active',
+      extraConfig: JSON.stringify({ credentialMode: 'session' }),
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'default',
+      token: 'sk-stored-token',
+      source: 'manual',
+      enabled: true,
+      isDefault: true,
+      valueStatus: 'ready' as any,
     }).returning().get();
 
     // Existing synced model
@@ -2426,23 +3024,36 @@ describe('refreshModelsForAccount credential discovery', () => {
       isManual: true,
     }).run();
 
+    await db.insert(schema.tokenModelAvailability).values({
+      tokenId: token.id,
+      modelName: 'gpt-4.1',
+      available: true,
+    }).run();
+
     const result = await refreshModelsForAccount(account.id, { allowInactive: true });
 
+    // A successful pull that reports an empty model list is definitive: the
+    // synced rows are cleared while manual rows survive.
     expect(result).toMatchObject({
       status: 'failed',
+      errorCode: 'empty_models',
+      errorMessage: '模型获取失败：未获取到可用模型',
     });
 
     const rows = await db.select().from(schema.modelAvailability)
       .where(eq(schema.modelAvailability.accountId, account.id))
       .all();
 
-    // Both manual model and restored synced model should exist
     const modelNames = rows.map((r) => r.modelName).sort();
-    expect(modelNames).toContain('my-custom-model');
-    expect(modelNames).toContain('gpt-4.1');
+    expect(modelNames).toEqual(['my-custom-model']);
 
     const manualRow = rows.find((r) => r.modelName === 'my-custom-model');
     expect(manualRow?.isManual).toBe(true);
+
+    const tokenRows = await db.select().from(schema.tokenModelAvailability)
+      .where(eq(schema.tokenModelAvailability.tokenId, token.id))
+      .all();
+    expect(tokenRows).toHaveLength(0);
   });
 
   it('rebuilds one pooled route channel for grouped oauth accounts that share a model', async () => {

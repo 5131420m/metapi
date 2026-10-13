@@ -173,12 +173,24 @@ export async function createManualAccount({
       accessToken = '';
       if (!apiToken) apiToken = rawAccessToken;
     } else {
-      const models = await getModelsWithSiteApiEndpointPool(
-        site,
-        adapter,
-        rawAccessToken,
-        body.platformUserId,
-      );
+      // A failed pull now reaches here as a throw (adapters no longer flatten
+      // failures into an empty list), and it means the same thing to the user
+      // as "no models": the API Key could not be verified.
+      let models: string[] = [];
+      try {
+        models = await getModelsWithSiteApiEndpointPool(
+          site,
+          adapter,
+          rawAccessToken,
+          body.platformUserId,
+        );
+      } catch (err) {
+        const error = new Error(
+          `API Key 验证失败：${(err as Error)?.message || '未获取到可用模型'}`,
+        );
+        (error as Error & { requiresVerification?: boolean }).requiresVerification = true;
+        throw error;
+      }
       verifiedModels = Array.isArray(models)
         ? models.filter((item) => typeof item === 'string' && item.trim().length > 0)
         : [];

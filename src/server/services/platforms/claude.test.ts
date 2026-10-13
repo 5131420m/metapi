@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { AddressInfo } from 'node:net';
 import { ClaudeAdapter } from './claude.js';
+import { isConfirmedEmptyModelList } from './modelListEvidence.js';
 
 vi.mock('../siteProxy.js', () => ({
   withSiteProxyRequestInit: (_url: string, options: unknown) => options,
@@ -88,9 +89,28 @@ describe('ClaudeAdapter', () => {
     });
 
     const adapter = new ClaudeAdapter();
+
+    // A failed request is reported as a failure, not as an empty model list:
+    // model refresh must be able to tell the two apart. See
+    // modelListEvidence.ts.
+    await expect(adapter.getModels(baseUrl, 'tp-test')).rejects.toThrow('HTTP 404');
+    expect(requests.map((request) => request.url)).toEqual(['/v1/models']);
+  });
+
+  it('reports an empty model list from the upstream as confirmed emptiness', async () => {
+    await startServer((req, res) => {
+      if (req.url === '/v1/models') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: [] }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+
+    const adapter = new ClaudeAdapter();
     const models = await adapter.getModels(baseUrl, 'tp-test');
 
     expect(models).toEqual([]);
-    expect(requests.map((request) => request.url)).toEqual(['/v1/models']);
+    expect(isConfirmedEmptyModelList(models)).toBe(true);
   });
 });

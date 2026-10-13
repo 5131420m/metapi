@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { NewApiAdapter } from './newApi.js';
 import { AnyRouterAdapter } from './anyrouter.js';
+import { isConfirmedEmptyModelList } from './modelListEvidence.js';
 
 interface RequestSnapshot {
   method: string;
@@ -626,6 +627,45 @@ describe('NewApiAdapter', () => {
         .rejects.toThrow(/HTTP 503|failed to discover models/i);
     } finally {
       await new Promise<void>((resolve, reject) => failingServer.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it('throws when every endpoint answers HTTP 200 with an error envelope', async () => {
+    // new-api answers 200 { success: false, message } for auth and permission
+    // failures. Reporting that as "this account has no models" would make model
+    // refresh clear the previously synced ones. See modelListEvidence.ts.
+    const envelopeServer = createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: false, message: '无权进行此操作' }));
+    });
+    await new Promise<void>((resolve) => envelopeServer.listen(0, '127.0.0.1', resolve));
+    const address = envelopeServer.address() as AddressInfo;
+
+    try {
+      const adapter = new NewApiAdapter();
+      await expect(adapter.getModels(`http://127.0.0.1:${address.port}`, 'envelope-token', 11494))
+        .rejects.toThrow(/无权进行此操作|failed to discover models/i);
+    } finally {
+      await new Promise<void>((resolve, reject) => envelopeServer.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+
+  it('reports a well-formed empty model list as confirmed emptiness', async () => {
+    const emptyServer = createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(req.url?.startsWith('/v1/models') ? { data: [] } : { success: true, data: [] }));
+    });
+    await new Promise<void>((resolve) => emptyServer.listen(0, '127.0.0.1', resolve));
+    const address = emptyServer.address() as AddressInfo;
+
+    try {
+      const adapter = new NewApiAdapter();
+      const models = await adapter.getModels(`http://127.0.0.1:${address.port}`, 'empty-token', 11494);
+
+      expect(models).toEqual([]);
+      expect(isConfirmedEmptyModelList(models)).toBe(true);
+    } finally {
+      await new Promise<void>((resolve, reject) => emptyServer.close((error) => (error ? reject(error) : resolve())));
     }
   });
 

@@ -19,6 +19,54 @@ import {
 type PlatformDiscoverySite = typeof schema.sites.$inferSelect;
 type PlatformDiscoveryAccount = typeof schema.accounts.$inferSelect;
 
+/**
+ * The upstream answered successfully and reported zero models.
+ *
+ * This is the one failure that is *definitive*: the upstream itself says the
+ * account has no models, so the previously synced rows may be dropped at once
+ * instead of being kept until repeated failures. Every other failure (HTTP
+ * error, timeout, transport fault) is transient as far as the model list is
+ * concerned and must preserve the rows.
+ *
+ * It is a dedicated type rather than a message, because the caller used to
+ * decide this with `message.includes('未获取到可用模型')` — a substring test on a
+ * string that carries the raw upstream response body. A gateway replying `503`
+ * with an empty body produced exactly that phrase through a fallback, so a
+ * transient outage was misread as "definitively empty" and wiped the rows.
+ */
+export class EmptyModelListError extends Error {
+  readonly definitiveEmpty = true as const;
+
+  constructor(message = '未获取到可用模型') {
+    super(message);
+    this.name = 'EmptyModelListError';
+  }
+}
+
+/**
+ * True when a caught error means "upstream responded, zero models".
+ *
+ * The check walks the `cause` chain rather than testing the top-level error:
+ * a sentinel thrown from inside the endpoint pool is re-wrapped by
+ * `normalizePoolTerminalError` into a `SiteApiEndpointRequestError` that keeps
+ * the original only as its `cause`. Unwrapping here keeps the knowledge of
+ * what "definitively empty" means in the discovery layer, instead of teaching
+ * the shared transport module about model semantics.
+ */
+export function isEmptyModelListError(error: unknown): boolean {
+  // Bounded walk: guards against a self-referential or pathological chain.
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    if (current instanceof EmptyModelListError) return true;
+    seen.add(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+
+  return false;
+}
+
 function normalizeDiscoveredModels(models: string[]): string[] {
   const normalizedModels: string[] = [];
   const seen = new Set<string>();
@@ -229,6 +277,7 @@ export async function discoverAntigravityModelsFromCloud(input: {
   const requestBody = projectId ? { project: projectId } : {};
   return runWithSiteApiEndpointPool(input.site, async (target) => {
     let lastError = '';
+    let sawEmptyModelList = false;
     const selectedBaseUrl = normalizeBaseUrl(target.baseUrl || ANTIGRAVITY_UPSTREAM_BASE_URL) || ANTIGRAVITY_UPSTREAM_BASE_URL;
     const discoveryBaseUrls = target.endpointId
       ? [selectedBaseUrl]
@@ -251,7 +300,10 @@ export async function discoverAntigravityModelsFromCloud(input: {
         );
         if (!response.ok) {
           const text = await response.text().catch(() => '');
-          lastError = `HTTP ${response.status}: ${text || '未获取到可用模型'}`;
+          // Neutral fallback on purpose: this is a transport failure, so its
+          // message must not read like a definitive empty model list.
+          lastError = `HTTP ${response.status}: ${text || 'antigravity model discovery failed'}`;
+          sawEmptyModelList = false;
           continue;
         }
 
@@ -260,12 +312,20 @@ export async function discoverAntigravityModelsFromCloud(input: {
         if (models.length > 0) {
           return models;
         }
+        // This candidate answered 200 with zero models.
         lastError = '未获取到可用模型';
+        sawEmptyModelList = true;
       } catch (error) {
         lastError = error instanceof Error ? `${discoveryBaseUrl}: ${error.message}` : String(error);
+        sawEmptyModelList = false;
       }
     }
 
-    throw new Error(lastError || '未获取到可用模型');
+    // Only the last candidate having answered "200, zero models" is a
+    // definitive empty result; anything else is a transient failure.
+    if (sawEmptyModelList) {
+      throw new EmptyModelListError();
+    }
+    throw new Error(lastError || 'antigravity model discovery failed');
   });
 }
