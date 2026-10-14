@@ -212,6 +212,9 @@ describe('tokenRouter timeout failure accounting', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const modelPattern = 'gpt-timeout-weight';

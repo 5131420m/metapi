@@ -23,6 +23,8 @@ import UpdateCenterSection from './settings/UpdateCenterSection.js';
 import {
   applyRoutingProfilePreset,
   resolveRoutingProfilePreset,
+  ROUTING_PROFILE_DESCRIPTIONS,
+  type RoutingProfilePresetId,
   type RoutingWeights,
 } from './helpers/routingProfiles.js';
 import { clearAuthSession } from '../authSession.js';
@@ -306,6 +308,9 @@ const defaultWeights: RoutingWeights = {
   costWeight: 0.4,
   balanceWeight: 0.3,
   usageWeight: 0.3,
+  firstByteWeight: 0,
+  speedWeight: 0,
+  successWeight: 0,
 };
 
 function getDialectDefaults(dialect: DbDialect) {
@@ -1147,7 +1152,7 @@ export default function Settings() {
     }
   };
 
-  const applyRoutingPreset = (preset: 'balanced' | 'stable' | 'cost') => {
+  const applyRoutingPreset = (preset: Exclude<RoutingProfilePresetId, 'custom'>) => {
     setRuntime((prev) => ({
       ...prev,
       routingWeights: applyRoutingProfilePreset(preset),
@@ -2206,7 +2211,7 @@ export default function Settings() {
         <div className="card animate-slide-up stagger-5" style={{ padding: 20 }}>
           <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 10 }}>路由策略</div>
           <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
-            先选择预设策略，只有需要精调时再展开高级参数。
+            先选择预设策略，只有需要精调时再展开高级参数。以下权重仅影响路由策略为「按权重随机」的通道；「稳定优先」策略的通道由其自身机制决定。
           </div>
           <div style={{ marginBottom: 12, maxWidth: 280 }}>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
@@ -2271,37 +2276,26 @@ export default function Settings() {
               支持秒、分钟、小时、天。只封顶普通失败与轮询分级冷却；429 限额类冷却仍优先遵循上游 reset 提示，避免过早重试。
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-            <button
-              onClick={() => applyRoutingPreset('balanced')}
-              className="btn btn-ghost"
-              style={{
-                border: activeRoutingProfile === 'balanced' ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
-                color: activeRoutingProfile === 'balanced' ? 'var(--color-primary)' : undefined,
-              }}
-            >
-              均衡
-            </button>
-            <button
-              onClick={() => applyRoutingPreset('stable')}
-              className="btn btn-ghost"
-              style={{
-                border: activeRoutingProfile === 'stable' ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
-                color: activeRoutingProfile === 'stable' ? 'var(--color-primary)' : undefined,
-              }}
-            >
-              稳定优先
-            </button>
-            <button
-              onClick={() => applyRoutingPreset('cost')}
-              className="btn btn-ghost"
-              style={{
-                border: activeRoutingProfile === 'cost' ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
-                color: activeRoutingProfile === 'cost' ? 'var(--color-primary)' : undefined,
-              }}
-            >
-              成本优先
-            </button>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 8 }}>
+            {([
+              ['balanced', '均衡'],
+              ['cost', '成本优先'],
+              ['quality', '质量优先'],
+              ['speed', '速度优先'],
+              ['durable', '耐用优先'],
+            ] as Array<[Exclude<RoutingProfilePresetId, 'custom'>, string]>).map(([presetId, label]) => (
+              <button
+                key={presetId}
+                onClick={() => applyRoutingPreset(presetId)}
+                className="btn btn-ghost"
+                style={{
+                  border: activeRoutingProfile === presetId ? '1px solid var(--color-primary)' : '1px solid var(--color-border)',
+                  color: activeRoutingProfile === presetId ? 'var(--color-primary)' : undefined,
+                }}
+              >
+                {label}
+              </button>
+            ))}
             <button
               onClick={() => setShowAdvancedRouting((prev) => !prev)}
               className="btn btn-ghost"
@@ -2309,6 +2303,9 @@ export default function Settings() {
             >
               {showAdvancedRouting ? '收起高级参数' : '展开高级参数'}
             </button>
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12, lineHeight: 1.6 }}>
+            {ROUTING_PROFILE_DESCRIPTIONS[activeRoutingProfile]}
           </div>
 
           <div className={`anim-collapse ${showAdvancedRouting ? 'is-open' : ''}`.trim()} style={{ marginBottom: 12 }}>
@@ -2320,6 +2317,9 @@ export default function Settings() {
                 ['costWeight', '成本权重'],
                 ['balanceWeight', '余额权重'],
                 ['usageWeight', '使用频次权重'],
+                ['firstByteWeight', '首字权重'],
+                ['speedWeight', '速度权重'],
+                ['successWeight', '成功率权重'],
               ] as Array<[keyof RoutingWeights, string]>).map(([key, label]) => (
                 <div key={key}>
                   <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>{label}</div>

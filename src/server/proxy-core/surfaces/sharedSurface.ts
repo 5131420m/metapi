@@ -488,6 +488,12 @@ export async function recordSurfaceSuccess(input: {
     input.latencyMs,
     estimatedCost,
     input.modelName,
+    undefined,
+    {
+      firstByteLatencyMs: input.firstByteLatencyMs ?? null,
+      completionTokens: resolvedUsage.completionTokens,
+      isStream: input.isStream ?? null,
+    },
   );
   input.recordDownstreamCost?.(estimatedCost);
   const logTokens = resolvedUsage.usageSource === 'unknown'

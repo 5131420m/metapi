@@ -145,6 +145,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -396,6 +399,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('claude-haiku-4-5-20251001');
@@ -456,6 +462,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 1,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('claude-opus-4-6');
@@ -508,6 +517,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 1,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
     config.routingFallbackUnitCost = 0.02;
 
@@ -560,6 +572,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0.75,
       balanceWeight: 0.15,
       usageWeight: 0.1,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
     config.routingFallbackUnitCost = 1000;
 
@@ -627,6 +642,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 1,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
     config.routingFallbackUnitCost = 100;
 
@@ -686,6 +704,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('gpt-5.4');
@@ -796,6 +817,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('gpt-5.3');
@@ -863,6 +887,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('gpt-first-byte');
@@ -917,6 +944,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('gpt-5.4');
@@ -999,6 +1029,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('gpt-5.4');
@@ -1053,13 +1086,16 @@ describe('TokenRouter selection scoring', () => {
     expect((candidateA?.probability || 0)).toBeGreaterThan(0);
   });
 
-  it('uses persisted site success and latency history to prefer historically healthier sites', async () => {
+  it('uses persisted site success history through the value-score success component', async () => {
     config.routingWeights = {
-      baseWeightFactor: 1,
-      valueScoreFactor: 0,
+      baseWeightFactor: 0,
+      valueScoreFactor: 1,
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 1,
     };
 
     const route = await createRoute('claude-4-sonnet');
@@ -1101,9 +1137,199 @@ describe('TokenRouter selection scoring', () => {
     expect(stableCandidate).toBeTruthy();
     expect(weakCandidate).toBeTruthy();
     expect((stableCandidate?.probability || 0)).toBeGreaterThan(weakCandidate?.probability || 0);
-    expect(stableCandidate?.reason || '').toContain('历史健康=');
+    expect(stableCandidate?.reason || '').toContain('价值分=');
     expect(stableCandidate?.reason || '').toContain('成功率=90.0%');
     expect(weakCandidate?.reason || '').toContain('成功率=40.0%');
+  });
+
+  it('uses observed first-byte latency through the value-score first-byte component', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 0,
+      valueScoreFactor: 1,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+      firstByteWeight: 1,
+      speedWeight: 0,
+      successWeight: 0,
+    };
+
+    const route = await createRoute('gpt-firstbyte-test');
+
+    const siteFast = await createSite('firstbyte-fast');
+    const accountFast = await createAccount(siteFast.id, 'firstbyte-user-fast');
+    const tokenFast = await createToken(accountFast.id, 'firstbyte-token-fast');
+    const channelFast = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountFast.id,
+      tokenId: tokenFast.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const siteSlow = await createSite('firstbyte-slow');
+    const accountSlow = await createAccount(siteSlow.id, 'firstbyte-user-slow');
+    const tokenSlow = await createToken(accountSlow.id, 'firstbyte-token-slow');
+    const channelSlow = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountSlow.id,
+      tokenId: tokenSlow.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    for (let index = 0; index < 10; index += 1) {
+      await router.recordSuccess(channelFast.id, 4000, 0, 'gpt-firstbyte-test', undefined, {
+        firstByteLatencyMs: 200,
+        isStream: true,
+      });
+      await router.recordSuccess(channelSlow.id, 8000, 0, 'gpt-firstbyte-test', undefined, {
+        firstByteLatencyMs: 4000,
+        isStream: true,
+      });
+    }
+    invalidateTokenRouterCache();
+
+    const decision = await router.explainSelection('gpt-firstbyte-test');
+    const fastCandidate = decision.candidates.find((candidate) => candidate.siteName.startsWith('firstbyte-fast'));
+    const slowCandidate = decision.candidates.find((candidate) => candidate.siteName.startsWith('firstbyte-slow'));
+
+    expect(fastCandidate).toBeTruthy();
+    expect(slowCandidate).toBeTruthy();
+    expect((fastCandidate?.probability || 0)).toBeGreaterThan(slowCandidate?.probability || 0);
+    expect(fastCandidate?.reason || '').toContain('首字=200ms');
+    expect(slowCandidate?.reason || '').toContain('首字=4000ms');
+  });
+
+  it('uses observed stream throughput through the value-score speed component', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 0,
+      valueScoreFactor: 1,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 1,
+      successWeight: 0,
+    };
+
+    const route = await createRoute('gpt-speed-test');
+
+    const siteFast = await createSite('speed-fast');
+    const accountFast = await createAccount(siteFast.id, 'speed-user-fast');
+    const tokenFast = await createToken(accountFast.id, 'speed-token-fast');
+    const channelFast = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountFast.id,
+      tokenId: tokenFast.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const siteSlow = await createSite('speed-slow');
+    const accountSlow = await createAccount(siteSlow.id, 'speed-user-slow');
+    const tokenSlow = await createToken(accountSlow.id, 'speed-token-slow');
+    const channelSlow = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountSlow.id,
+      tokenId: tokenSlow.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    for (let index = 0; index < 10; index += 1) {
+      // 300 completion tokens over a 5000ms generation window = 60 tps.
+      await router.recordSuccess(channelFast.id, 5500, 0, 'gpt-speed-test', undefined, {
+        firstByteLatencyMs: 500,
+        completionTokens: 300,
+        isStream: true,
+      });
+      // 50 completion tokens over a 5000ms generation window = 10 tps.
+      await router.recordSuccess(channelSlow.id, 5500, 0, 'gpt-speed-test', undefined, {
+        firstByteLatencyMs: 500,
+        completionTokens: 50,
+        isStream: true,
+      });
+    }
+    invalidateTokenRouterCache();
+
+    const decision = await router.explainSelection('gpt-speed-test');
+    const fastCandidate = decision.candidates.find((candidate) => candidate.siteName.startsWith('speed-fast'));
+    const slowCandidate = decision.candidates.find((candidate) => candidate.siteName.startsWith('speed-slow'));
+
+    expect(fastCandidate).toBeTruthy();
+    expect(slowCandidate).toBeTruthy();
+    expect((fastCandidate?.probability || 0)).toBeGreaterThan(slowCandidate?.probability || 0);
+    expect(fastCandidate?.reason || '').toContain('速度=60.0tps');
+    expect(slowCandidate?.reason || '').toContain('速度=10.0tps');
+  });
+
+  it('gives unmeasured channels a neutral quality score instead of burying them at zero', async () => {
+    config.routingWeights = {
+      baseWeightFactor: 0,
+      valueScoreFactor: 1,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+      firstByteWeight: 1,
+      speedWeight: 0,
+      successWeight: 0,
+    };
+
+    const route = await createRoute('gpt-coldstart-test');
+
+    const siteFresh = await createSite('coldstart-fresh');
+    const accountFresh = await createAccount(siteFresh.id, 'coldstart-user-fresh');
+    const tokenFresh = await createToken(accountFresh.id, 'coldstart-token-fresh');
+    await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountFresh.id,
+      tokenId: tokenFresh.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).run();
+
+    const siteSlow = await createSite('coldstart-slow');
+    const accountSlow = await createAccount(siteSlow.id, 'coldstart-user-slow');
+    const tokenSlow = await createToken(accountSlow.id, 'coldstart-token-slow');
+    const channelSlow = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: accountSlow.id,
+      tokenId: tokenSlow.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    for (let index = 0; index < 10; index += 1) {
+      await router.recordSuccess(channelSlow.id, 9000, 0, 'gpt-coldstart-test', undefined, {
+        firstByteLatencyMs: 8000,
+        isStream: true,
+      });
+    }
+    invalidateTokenRouterCache();
+
+    const decision = await router.explainSelection('gpt-coldstart-test');
+    const freshCandidate = decision.candidates.find((candidate) => candidate.siteName.startsWith('coldstart-fresh'));
+    const slowCandidate = decision.candidates.find((candidate) => candidate.siteName.startsWith('coldstart-slow'));
+
+    expect(freshCandidate).toBeTruthy();
+    expect(slowCandidate).toBeTruthy();
+    // The fresh channel has no first-byte samples, so it blends to the neutral
+    // 0.5 score; the measured slow channel (raw = 2500/8000, full confidence)
+    // lands below it. The old min-max normalization would have ranked the
+    // unmeasured channel dead last and starved it of the traffic it needs to
+    // ever collect evidence.
+    expect((freshCandidate?.probability || 0)).toBeGreaterThan(slowCandidate?.probability || 0);
+    expect(freshCandidate?.reason || '').toContain('首字=—');
   });
 
   it('stable_first ranks recent and fallback success rate ahead of balance-heavy weak sites', async () => {
@@ -1113,6 +1339,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0.1,
       balanceWeight: 10,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -1173,6 +1402,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await createRoute('gpt-4o-mini');
@@ -1239,6 +1471,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -1312,6 +1547,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const gptRoute = await createRoute('gpt-5.4');
@@ -1390,6 +1628,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const gptRoute = await createRoute('gpt-5.4');
@@ -1474,6 +1715,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -1534,6 +1778,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -1585,6 +1832,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -1650,6 +1900,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
 
     const route = await db.insert(schema.tokenRoutes).values({
@@ -1733,6 +1986,9 @@ describe('TokenRouter selection scoring', () => {
       costWeight: 0,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
     config.proxySessionChannelConcurrencyLimit = 1;
     config.proxySessionChannelQueueWaitMs = 5_000;

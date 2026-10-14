@@ -1310,7 +1310,16 @@ function isSettingValueAcceptable(key: string, value: unknown): boolean {
 
   if (key === 'routing_weights') {
     if (!isRecord(value)) return false;
-    const keys = ['baseWeightFactor', 'valueScoreFactor', 'costWeight', 'balanceWeight', 'usageWeight'] as const;
+    const keys = [
+      'baseWeightFactor',
+      'valueScoreFactor',
+      'costWeight',
+      'balanceWeight',
+      'usageWeight',
+      'firstByteWeight',
+      'speedWeight',
+      'successWeight',
+    ] as const;
     return keys.every((weightKey) => value[weightKey] === undefined || isFiniteNumber(value[weightKey]));
   }
 

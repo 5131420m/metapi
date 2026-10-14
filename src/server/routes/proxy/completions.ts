@@ -1,4 +1,4 @@
-﻿import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { fetch } from 'undici';
 import { randomUUID } from 'node:crypto';
 import { config } from '../../config.js';
@@ -222,7 +222,11 @@ export async function completionsProxyRoute(app: FastifyInstance) {
             resolvedUsage,
           });
           await recordTokenRouterEventBestEffort('record channel success', () => (
-            tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+            tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+              firstByteLatencyMs,
+              completionTokens: resolvedUsage.completionTokens,
+              isStream,
+            })
           ));
           recordDownstreamCostUsage(request, estimatedCost);
           logProxy(
@@ -342,7 +346,11 @@ export async function completionsProxyRoute(app: FastifyInstance) {
         });
 
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+            firstByteLatencyMs,
+            completionTokens: resolvedUsage.completionTokens,
+            isStream,
+          })
         ));
         recordDownstreamCostUsage(request, estimatedCost);
         logProxy(

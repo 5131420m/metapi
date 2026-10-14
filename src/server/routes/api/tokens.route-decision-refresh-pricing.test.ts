@@ -109,6 +109,9 @@ describe('POST /api/routes/decision/batch refreshPricingCatalog', () => {
       costWeight: 1,
       balanceWeight: 0,
       usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 0,
     };
     config.routingFallbackUnitCost = 100;
   });

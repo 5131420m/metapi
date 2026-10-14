@@ -91,6 +91,14 @@ type SiteRuntimeHealthState = {
   lastUpdatedAtMs: number;
   lastFailureAtMs: number | null;
   lastSuccessAtMs: number | null;
+  /** EMA of observed time-to-first-byte, feeding the weighted value score. */
+  firstByteEmaMs: number | null;
+  /** Samples behind `firstByteEmaMs`; drives the neutral-fallback confidence. */
+  firstByteSampleCount: number;
+  /** EMA of observed stream generation throughput (tokens/sec). */
+  tpsEma: number | null;
+  /** Samples behind `tpsEma`; drives the neutral-fallback confidence. */
+  tpsSampleCount: number;
 };
 
 const FAILURE_BACKOFF_BASE_SEC = 15;
@@ -191,9 +199,22 @@ const STABLE_FIRST_SITE_SCORE_RATIO = 0.92;
 const SITE_RUNTIME_HEALTH_DECAY_HALF_LIFE_MS = 10 * 60 * 1000;
 const SITE_RUNTIME_MIN_MULTIPLIER = 0.08;
 const SITE_RUNTIME_LATENCY_BASELINE_MS = 2_500;
-const SITE_RUNTIME_LATENCY_WINDOW_MS = 30_000;
-const SITE_RUNTIME_MAX_LATENCY_PENALTY = 0.35;
 const SITE_RUNTIME_LATENCY_EMA_ALPHA = 0.3;
+const SITE_RUNTIME_TPS_EMA_ALPHA = 0.3;
+/**
+ * Throughput a site must sustain (tokens/sec) to score a full 1.0 on the weighted
+ * speed component. Sites faster than this saturate: beyond the target, extra speed
+ * stops buying probability, mirroring the stable-first tolerance philosophy.
+ */
+const SITE_RUNTIME_SPEED_TARGET_TPS = 30;
+/** Upper bound for a single observed tokens/sec sample, so one bogus usage payload cannot poison the EMA. */
+const SITE_RUNTIME_SPEED_MAX_TPS = 500;
+/** Minimum stream generation window (latency minus first byte) before a tokens/sec sample is trusted. */
+const SITE_RUNTIME_TPS_MIN_GENERATION_MS = 500;
+/** Samples of a quality EMA (first-byte / tps) needed for full confidence; below it the score blends toward neutral. */
+const SITE_RUNTIME_SIGNAL_CONFIDENCE_SAMPLES = 10;
+/** Neutral value-score component used when a quality signal has no samples yet (cold start). */
+const NEUTRAL_VALUE_COMPONENT_SCORE = 0.5;
 const SITE_RUNTIME_BREAKER_STREAK_THRESHOLD = 3;
 const SITE_RUNTIME_BREAKER_LEVELS_MS = [0, 60_000, 5 * 60_000, 30 * 60 * 1000] as const;
 const SITE_TRANSIENT_STREAK_WINDOW_MS = 5 * 60 * 1000;
@@ -309,6 +330,14 @@ type SiteRuntimeHealthDetails = {
   recentSuccessRate: number;
   recentSampleCount: number;
   recentConfidence: number;
+  /** Resolved first-byte EMA (model-level preferred, site-global fallback); null when never observed. */
+  firstByteEmaMs: number | null;
+  /** Confidence [0,1] behind `firstByteEmaMs`, from its sample count. */
+  firstByteConfidence: number;
+  /** Resolved stream throughput EMA (tokens/sec); null when never observed. */
+  tpsEma: number | null;
+  /** Confidence [0,1] behind `tpsEma`, from its sample count. */
+  tpsConfidence: number;
 };
 
 type WeightedSelectionMode = 'weighted' | 'stable_first';
@@ -656,6 +685,52 @@ function resolveStableFirstSuccessRate(
 }
 
 /**
+ * Shrink an observed quality score toward the neutral component score while the
+ * sample behind it is scarce. A site with one lucky observation must not outrank
+ * one with a hundred boring ones, and a brand-new site must not be buried at zero
+ * before it ever had a chance to be measured.
+ */
+function blendQualityComponentScore(score: number, confidence: number): number {
+  return clampNumber(
+    (score * confidence) + (NEUTRAL_VALUE_COMPONENT_SCORE * (1 - confidence)),
+    0,
+    1,
+  );
+}
+
+/**
+ * Derive the quality metrics a successful request can contribute from its stream
+ * timing. First-byte latency is always usable when observed; tokens/sec is only
+ * trusted for stream responses with a real generation window (total latency minus
+ * first byte), so non-stream replies — where the first byte IS the whole body —
+ * cannot fabricate a throughput sample.
+ */
+function resolveStreamTimingQualityMetrics(
+  latencyMs: number,
+  streamTiming?: {
+    firstByteLatencyMs?: number | null;
+    completionTokens?: number | null;
+    isStream?: boolean | null;
+  },
+): RuntimeSuccessQualityMetrics {
+  const firstByteLatencyMs = readFiniteNumber(streamTiming?.firstByteLatencyMs);
+  if (firstByteLatencyMs == null || firstByteLatencyMs < 0) return {};
+  const metrics: RuntimeSuccessQualityMetrics = { firstByteLatencyMs };
+  const completionTokens = readFiniteNumber(streamTiming?.completionTokens);
+  const streamEligible = streamTiming?.isStream == null || streamTiming.isStream === true;
+  if (streamEligible && completionTokens != null && completionTokens > 0) {
+    const generationMs = latencyMs - firstByteLatencyMs;
+    if (generationMs >= SITE_RUNTIME_TPS_MIN_GENERATION_MS) {
+      metrics.tokensPerSecond = Math.min(
+        SITE_RUNTIME_SPEED_MAX_TPS,
+        (completionTokens * 1000) / generationMs,
+      );
+    }
+  }
+  return metrics;
+}
+
+/**
  * An observed timeout says "this attempt waited longer than its budget", not "this
  * credential is broken". The budget itself is a per-response-shape policy decision
  * (see `proxy-core/responseTimeoutPolicy.ts`), so a media generation that legitimately
@@ -791,6 +866,8 @@ function hydrateSiteRuntimeHealthState(raw: unknown): SiteRuntimeHealthState | n
 
   const lastUpdatedAtMs = readFiniteInteger(raw.lastUpdatedAtMs) ?? Date.now();
   const recentWindowUpdatedAtMs = readFiniteInteger(raw.recentWindowUpdatedAtMs) ?? lastUpdatedAtMs;
+  const firstByteEmaMs = readFiniteNumber(raw.firstByteEmaMs);
+  const tpsEma = readFiniteNumber(raw.tpsEma);
   return {
     penaltyScore: Math.max(0, readFiniteNumber(raw.penaltyScore) ?? 0),
     latencyEmaMs: readFiniteNumber(raw.latencyEmaMs),
@@ -804,6 +881,10 @@ function hydrateSiteRuntimeHealthState(raw: unknown): SiteRuntimeHealthState | n
     lastUpdatedAtMs: Math.max(0, lastUpdatedAtMs),
     lastFailureAtMs: readNullableTimestamp(raw.lastFailureAtMs),
     lastSuccessAtMs: readNullableTimestamp(raw.lastSuccessAtMs),
+    firstByteEmaMs: firstByteEmaMs != null && firstByteEmaMs >= 0 ? firstByteEmaMs : null,
+    firstByteSampleCount: Math.max(0, readFiniteNumber(raw.firstByteSampleCount) ?? 0),
+    tpsEma: tpsEma != null && tpsEma > 0 ? tpsEma : null,
+    tpsSampleCount: Math.max(0, readFiniteNumber(raw.tpsSampleCount) ?? 0),
   };
 }
 
@@ -821,6 +902,10 @@ function cloneSiteRuntimeHealthState(state: SiteRuntimeHealthState): SiteRuntime
     lastUpdatedAtMs: state.lastUpdatedAtMs,
     lastFailureAtMs: state.lastFailureAtMs,
     lastSuccessAtMs: state.lastSuccessAtMs,
+    firstByteEmaMs: state.firstByteEmaMs,
+    firstByteSampleCount: state.firstByteSampleCount,
+    tpsEma: state.tpsEma,
+    tpsSampleCount: state.tpsSampleCount,
   };
 }
 
@@ -840,6 +925,10 @@ function getOrCreateRuntimeHealthState<K>(states: Map<K, SiteRuntimeHealthState>
       lastUpdatedAtMs: nowMs,
       lastFailureAtMs: null,
       lastSuccessAtMs: null,
+      firstByteEmaMs: null,
+      firstByteSampleCount: 0,
+      tpsEma: null,
+      tpsSampleCount: 0,
     };
     states.set(key, initial);
     return initial;
@@ -888,17 +977,13 @@ function getRuntimeHealthMultiplier(state: SiteRuntimeHealthState | null | undef
   if (isRuntimeHealthBreakerOpen(state, nowMs)) {
     return SITE_RUNTIME_MIN_MULTIPLIER;
   }
+  // Pure safety floor: failure penalty + breaker. Responsiveness used to be damped
+  // here through the total-latency EMA, but that punished channels serving long
+  // outputs and double-counted the quality signals that now live in the weighted
+  // value score (first-byte / speed components). Ranking slow-but-healthy channels
+  // is the weights' job; this multiplier only reacts to failures.
   const penaltyScore = getDecayedSiteRuntimePenalty(state, nowMs);
-  const failurePenaltyFactor = 1 / (1 + penaltyScore);
-  const latencyPenaltyRatio = state.latencyEmaMs == null
-    ? 0
-    : clampNumber(
-      (state.latencyEmaMs - SITE_RUNTIME_LATENCY_BASELINE_MS) / SITE_RUNTIME_LATENCY_WINDOW_MS,
-      0,
-      1,
-    );
-  const latencyFactor = 1 - (latencyPenaltyRatio * SITE_RUNTIME_MAX_LATENCY_PENALTY);
-  return clampNumber(failurePenaltyFactor * latencyFactor, SITE_RUNTIME_MIN_MULTIPLIER, 1);
+  return clampNumber(1 / (1 + penaltyScore), SITE_RUNTIME_MIN_MULTIPLIER, 1);
 }
 
 function getSiteRuntimeHealthDetails(siteId: number, modelName?: string | null, nowMs = Date.now()): SiteRuntimeHealthDetails {
@@ -910,6 +995,10 @@ function getSiteRuntimeHealthDetails(siteId: number, modelName?: string | null, 
   const globalRecentSnapshot = getRecentOutcomeSnapshot(globalState, nowMs);
   const modelRecentSnapshot = modelState ? getRecentOutcomeSnapshot(modelState, nowMs) : null;
   const recentSnapshot = blendRecentOutcomeSnapshots(globalRecentSnapshot, modelRecentSnapshot);
+  // Quality EMAs prefer the model-scoped observation and fall back to the site-global
+  // one; confidence follows whichever state actually supplied the value.
+  const firstByteSource = modelState?.firstByteEmaMs != null ? modelState : globalState;
+  const tpsSource = modelState?.tpsEma != null ? modelState : globalState;
   return {
     globalMultiplier,
     modelMultiplier,
@@ -924,6 +1013,14 @@ function getSiteRuntimeHealthDetails(siteId: number, modelName?: string | null, 
     recentSuccessRate: recentSnapshot.successRate,
     recentSampleCount: recentSnapshot.sampleCount,
     recentConfidence: recentSnapshot.confidence,
+    firstByteEmaMs: firstByteSource?.firstByteEmaMs ?? null,
+    firstByteConfidence: firstByteSource
+      ? clampNumber(firstByteSource.firstByteSampleCount / SITE_RUNTIME_SIGNAL_CONFIDENCE_SAMPLES, 0, 1)
+      : 0,
+    tpsEma: tpsSource?.tpsEma ?? null,
+    tpsConfidence: tpsSource
+      ? clampNumber(tpsSource.tpsSampleCount / SITE_RUNTIME_SIGNAL_CONFIDENCE_SAMPLES, 0, 1)
+      : 0,
   };
 }
 
@@ -954,7 +1051,23 @@ function applyRuntimeHealthFailure(state: SiteRuntimeHealthState, context: SiteR
   state.lastFailureAtMs = nowMs;
 }
 
-function applyRuntimeHealthSuccess(state: SiteRuntimeHealthState, latencyMs: number, nowMs = Date.now()): void {
+/**
+ * Quality observations carried by a successful proxy request. `firstByteLatencyMs`
+ * feeds the responsiveness EMA; `tokensPerSecond` (stream generation throughput)
+ * feeds the speed EMA. Both are optional because non-chat surfaces and probes
+ * may only observe latency.
+ */
+export type RuntimeSuccessQualityMetrics = {
+  firstByteLatencyMs?: number | null;
+  tokensPerSecond?: number | null;
+};
+
+function applyRuntimeHealthSuccess(
+  state: SiteRuntimeHealthState,
+  latencyMs: number,
+  nowMs = Date.now(),
+  quality: RuntimeSuccessQualityMetrics = {},
+): void {
   refreshRecentOutcomeWindow(state, nowMs);
   state.recentSuccessCount += 1;
   state.penaltyScore = Math.max(0, state.penaltyScore * 0.2 - 0.3);
@@ -968,6 +1081,23 @@ function applyRuntimeHealthSuccess(state: SiteRuntimeHealthState, latencyMs: num
     ? normalizedLatencyMs
     : (state.latencyEmaMs * (1 - SITE_RUNTIME_LATENCY_EMA_ALPHA))
       + (normalizedLatencyMs * SITE_RUNTIME_LATENCY_EMA_ALPHA);
+  const firstByteLatencyMs = readFiniteNumber(quality.firstByteLatencyMs);
+  if (firstByteLatencyMs != null && firstByteLatencyMs >= 0) {
+    const normalizedFirstByteMs = Math.trunc(firstByteLatencyMs);
+    state.firstByteEmaMs = state.firstByteEmaMs == null
+      ? normalizedFirstByteMs
+      : (state.firstByteEmaMs * (1 - SITE_RUNTIME_LATENCY_EMA_ALPHA))
+        + (normalizedFirstByteMs * SITE_RUNTIME_LATENCY_EMA_ALPHA);
+    state.firstByteSampleCount += 1;
+  }
+  const tokensPerSecond = readFiniteNumber(quality.tokensPerSecond);
+  if (tokensPerSecond != null && tokensPerSecond > 0) {
+    state.tpsEma = state.tpsEma == null
+      ? tokensPerSecond
+      : (state.tpsEma * (1 - SITE_RUNTIME_TPS_EMA_ALPHA))
+        + (tokensPerSecond * SITE_RUNTIME_TPS_EMA_ALPHA);
+    state.tpsSampleCount += 1;
+  }
 }
 
 function shouldPersistSiteRuntimeHealthState(state: SiteRuntimeHealthState, nowMs = Date.now()): boolean {
@@ -1116,11 +1246,17 @@ function recordSiteRuntimeFailure(siteId: number, context: SiteRuntimeFailureCon
   scheduleSiteRuntimeHealthPersistence();
 }
 
-function recordSiteRuntimeSuccess(siteId: number, latencyMs: number, modelName?: string | null, nowMs = Date.now()): void {
-  applyRuntimeHealthSuccess(getOrCreateSiteRuntimeHealthState(siteId, nowMs), latencyMs, nowMs);
+function recordSiteRuntimeSuccess(
+  siteId: number,
+  latencyMs: number,
+  modelName?: string | null,
+  quality: RuntimeSuccessQualityMetrics = {},
+  nowMs = Date.now(),
+): void {
+  applyRuntimeHealthSuccess(getOrCreateSiteRuntimeHealthState(siteId, nowMs), latencyMs, nowMs, quality);
   const modelState = getOrCreateSiteModelRuntimeHealthState(siteId, modelName, nowMs);
   if (modelState) {
-    applyRuntimeHealthSuccess(modelState, latencyMs, nowMs);
+    applyRuntimeHealthSuccess(modelState, latencyMs, nowMs, quality);
   }
   scheduleSiteRuntimeHealthPersistence();
 }
@@ -2695,8 +2831,14 @@ export class TokenRouter {
     cost: number,
     modelName?: string | null,
     actualAccountId?: number,
+    streamTiming?: {
+      firstByteLatencyMs?: number | null;
+      completionTokens?: number | null;
+      isStream?: boolean | null;
+    },
   ) {
     await ensureSiteRuntimeHealthStateLoaded();
+    const quality = resolveStreamTimingQualityMetrics(latencyMs, streamTiming);
     const row = await db.select()
       .from(schema.routeChannels)
       .innerJoin(schema.accounts, eq(schema.routeChannels.accountId, schema.accounts.id))
@@ -2740,13 +2882,13 @@ export class TokenRouter {
           cooldownLevel: 0,
           updatedAt: nowIso,
         }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
-        recordSiteRuntimeSuccess(memberRow.account.siteId, latencyMs, modelName);
+        recordSiteRuntimeSuccess(memberRow.account.siteId, latencyMs, modelName, quality);
       } else {
-        recordSiteRuntimeSuccess(account.siteId, latencyMs, modelName);
+        recordSiteRuntimeSuccess(account.siteId, latencyMs, modelName, quality);
       }
       invalidateRouteScopedCache(ch.routeId);
     } else {
-      recordSiteRuntimeSuccess(account.siteId, latencyMs, modelName);
+      recordSiteRuntimeSuccess(account.siteId, latencyMs, modelName, quality);
     }
 
     await db.update(schema.routeChannels).set({
@@ -3838,7 +3980,16 @@ export class TokenRouter {
       };
     }
 
-    const { baseWeightFactor, valueScoreFactor, costWeight, balanceWeight, usageWeight } = config.routingWeights;
+    const {
+      baseWeightFactor,
+      valueScoreFactor,
+      costWeight,
+      balanceWeight,
+      usageWeight,
+      firstByteWeight,
+      speedWeight,
+      successWeight,
+    } = config.routingWeights;
     const resolveModelName = typeof modelName === 'function'
       ? modelName
       : (() => modelName);
@@ -3853,23 +4004,55 @@ export class TokenRouter {
         accountOauthProvider: candidate.account.oauthProvider,
       })
     ));
+    const siteHistoricalHealthMetrics = buildSiteHistoricalHealthMetrics(candidates);
 
-    const valueScores = candidates.map((c, i) => {
+    // Each value-score component is normalized into [0,1] BEFORE the weighted sum.
+    // The old raw-sum-then-min-max let one outlier (e.g. a balance quoted in
+    // dollars) stretch the whole field and swallow every other component. Quality
+    // components shrink toward the neutral score while samples are scarce, and the
+    // success-rate component reuses the confidence-blended stable-first resolution,
+    // so a fresh channel starts neutral instead of being flattened to zero and
+    // never earning the traffic that would produce evidence.
+    const componentScores = candidates.map((candidate, i) => {
       const unitCost = effectiveCosts[i]?.unitCost || 1;
-      const balance = c.account.balance || 0;
-      const totalUsed = (c.channel.successCount ?? 0) + (c.channel.failCount ?? 0);
+      const balance = candidate.account.balance || 0;
+      const totalUsed = (candidate.channel.successCount ?? 0) + (candidate.channel.failCount ?? 0);
       const recentUsage = Math.max(totalUsed, 1);
-      return costWeight * (1 / unitCost) + balanceWeight * balance + usageWeight * (1 / recentUsage);
+      const runtimeDetail = runtimeHealthDetails[i];
+      const firstByteScore = runtimeDetail.firstByteEmaMs != null
+        ? blendQualityComponentScore(
+          clampNumber(SITE_RUNTIME_LATENCY_BASELINE_MS / Math.max(1, runtimeDetail.firstByteEmaMs), 0, 1),
+          runtimeDetail.firstByteConfidence,
+        )
+        : NEUTRAL_VALUE_COMPONENT_SCORE;
+      const speedScore = runtimeDetail.tpsEma != null
+        ? blendQualityComponentScore(
+          clampNumber(runtimeDetail.tpsEma / SITE_RUNTIME_SPEED_TARGET_TPS, 0, 1),
+          runtimeDetail.tpsConfidence,
+        )
+        : NEUTRAL_VALUE_COMPONENT_SCORE;
+      const successScore = resolveStableFirstSuccessRate(
+        runtimeDetail,
+        siteHistoricalHealthMetrics.get(candidate.site.id)?.successRate,
+      );
+      return { unitCost, balance, recentUsage, firstByteScore, speedScore, successScore };
     });
+    const cheapestUnitCost = Math.min(...componentScores.map((c) => c.unitCost));
+    const maxBalance = Math.max(...componentScores.map((c) => c.balance), 0);
+    const leastRecentUsage = Math.min(...componentScores.map((c) => c.recentUsage));
 
-    const maxVS = Math.max(...valueScores, 0.001);
-    const minVS = Math.min(...valueScores, 0);
-    const range = maxVS - minVS || 1;
-    const normalizedVS = valueScores.map((v) => (v - minVS) / range);
+    const valueScores = componentScores.map((c) => (
+      costWeight * clampNumber(cheapestUnitCost / c.unitCost, 0, 1)
+      + balanceWeight * (maxBalance > 0 ? clampNumber(c.balance / maxBalance, 0, 1) : NEUTRAL_VALUE_COMPONENT_SCORE)
+      + usageWeight * clampNumber(leastRecentUsage / c.recentUsage, 0, 1)
+      + firstByteWeight * c.firstByteScore
+      + speedWeight * c.speedScore
+      + successWeight * c.successScore
+    ));
 
     const baseContributions = candidates.map((c, i) => {
       const weight = c.channel.weight ?? 10;
-      return (weight + 10) * (baseWeightFactor + normalizedVS[i] * valueScoreFactor);
+      return (weight + 10) * (baseWeightFactor + valueScores[i] * valueScoreFactor);
     });
 
     // Avoid over-favoring a site that has many tokens/channels for the same route.
@@ -3878,7 +4061,6 @@ export class TokenRouter {
     for (const candidate of candidates) {
       siteChannelCounts.set(candidate.site.id, (siteChannelCounts.get(candidate.site.id) || 0) + 1);
     }
-    const siteHistoricalHealthMetrics = buildSiteHistoricalHealthMetrics(candidates);
 
     const contributions = candidates.map((candidate, i) => {
       const siteChannels = Math.max(1, siteChannelCounts.get(candidate.site.id) || 1);
@@ -3911,7 +4093,11 @@ export class TokenRouter {
       }
 
       contribution *= runtimeMultiplier;
-      contribution *= siteHistoricalHealthMetrics.get(candidate.site.id)?.multiplier ?? 1;
+      // Historical health (success rate + average latency) no longer damps the
+      // weighted contribution: both signals moved into the value score as explicit,
+      // user-tunable components, and multiplying them here would double-count every
+      // failure and every slow response. The stable-first branch still consumes the
+      // historical success rate through resolveStableFirstSuccessRate.
       contribution *= runtimeLoadMultiplier;
 
       // If upstream price is unknown and we are using fallback unit cost,
@@ -3960,13 +4146,9 @@ export class TokenRouter {
       const combinedSiteWeight = siteGlobalWeight * normalizedDownstreamSiteMultiplier;
       const siteRuntimeDetail = runtimeHealthDetails[i];
       const siteHistoricalHealth = siteHistoricalHealthMetrics.get(candidate.site.id);
-      const siteHistoricalMultiplier = siteHistoricalHealth?.multiplier ?? 1;
       const historicalSuccessRateText = siteHistoricalHealth?.successRate == null
         ? '—'
         : `${(siteHistoricalHealth.successRate * 100).toFixed(1)}%`;
-      const historicalLatencyText = siteHistoricalHealth?.avgLatencyMs == null
-        ? '—'
-        : `${siteHistoricalHealth.avgLatencyMs}ms`;
       const channelRuntimeLoad = channelLoadSnapshots[i];
       const runtimeHealthText = siteRuntimeDetail.modelKey
         ? `${siteRuntimeDetail.combinedMultiplier.toFixed(2)}（站点=${siteRuntimeDetail.globalMultiplier.toFixed(2)}，模型=${siteRuntimeDetail.modelMultiplier.toFixed(2)}）`
@@ -3975,6 +4157,13 @@ export class TokenRouter {
       const recentSuccessRateText = `${(siteRuntimeDetail.recentSuccessRate * 100).toFixed(1)}%`;
       const stableFirstSuccessRate = resolveStableFirstSuccessRate(siteRuntimeDetail, siteHistoricalHealth?.successRate);
       const stableFirstSuccessRateText = `${(stableFirstSuccessRate * 100).toFixed(1)}%`;
+      const firstByteEmaText = siteRuntimeDetail.firstByteEmaMs == null
+        ? '—'
+        : `${siteRuntimeDetail.firstByteEmaMs}ms`;
+      const tpsEmaText = siteRuntimeDetail.tpsEma == null
+        ? '—'
+        : `${siteRuntimeDetail.tpsEma.toFixed(1)}tps`;
+      const valueScoreText = valueScores[i].toFixed(3);
       const stableSiteOrder = this.getStableFirstSiteOrder(candidates, candidate.site.id);
       const reasonPrefix = selectionMode === 'stable_first'
         ? (
@@ -3997,8 +4186,8 @@ export class TokenRouter {
           ? `${reasonPrefix}，近期成功率=${recentSuccessRateText}（样本=${siteRuntimeDetail.recentSampleCount.toFixed(2)}，置信=${siteRuntimeDetail.recentConfidence.toFixed(2)}），回退成功率=${historicalSuccessRateText}，综合近期成功率=${stableFirstSuccessRateText}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，同站点通道=${siteChannels}${stablePoolText}，评分占比≈${(probability * 100).toFixed(1)}%）`
           : (
             candidates.length === 1
-              ? `${reasonPrefix}，W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，历史健康=${siteHistoricalMultiplier.toFixed(2)}（成功率=${historicalSuccessRateText}，均延迟=${historicalLatencyText}，样本=${siteHistoricalHealth?.totalCalls ?? 0}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
-              : `按权重随机（W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，历史健康=${siteHistoricalMultiplier.toFixed(2)}（成功率=${historicalSuccessRateText}，均延迟=${historicalLatencyText}，样本=${siteHistoricalHealth?.totalCalls ?? 0}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
+              ? `${reasonPrefix}，W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，价值分=${valueScoreText}（首字=${firstByteEmaText}，速度=${tpsEmaText}，成功率=${stableFirstSuccessRateText}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
+              : `按权重随机（W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，价值分=${valueScoreText}（首字=${firstByteEmaText}，速度=${tpsEmaText}，成功率=${stableFirstSuccessRateText}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
           ),
       };
     });

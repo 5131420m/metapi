@@ -752,6 +752,9 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
         costWeight: toPositiveNumberOrFallback(rw.costWeight, config.routingWeights.costWeight),
         balanceWeight: toPositiveNumberOrFallback(rw.balanceWeight, config.routingWeights.balanceWeight),
         usageWeight: toPositiveNumberOrFallback(rw.usageWeight, config.routingWeights.usageWeight),
+        firstByteWeight: toPositiveNumberOrFallback(rw.firstByteWeight, config.routingWeights.firstByteWeight),
+        speedWeight: toPositiveNumberOrFallback(rw.speedWeight, config.routingWeights.speedWeight),
+        successWeight: toPositiveNumberOrFallback(rw.successWeight, config.routingWeights.successWeight),
       };
       return;
     }
@@ -1919,6 +1922,9 @@ export async function settingsRoutes(app: FastifyInstance) {
         costWeight: toPositiveNumberOrFallback(body.routingWeights.costWeight, config.routingWeights.costWeight),
         balanceWeight: toPositiveNumberOrFallback(body.routingWeights.balanceWeight, config.routingWeights.balanceWeight),
         usageWeight: toPositiveNumberOrFallback(body.routingWeights.usageWeight, config.routingWeights.usageWeight),
+        firstByteWeight: toPositiveNumberOrFallback(body.routingWeights.firstByteWeight, config.routingWeights.firstByteWeight),
+        speedWeight: toPositiveNumberOrFallback(body.routingWeights.speedWeight, config.routingWeights.speedWeight),
+        successWeight: toPositiveNumberOrFallback(body.routingWeights.successWeight, config.routingWeights.successWeight),
       };
       if (JSON.stringify(nextWeights) !== JSON.stringify(config.routingWeights)) {
         changedLabels.push('路由权重');

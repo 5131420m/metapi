@@ -121,7 +121,7 @@ export async function videosProxyRoute(app: FastifyInstance) {
       const startTime = Date.now();
 
       try {
-        const { upstream, text, baseUrl } = await runWithSiteApiEndpointPool(selected.site, async (target) => {
+        const { upstream, text, baseUrl, firstByteLatencyMs } = await runWithSiteApiEndpointPool(selected.site, async (target) => {
           const attemptStartedAtMs = Date.now();
           const targetUrl = buildUpstreamUrl(target.baseUrl, '/v1/videos');
           const accountProxy = getProxyUrlFromExtraConfig(selected.account.extraConfig);
@@ -215,7 +215,10 @@ export async function videosProxyRoute(app: FastifyInstance) {
           totalTokens: 0,
         });
         await recordTokenRouterEventBestEffort('record channel success', () => (
-          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel)
+          tokenRouter.recordSuccess(selected.channel.id, latency, estimatedCost, upstreamModel, undefined, {
+            firstByteLatencyMs,
+            isStream: false,
+          })
         ));
         recordDownstreamCostUsage(request, estimatedCost);
         return reply.code(upstream.status).send(rewriteVideoResponsePublicId(data, mapping.publicId));

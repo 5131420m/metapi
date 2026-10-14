@@ -357,6 +357,9 @@ export type RuntimeRoutingWeightsPayload = {
   costWeight?: number;
   balanceWeight?: number;
   usageWeight?: number;
+  firstByteWeight?: number;
+  speedWeight?: number;
+  successWeight?: number;
 };
 
 export type RuntimeSettingsPayload = {

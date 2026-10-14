@@ -1424,7 +1424,11 @@ describe('selectSurfaceChannelForAttempt', () => {
         usageSource: 'self-log',
       },
     });
-    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0.42, 'upstream-model');
+    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0.42, 'upstream-model', undefined, {
+      completionTokens: 8,
+      firstByteLatencyMs: null,
+      isStream: null,
+    });
     expect(recordDownstreamCost).toHaveBeenCalledWith(0.42);
     expect(logSuccess).toHaveBeenCalledWith({
       selected: {
@@ -1607,7 +1611,11 @@ describe('selectSurfaceChannelForAttempt', () => {
       '[proxy/chat] failed to record success metrics',
       expect.any(Error),
     );
-    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0, 'upstream-model');
+    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0, 'upstream-model', undefined, {
+      completionTokens: 5,
+      firstByteLatencyMs: null,
+      isStream: null,
+    });
     expect(recordDownstreamCost).toHaveBeenCalledWith(0);
     expect(logSuccess).toHaveBeenCalledWith(expect.objectContaining({
       promptTokens: 10,

@@ -174,6 +174,11 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
       costWeight: parseNumber(env.COST_WEIGHT, 0.4),
       balanceWeight: parseNumber(env.BALANCE_WEIGHT, 0.3),
       usageWeight: parseNumber(env.USAGE_WEIGHT, 0.3),
+      // Quality components of the weighted value score. Default 0 keeps upgraded
+      // installations behavior-identical until an operator opts in via a preset.
+      firstByteWeight: parseNumber(env.FIRST_BYTE_WEIGHT, 0),
+      speedWeight: parseNumber(env.SPEED_WEIGHT, 0),
+      successWeight: parseNumber(env.SUCCESS_WEIGHT, 0),
     },
   };
 }
