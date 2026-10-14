@@ -1,2 +1,2 @@
-ALTER TABLE `sites` ADD COLUMN `custom_headers_override_request_headers` BOOLEAN DEFAULT true;
-ALTER TABLE `sites` ADD COLUMN `max_concurrency` INT NOT NULL DEFAULT 0;
+ALTER TABLE `oauth_route_unit_members` ADD COLUMN `cooldown_source` TEXT;
+ALTER TABLE `route_channels` ADD COLUMN `cooldown_source` TEXT;

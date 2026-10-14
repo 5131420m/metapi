@@ -8,7 +8,7 @@ export interface RouteGroupingSchemaInspector {
 }
 
 export type RouteGroupingColumnCompatibilitySpec = {
-  table: 'token_routes' | 'route_channels';
+  table: 'token_routes' | 'route_channels' | 'oauth_route_unit_members';
   column: string;
   addSql: Record<RouteGroupingSchemaDialect, string>;
 };
@@ -107,6 +107,24 @@ export const ROUTE_GROUPING_COLUMN_COMPATIBILITY_SPECS: RouteGroupingColumnCompa
       sqlite: 'ALTER TABLE route_channels ADD COLUMN cooldown_level integer NOT NULL DEFAULT 0;',
       mysql: 'ALTER TABLE `route_channels` ADD COLUMN `cooldown_level` INT NOT NULL DEFAULT 0',
       postgres: 'ALTER TABLE "route_channels" ADD COLUMN "cooldown_level" INTEGER NOT NULL DEFAULT 0',
+    },
+  },
+  {
+    table: 'route_channels',
+    column: 'cooldown_source',
+    addSql: {
+      sqlite: 'ALTER TABLE route_channels ADD COLUMN cooldown_source text;',
+      mysql: 'ALTER TABLE `route_channels` ADD COLUMN `cooldown_source` TEXT NULL',
+      postgres: 'ALTER TABLE "route_channels" ADD COLUMN "cooldown_source" TEXT',
+    },
+  },
+  {
+    table: 'oauth_route_unit_members',
+    column: 'cooldown_source',
+    addSql: {
+      sqlite: 'ALTER TABLE oauth_route_unit_members ADD COLUMN cooldown_source text;',
+      mysql: 'ALTER TABLE `oauth_route_unit_members` ADD COLUMN `cooldown_source` TEXT NULL',
+      postgres: 'ALTER TABLE "oauth_route_unit_members" ADD COLUMN "cooldown_source" TEXT',
     },
   },
 ];

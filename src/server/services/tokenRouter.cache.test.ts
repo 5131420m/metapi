@@ -486,7 +486,10 @@ describe('TokenRouter runtime cache', () => {
 
     expect(cooldownMs).toBeGreaterThanOrEqual(4 * 60 * 1000);
     expect(cooldownMs).toBeLessThanOrEqual(6 * 60 * 1000);
-    expect(record?.failCount).toBe(0);
+    // The rate limit is counted as the failure it was, and the cooldown states its own
+    // origin instead of encoding it as failCount === 0.
+    expect(record?.failCount).toBe(1);
+    expect(record?.cooldownSource).toBe('provider_quota');
   });
 
   it('keeps generic 429 backoff when the error is not limit-related', async () => {
@@ -893,6 +896,10 @@ describe('TokenRouter runtime cache', () => {
       weight: 10,
       enabled: true,
       failCount: 57,
+      // The backoff escalates on the CONSECUTIVE streak, so that is what has to be deep
+      // to reach the Fibonacci range this test guards. The lifetime failCount is kept
+      // alongside it only to show it no longer drives the duration.
+      consecutiveFailCount: 57,
     }).returning().get();
 
     // Weighted routes previously let Fibonacci backoff grow beyond the Date range.
@@ -906,8 +913,64 @@ describe('TokenRouter runtime cache', () => {
     const cooldownMs = Date.parse(String(current?.cooldownUntil || '')) - startedAt;
 
     expect(current?.failCount).toBe(58);
+    expect(current?.consecutiveFailCount).toBe(58);
     expect(Number.isFinite(Date.parse(String(current?.cooldownUntil || '')))).toBe(true);
     expect(cooldownMs).toBeGreaterThanOrEqual((30 * 24 * 60 * 60 - 5) * 1000);
     expect(cooldownMs).toBeLessThanOrEqual((30 * 24 * 60 * 60 + 5) * 1000);
+  });
+
+  it('keeps a long-serving channel out of the deep backoff when it has no active streak', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'weighted-no-streak-site',
+      url: 'https://weighted-no-streak.example.com',
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'weighted-no-streak-user',
+      accessToken: 'weighted-no-streak-access-token',
+      apiToken: 'weighted-no-streak-api-token',
+      status: 'active',
+    }).returning().get();
+
+    const token = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'weighted-no-streak-token',
+      token: 'sk-weighted-no-streak-token',
+      enabled: true,
+      isDefault: true,
+    }).returning().get();
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.4',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: account.id,
+      tokenId: token.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      failCount: 57,
+      consecutiveFailCount: 0,
+    }).returning().get();
+
+    const router = new TokenRouter();
+    const startedAt = Date.now();
+    await router.recordFailure(channel.id);
+    const current = await db.select().from(schema.routeChannels)
+      .where(eq(schema.routeChannels.id, channel.id))
+      .get();
+    const cooldownMs = Date.parse(String(current?.cooldownUntil || '')) - startedAt;
+
+    // One hiccup after a long healthy run is the FIRST backoff step, not the 30-day cap.
+    expect(current?.consecutiveFailCount).toBe(1);
+    expect(cooldownMs).toBeGreaterThanOrEqual(10_000);
+    expect(cooldownMs).toBeLessThanOrEqual(25_000);
   });
 });

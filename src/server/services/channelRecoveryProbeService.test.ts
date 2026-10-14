@@ -81,7 +81,14 @@ describe('channelRecoveryProbeService', () => {
     resetProxyChannelCoordinatorState();
     invalidateTokenRouterCache();
     resetSiteRuntimeHealthState();
-    rmSync(dataDir, { recursive: true, force: true });
+    // Best-effort: on Windows the SQLite handle is still open at teardown, so removing the
+    // temp dir raises EPERM and would fail the whole suite over a stale scratch directory
+    // the OS reclaims anyway. Other suites here simply leave theirs behind.
+    try {
+      rmSync(dataDir, { recursive: true, force: true });
+    } catch {
+      // ignore: the temp directory outliving the run is harmless
+    }
     if (originalDataDir === undefined) {
       delete process.env.DATA_DIR;
     } else {
@@ -240,6 +247,8 @@ describe('channelRecoveryProbeService', () => {
       enabled: true,
     }).returning().get();
 
+    // Legacy rows: written before cooldown_source existed, so the sweep has to fall back
+    // to the old implicit signal (cooling with every failure counter at zero).
     await db.insert(schema.routeChannels).values([
       {
         routeId: route.id,
@@ -270,6 +279,84 @@ describe('channelRecoveryProbeService', () => {
     expect(probeRuntimeModelMock).toHaveBeenCalledTimes(1);
     expect(probeRuntimeModelMock.mock.calls[0]?.[0]).toMatchObject({
       tokenValue: 'sk-retry-token',
+      modelName: 'gpt-5.4',
+    });
+  });
+
+  it('classifies cooldowns by recorded source rather than by counter shape', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'source-site',
+      url: 'https://source-site.example.com',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+
+    const account = await db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: 'source-user',
+      accessToken: 'access-source',
+      apiToken: 'sk-source',
+      status: 'active',
+    }).returning().get();
+
+    const quotaToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'source-quota-token',
+      token: 'sk-source-quota-token',
+      enabled: true,
+      isDefault: false,
+    }).returning().get();
+
+    const backoffToken = await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'source-backoff-token',
+      token: 'sk-source-backoff-token',
+      enabled: true,
+      isDefault: false,
+    }).returning().get();
+
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.4',
+      enabled: true,
+    }).returning().get();
+
+    const cooldownUntil = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    await db.insert(schema.routeChannels).values([
+      {
+        routeId: route.id,
+        accountId: account.id,
+        tokenId: quotaToken.id,
+        enabled: true,
+        cooldownUntil,
+        lastFailAt: new Date().toISOString(),
+        // Non-zero counters: under the old implicit rule this looked like our own backoff
+        // and would have been probed, re-hitting a window the provider set.
+        failCount: 3,
+        consecutiveFailCount: 2,
+        cooldownLevel: 1,
+        cooldownSource: 'provider_quota',
+      },
+      {
+        routeId: route.id,
+        accountId: account.id,
+        tokenId: backoffToken.id,
+        enabled: true,
+        cooldownUntil,
+        lastFailAt: new Date().toISOString(),
+        // All-zero counters: the old rule would have mistaken this for provider-directed
+        // and skipped a channel a probe is allowed to recover early.
+        failCount: 0,
+        consecutiveFailCount: 0,
+        cooldownLevel: 0,
+        cooldownSource: 'metapi_backoff',
+      },
+    ]).run();
+
+    await runChannelRecoveryProbeSweep();
+
+    expect(probeRuntimeModelMock).toHaveBeenCalledTimes(1);
+    expect(probeRuntimeModelMock.mock.calls[0]?.[0]).toMatchObject({
+      tokenValue: 'sk-source-backoff-token',
       modelName: 'gpt-5.4',
     });
   });

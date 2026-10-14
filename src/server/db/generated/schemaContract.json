@@ -817,6 +817,12 @@
           "notNull": false,
           "defaultValue": "datetime('now')",
           "primaryKey": false
+        },
+        "cooldown_source": {
+          "logicalType": "text",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
         }
       }
     },
@@ -1586,6 +1592,12 @@
         },
         "oauth_route_unit_id": {
           "logicalType": "integer",
+          "notNull": false,
+          "defaultValue": null,
+          "primaryKey": false
+        },
+        "cooldown_source": {
+          "logicalType": "text",
           "notNull": false,
           "defaultValue": null,
           "primaryKey": false

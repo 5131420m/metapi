@@ -1,4 +1,4 @@
-﻿import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { upsertSetting } from '../db/upsertSetting.js';
 import {
@@ -67,6 +67,7 @@ interface SelectedChannel {
 
 type FailureAwareChannel = {
   failCount?: number | null;
+  consecutiveFailCount?: number | null;
   lastFailAt?: string | null;
 };
 
@@ -94,8 +95,95 @@ type SiteRuntimeHealthState = {
 
 const FAILURE_BACKOFF_BASE_SEC = 15;
 const SHORT_WINDOW_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
+/**
+ * Fallback cooldown for a 429 the upstream scoped to a per-minute window (RPM/TPM).
+ *
+ * Half the window: long enough that a fixed per-minute bucket has probably rolled over
+ * and a sliding one has drained most of the way, short enough that the channel does not
+ * sit out the ~10 further windows the 5-minute plan-quota fallback would cost it. A
+ * channel that is still throttled when it comes back simply earns another cooldown, and
+ * the jitter keeps siblings from retrying in lockstep.
+ */
+const PER_MINUTE_LIMIT_COOLDOWN_MS = 30 * 1000;
 // Keep weighted-route backoff within the JavaScript Date range when fail counts grow large.
 const MAX_FAILURE_BACKOFF_SEC = 30 * 24 * 60 * 60;
+/**
+ * De-correlating jitter added to every cooldown Metapi computes itself (Fibonacci backoff,
+ * round-robin tiers, the short-window limit fallback).
+ *
+ * Without it, N channels sharing one upstream group are rate-limited by the same traffic
+ * burst, get the same `now + duration`, and therefore thaw in the same millisecond — the
+ * retry wave then re-trips the same limit, which is a textbook thundering herd. The jitter
+ * is positive-only: shortening a cooldown would weaken the protection window the failure
+ * just earned.
+ *
+ * The spread is `ratio` of the duration but never more than `MAX_MS`, because the two
+ * numbers answer different questions. The ratio keeps the jitter meaningful for a short
+ * backoff (a 15s cooldown gets ~2s), while the absolute cap keeps a long cooldown a
+ * *named tier*: a pure ratio would stretch the 24h round-robin tier to as much as 27.6h,
+ * so "level 3 means one day" would stop being true and the tier boundaries would blur
+ * into each other. De-correlation only needs the thaw instants to stop coinciding, and
+ * tens of seconds of spread does that at any tier length.
+ *
+ * A cooldown dictated by the upstream itself (a codex `resets_at` / `resets_in_seconds`
+ * hint, or a stored quota reset) is NOT jittered — that timestamp is authoritative and is
+ * stored verbatim.
+ */
+const FAILURE_COOLDOWN_JITTER_RATIO = 0.15;
+const FAILURE_COOLDOWN_JITTER_MAX_MS = 30_000;
+/**
+ * Upper bound of the soft-avoidance preference window (see `isChannelRecentlyFailed`).
+ *
+ * Ten minutes is a routing-decision timescale: long enough to steer traffic away from a
+ * channel that is visibly struggling, short enough that the hint cannot outlive its own
+ * relevance. Exclusion past this point is the hard cooldown's job, not a preference's.
+ */
+const SOFT_AVOIDANCE_MAX_MS = 10 * 60 * 1000;
+
+/**
+ * Why a channel is cooling, recorded on the row instead of being inferred from the shape
+ * of its counters.
+ *
+ * `PROVIDER_QUOTA` means the upstream dictated the window (a 429 usage/rate limit, or an
+ * explicit reset hint). Such a cooldown must be waited out: probing it early achieves
+ * nothing and looks like abuse to the provider. `METAPI_BACKOFF` is our own failure
+ * escalation, which a successful recovery probe is allowed to cut short.
+ */
+export const COOLDOWN_SOURCE_PROVIDER_QUOTA = 'provider_quota';
+export const COOLDOWN_SOURCE_METAPI_BACKOFF = 'metapi_backoff';
+
+export type CooldownSource =
+  | typeof COOLDOWN_SOURCE_PROVIDER_QUOTA
+  | typeof COOLDOWN_SOURCE_METAPI_BACKOFF;
+
+type CooldownSourceAwareChannel = {
+  cooldownUntil?: string | null;
+  cooldownSource?: string | null;
+  failCount?: number | null;
+  consecutiveFailCount?: number | null;
+  cooldownLevel?: number | null;
+};
+
+/**
+ * Whether a cooling channel was put there by the upstream rather than by our own backoff.
+ *
+ * Reads the stated `cooldownSource`. A row that predates that column (or arrives from a
+ * partial restore) carries null, and only then does this fall back to the old implicit
+ * signal — "cooling with all failure counters at zero" — so an upgrade does not suddenly
+ * start probing provider-quota channels. New writes always state the source, so the
+ * fallback is a compatibility shim, not the contract.
+ */
+export function isProviderDirectedCooldown(channel: CooldownSourceAwareChannel): boolean {
+  if (!channel.cooldownUntil) return false;
+
+  const source = (channel.cooldownSource || '').trim();
+  if (source) return source === COOLDOWN_SOURCE_PROVIDER_QUOTA;
+
+  return (channel.failCount ?? 0) <= 0
+    && (channel.consecutiveFailCount ?? 0) <= 0
+    && (channel.cooldownLevel ?? 0) <= 0;
+}
+
 const MIN_EFFECTIVE_UNIT_COST = 1e-6;
 const ROUND_ROBIN_FAILURE_THRESHOLD = 3;
 const ROUND_ROBIN_COOLDOWN_LEVELS_SEC = [0, 10 * 60, 60 * 60, 24 * 60 * 60] as const;
@@ -185,6 +273,23 @@ const USAGE_LIMIT_RATE_LIMIT_PATTERNS: RegExp[] = [
   /quota\s+exceeded/i,
   /rate\s+limit/i,
   /\blimit\b/i,
+];
+
+/**
+ * A 429 whose limit is scoped to a MINUTE (an RPM/TPM throttle) is a different animal
+ * from a plan quota: the window it belongs to drains on its own within sixty seconds.
+ *
+ * Both arrive as "429 + something limit-shaped", so without this distinction they share
+ * one 5-minute fallback and a channel throttled for one second of burst traffic sits out
+ * roughly ten windows it could already have served. These patterns recognise the upstream
+ * saying "per minute" so the cooldown can match the window the provider actually used.
+ */
+const PER_MINUTE_RATE_LIMIT_PATTERNS: RegExp[] = [
+  /per[-\s]?min(?:ute)?\b/i,
+  /\b(?:rpm|tpm)\b/i,
+  /\d+\s*\/\s*min(?:ute)?\b/i,
+  /minute\s+limit/i,
+  /每分钟/,
 ];
 
 type SiteRuntimeHealthPersistencePayload = {
@@ -323,10 +428,34 @@ function fibonacciNumber(index: number): number {
 /**
  * Weighted-route failures use a Fibonacci backoff, but the resulting cooldown must stay
  * representable as a JavaScript Date for downstream `toISOString()` calls.
+ *
+ * The exponent is the CONSECUTIVE failure streak, not the lifetime `failCount`.
+ * `failCount` is a cumulative statistic that only ever grows (a success does not decrement
+ * it), so using it as the Fibonacci index made the backoff a function of how long a
+ * channel had been in service rather than how unhealthy it is now: a workhorse with 57
+ * historical failures and a 100% recent success rate drew the 30-day ceiling on its next
+ * single hiccup. The streak resets to 0 on success, so the backoff grows while a channel
+ * is genuinely failing and starts over once it proves itself.
  */
-function resolveFailureBackoffSec(failCount?: number | null): number {
-  const normalizedFailCount = Math.max(1, Math.trunc(failCount ?? 0));
-  return Math.min(FAILURE_BACKOFF_BASE_SEC * fibonacciNumber(normalizedFailCount), MAX_FAILURE_BACKOFF_SEC);
+function resolveFailureBackoffSec(consecutiveFailCount?: number | null): number {
+  const normalizedStreak = Math.max(1, Math.trunc(consecutiveFailCount ?? 0));
+  return Math.min(FAILURE_BACKOFF_BASE_SEC * fibonacciNumber(normalizedStreak), MAX_FAILURE_BACKOFF_SEC);
+}
+
+/**
+ * The failure streak a channel's backoff and soft-avoidance window are computed from.
+ *
+ * Falls back to `failCount` only when the streak column is absent (a legacy row written
+ * before `consecutive_fail_count` existed, or a partial restore), so such a row degrades
+ * to the old behaviour instead of silently losing its backoff entirely.
+ */
+function resolveChannelFailureStreak(channel: FailureAwareChannel): number {
+  const streak = Math.trunc(channel.consecutiveFailCount ?? 0);
+  if (streak > 0) return streak;
+  if (channel.consecutiveFailCount == null) {
+    return Math.max(0, Math.trunc(channel.failCount ?? 0));
+  }
+  return 0;
 }
 
 function resolveConfiguredFailureCooldownMaxMs(): number {
@@ -340,8 +469,45 @@ function clampFailureCooldownMs(cooldownMs: number): number {
   return Math.min(normalized, resolveConfiguredFailureCooldownMaxMs());
 }
 
-function resolveEffectiveFailureCooldownMs(failCount?: number | null): number {
-  return clampFailureCooldownMs(resolveFailureBackoffSec(failCount) * 1000);
+/**
+ * Ceiling for the soft-avoidance window (see `isChannelRecentlyFailed`).
+ *
+ * Deliberately NOT the configured hard-cooldown cap: a preference hint that outlives the
+ * routing decisions it informs is just a stale ranking. It also never exceeds the hard
+ * cap, because preferring against a channel for longer than it could be cooled would
+ * invert the two mechanisms' severity.
+ */
+function clampSoftAvoidanceMs(avoidMs: number): number {
+  const normalized = Math.max(0, Math.trunc(avoidMs));
+  return Math.min(normalized, SOFT_AVOIDANCE_MAX_MS, resolveConfiguredFailureCooldownMaxMs());
+}
+
+/**
+ * Source of the jitter fraction, injectable so tests can pin the random draw instead of
+ * asserting on a range and hoping. Production always reads `Math.random`.
+ */
+let failureCooldownJitterSource: () => number = Math.random;
+
+/**
+ * Spreads same-instant cooldowns apart so sibling channels do not thaw together.
+ *
+ * Applied BEFORE `clampFailureCooldownMs` on purpose: the configured cap is a hard
+ * ceiling the operator set, so jitter must never push a cooldown past it.
+ */
+function applyFailureCooldownJitter(cooldownMs: number): number {
+  const normalized = Math.max(0, Math.trunc(cooldownMs));
+  if (normalized <= 0) return 0;
+  const spreadMs = Math.min(normalized * FAILURE_COOLDOWN_JITTER_RATIO, FAILURE_COOLDOWN_JITTER_MAX_MS);
+  const fraction = clampNumber(failureCooldownJitterSource(), 0, 1);
+  return normalized + Math.trunc(spreadMs * fraction);
+}
+
+function resolveJitteredFailureCooldownMs(cooldownMs: number): number {
+  return clampFailureCooldownMs(applyFailureCooldownJitter(cooldownMs));
+}
+
+function resolveEffectiveFailureCooldownMs(consecutiveFailCount?: number | null): number {
+  return resolveJitteredFailureCooldownMs(resolveFailureBackoffSec(consecutiveFailCount) * 1000);
 }
 
 function resolveRoundRobinCooldownSec(level: number): number {
@@ -364,6 +530,16 @@ function isUsageLimitRateLimitFailure(context: SiteRuntimeFailureContext = {}): 
   const status = typeof context.status === 'number' ? context.status : 0;
   if (status !== 429) return false;
   return matchesAnyPattern(USAGE_LIMIT_RATE_LIMIT_PATTERNS, context.errorText);
+}
+
+/**
+ * True when the upstream named a per-minute window for the limit it just enforced.
+ *
+ * Only consulted for a failure already classified as a usage/rate limit, so this answers
+ * "which window?" and never "is this a limit?".
+ */
+function isPerMinuteRateLimitFailure(context: SiteRuntimeFailureContext = {}): boolean {
+  return matchesAnyPattern(PER_MINUTE_RATE_LIMIT_PATTERNS, context.errorText);
 }
 
 function isModelScopedRuntimeFailure(context: SiteRuntimeFailureContext = {}): boolean {
@@ -570,12 +746,22 @@ function resolveShortWindowLimitCooldown(
   const errorText = (context.errorText || '').trim();
   if (!isUsageLimitRateLimitFailure({ status, errorText })) return null;
 
+  // Upstream-dictated reset instants are authoritative: keep them verbatim rather than
+  // jittering them, so the channel comes back exactly when the provider says it may.
+  // This hint describes THIS failure, so it outranks the per-minute heuristic below.
   const resetHint = parseCodexQuotaResetHint(status, errorText, nowMs);
   if (resetHint) {
     const hintMs = Date.parse(resetHint.resetAt);
     if (Number.isFinite(hintMs) && hintMs > nowMs) {
       return new Date(hintMs).toISOString();
     }
+  }
+
+  // Checked BEFORE the stored quota reset: that stored instant is a previously observed
+  // 5h/7d plan-window reset, so honouring it for a failure the upstream just scoped to a
+  // minute would park the channel for hours over a throttle that clears in seconds.
+  if (isPerMinuteRateLimitFailure({ status, errorText })) {
+    return new Date(nowMs + applyFailureCooldownJitter(PER_MINUTE_LIMIT_COOLDOWN_MS)).toISOString();
   }
 
   const oauth = getOauthInfoFromAccount(account);
@@ -587,7 +773,9 @@ function resolveShortWindowLimitCooldown(
     }
   }
 
-  return new Date(nowMs + SHORT_WINDOW_LIMIT_COOLDOWN_MS).toISOString();
+  // No reset information from upstream: this duration is Metapi's own guess, so it carries
+  // jitter to keep sibling channels of the same upstream group from thawing in lockstep.
+  return new Date(nowMs + applyFailureCooldownJitter(SHORT_WINDOW_LIMIT_COOLDOWN_MS)).toISOString();
 }
 
 function getDecayedSiteRuntimePenalty(state: SiteRuntimeHealthState, nowMs: number): number {
@@ -1277,14 +1465,27 @@ function isSiteDisabled(status?: string | null): boolean {
   return (status || 'active') === 'disabled';
 }
 
+/**
+ * Soft avoidance: a channel that failed this recently is deprioritised while a healthy
+ * sibling exists, but it is NOT excluded — `filterRecentlyFailedCandidates` hands the
+ * whole pool back when every candidate is in this state.
+ *
+ * This window is clamped by its own ceiling rather than the hard-cooldown ceiling, which
+ * is the operator's answer to a different question. `tokenRouterFailureCooldownMaxSec`
+ * bounds how long a channel may be taken OUT of rotation; raising it to tolerate long
+ * provider quota windows used to also stretch this preference window to the same length,
+ * so a single failure could make a channel the last resort for days even though it was
+ * never actually cooling. Keeping the two apart lets a long hard cap coexist with a
+ * preference hint that expires on a routing-decision timescale.
+ */
 export function isChannelRecentlyFailed(
   channel: FailureAwareChannel,
   nowMs = Date.now(),
-  avoidSec = resolveFailureBackoffSec(channel.failCount),
+  avoidSec = resolveFailureBackoffSec(resolveChannelFailureStreak(channel)),
 ): boolean {
-  const avoidMs = clampFailureCooldownMs(avoidSec * 1000);
+  const avoidMs = clampSoftAvoidanceMs(avoidSec * 1000);
   if (avoidMs <= 0) return false;
-  if ((channel.failCount ?? 0) <= 0) return false;
+  if (resolveChannelFailureStreak(channel) <= 0) return false;
   if (!channel.lastFailAt) return false;
 
   const failTs = Date.parse(channel.lastFailAt);
@@ -2184,7 +2385,7 @@ export class TokenRouter {
           const target = candidateMap.get(row.channel.id);
           if (!target) continue;
           target.avoidedByRecentFailure = true;
-          target.reason = `最近失败，优先避让（${resolveFailureBackoffSec(row.channel.failCount)} 秒窗口）`;
+          target.reason = `最近失败，优先避让（${resolveFailureBackoffSec(resolveChannelFailureStreak(row.channel))} 秒窗口）`;
         }
       }
 
@@ -2367,7 +2568,7 @@ export class TokenRouter {
           const target = candidateMap.get(row.channel.id);
           if (!target) continue;
           target.avoidedByRecentFailure = true;
-          target.reason = `最近失败，优先避让（${resolveFailureBackoffSec(row.channel.failCount)} 秒窗口）`;
+          target.reason = `最近失败，优先避让（${resolveFailureBackoffSec(resolveChannelFailureStreak(row.channel))} 秒窗口）`;
         }
       }
 
@@ -2533,6 +2734,7 @@ export class TokenRouter {
           totalCost: memberTotalCost,
           lastUsedAt: nowIso,
           cooldownUntil: null,
+          cooldownSource: null,
           lastFailAt: null,
           consecutiveFailCount: 0,
           cooldownLevel: 0,
@@ -2553,6 +2755,7 @@ export class TokenRouter {
       totalCost: nextTotalCost,
       lastUsedAt: nowIso,
       cooldownUntil: null,
+      cooldownSource: null,
       lastFailAt: null,
       consecutiveFailCount: 0,
       cooldownLevel: 0,
@@ -2564,6 +2767,7 @@ export class TokenRouter {
       channel.totalCost = nextTotalCost;
       channel.lastUsedAt = nowIso;
       channel.cooldownUntil = null;
+      channel.cooldownSource = null;
       channel.lastFailAt = null;
       channel.consecutiveFailCount = 0;
       channel.cooldownLevel = 0;
@@ -2605,6 +2809,7 @@ export class TokenRouter {
       if (memberRow) {
         await db.update(schema.oauthRouteUnitMembers).set({
           cooldownUntil: null,
+          cooldownSource: null,
           lastFailAt: null,
           consecutiveFailCount: 0,
           cooldownLevel: 0,
@@ -2617,12 +2822,14 @@ export class TokenRouter {
 
       await db.update(schema.routeChannels).set({
         cooldownUntil: null,
+        cooldownSource: null,
         lastFailAt: null,
         consecutiveFailCount: 0,
         cooldownLevel: 0,
       }).where(eq(schema.routeChannels.id, channelId)).run();
       patchCachedChannel(channelId, (channel) => {
         channel.cooldownUntil = null;
+        channel.cooldownSource = null;
         channel.lastFailAt = null;
         channel.consecutiveFailCount = 0;
         channel.cooldownLevel = 0;
@@ -2633,6 +2840,7 @@ export class TokenRouter {
 
     // 与上游一致：成功恢复只清除当前通道的失败/冷却状态，不扩散到同凭据的兄弟通道。
     const needsChannelReset = !!ch.cooldownUntil
+      || !!ch.cooldownSource
       || !!ch.lastFailAt
       || (ch.consecutiveFailCount ?? 0) > 0
       || (ch.cooldownLevel ?? 0) > 0;
@@ -2640,12 +2848,14 @@ export class TokenRouter {
     if (needsChannelReset) {
       await db.update(schema.routeChannels).set({
         cooldownUntil: null,
+        cooldownSource: null,
         lastFailAt: null,
         consecutiveFailCount: 0,
         cooldownLevel: 0,
       }).where(eq(schema.routeChannels.id, channelId)).run();
       patchCachedChannel(channelId, (channel) => {
         channel.cooldownUntil = null;
+        channel.cooldownSource = null;
         channel.lastFailAt = null;
         channel.consecutiveFailCount = 0;
         channel.cooldownLevel = 0;
@@ -2687,6 +2897,7 @@ export class TokenRouter {
       consecutiveFailCount: 0,
       cooldownLevel: 0,
       cooldownUntil: null,
+      cooldownSource: null,
     }).where(inArray(schema.routeChannels.id, normalizedChannelIds)).run();
 
     // A route-unit channel keeps its cooldown on the member rows, so clearing only the
@@ -2703,6 +2914,7 @@ export class TokenRouter {
         consecutiveFailCount: 0,
         cooldownLevel: 0,
         cooldownUntil: null,
+        cooldownSource: null,
         updatedAt: new Date().toISOString(),
       }).where(inArray(schema.oauthRouteUnitMembers.unitId, routeUnitIds)).run();
     }
@@ -2770,16 +2982,22 @@ export class TokenRouter {
         }
 
         const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(memberRow.account, normalizedContext, nowMs);
-        const failCount = shortWindowLimitCooldownUntil ? 0 : ((memberRow.member.failCount ?? 0) + 1);
+        // A rate limit is still a failure that happened, so the lifetime statistic counts
+        // it. It used to be reset to 0 purely to signal "provider-directed cooldown" to the
+        // recovery sweep, which erased the member's entire failure history as a side
+        // effect; `cooldownSource` now carries that signal explicitly.
+        const failCount = (memberRow.member.failCount ?? 0) + 1;
         const routeUnitStrategy = memberRow.unit.strategy === 'stick_until_unavailable'
           ? 'stick_until_unavailable'
           : 'round_robin';
         let cooldownUntil: string | null = null;
+        let cooldownSource: CooldownSource | null = null;
         let consecutiveFailCount = Math.max(0, memberRow.member.consecutiveFailCount ?? 0) + 1;
         let cooldownLevel = Math.max(0, memberRow.member.cooldownLevel ?? 0);
 
         if (shortWindowLimitCooldownUntil) {
           cooldownUntil = shortWindowLimitCooldownUntil;
+          cooldownSource = COOLDOWN_SOURCE_PROVIDER_QUOTA;
           consecutiveFailCount = 0;
           cooldownLevel = 0;
         } else if (routeUnitStrategy === 'round_robin') {
@@ -2787,13 +3005,15 @@ export class TokenRouter {
             cooldownLevel = Math.min(cooldownLevel + 1, ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1);
             const cooldownSec = resolveRoundRobinCooldownSec(cooldownLevel);
             cooldownUntil = cooldownSec > 0
-              ? new Date(nowMs + clampFailureCooldownMs(cooldownSec * 1000)).toISOString()
+              ? new Date(nowMs + resolveJitteredFailureCooldownMs(cooldownSec * 1000)).toISOString()
               : null;
+            cooldownSource = cooldownUntil ? COOLDOWN_SOURCE_METAPI_BACKOFF : null;
             consecutiveFailCount = 0;
           }
         } else {
-          cooldownUntil = new Date(nowMs + resolveEffectiveFailureCooldownMs(failCount)).toISOString();
-          consecutiveFailCount = 0;
+          // Same contract as the channel path: the streak drives the backoff, so keep it.
+          cooldownUntil = new Date(nowMs + resolveEffectiveFailureCooldownMs(consecutiveFailCount)).toISOString();
+          cooldownSource = COOLDOWN_SOURCE_METAPI_BACKOFF;
           cooldownLevel = 0;
         }
 
@@ -2803,6 +3023,7 @@ export class TokenRouter {
           consecutiveFailCount,
           cooldownLevel,
           cooldownUntil,
+          cooldownSource,
           updatedAt: nowIso,
         }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
         // 用量限流属于凭据/渠道级状态，不把单个成员的冷却扩散到整个站点。
@@ -2830,16 +3051,21 @@ export class TokenRouter {
     }
 
     const shortWindowLimitCooldownUntil = resolveShortWindowLimitCooldown(account, normalizedContext, nowMs);
-    const failCount = shortWindowLimitCooldownUntil ? 0 : ((ch.failCount ?? 0) + 1);
+    // Counts the failure that actually occurred. The old `? 0 :` reset existed only to
+    // encode "this cooldown came from the provider" in the counters, and cost the channel
+    // its lifetime failure statistic every time it hit a rate limit.
+    const failCount = (ch.failCount ?? 0) + 1;
     const routeStrategy = resolveRouteStrategy(route);
     // 与上游一致：每次失败只更新实际发起请求的通道，限流状态不扩散到同凭据的其他通道。
     const affectedChannelIds = [channelId];
     let cooldownUntil: string | null = null;
+    let cooldownSource: CooldownSource | null = null;
     let consecutiveFailCount = Math.max(0, ch.consecutiveFailCount ?? 0) + 1;
     let cooldownLevel = Math.max(0, ch.cooldownLevel ?? 0);
 
     if (shortWindowLimitCooldownUntil) {
       cooldownUntil = shortWindowLimitCooldownUntil;
+      cooldownSource = COOLDOWN_SOURCE_PROVIDER_QUOTA;
       consecutiveFailCount = 0;
       cooldownLevel = 0;
     } else if (routeStrategy === 'round_robin') {
@@ -2847,13 +3073,17 @@ export class TokenRouter {
         cooldownLevel = Math.min(cooldownLevel + 1, ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1);
         const cooldownSec = resolveRoundRobinCooldownSec(cooldownLevel);
         cooldownUntil = cooldownSec > 0
-          ? new Date(nowMs + clampFailureCooldownMs(cooldownSec * 1000)).toISOString()
+          ? new Date(nowMs + resolveJitteredFailureCooldownMs(cooldownSec * 1000)).toISOString()
           : null;
+        cooldownSource = cooldownUntil ? COOLDOWN_SOURCE_METAPI_BACKOFF : null;
         consecutiveFailCount = 0;
       }
     } else {
-      cooldownUntil = new Date(nowMs + resolveEffectiveFailureCooldownMs(failCount)).toISOString();
-      consecutiveFailCount = 0;
+      // The streak is what the backoff escalates on, so it must survive this failure.
+      // Zeroing it here (as the weighted path used to) pinned every cooldown at the first
+      // Fibonacci step while the lifetime failCount silently drove escalation instead.
+      cooldownUntil = new Date(nowMs + resolveEffectiveFailureCooldownMs(consecutiveFailCount)).toISOString();
+      cooldownSource = COOLDOWN_SOURCE_METAPI_BACKOFF;
       cooldownLevel = 0;
     }
 
@@ -2863,6 +3093,7 @@ export class TokenRouter {
       consecutiveFailCount,
       cooldownLevel,
       cooldownUntil,
+      cooldownSource,
     }).where(inArray(schema.routeChannels.id, affectedChannelIds)).run();
 
     for (const affectedChannelId of affectedChannelIds) {
@@ -2870,6 +3101,7 @@ export class TokenRouter {
         channel.failCount = failCount;
         channel.lastFailAt = nowIso;
         channel.cooldownUntil = cooldownUntil;
+        channel.cooldownSource = cooldownSource;
         channel.consecutiveFailCount = consecutiveFailCount;
         channel.cooldownLevel = cooldownLevel;
       });
@@ -3857,5 +4089,13 @@ export const __tokenRouterTestUtils = {
   resolveMappedModel,
   getStableFirstRotationCacheSize: () => stableFirstLastSelectedSiteByKey.size,
   rememberStableFirstSiteSelectionForKey,
+  applyFailureCooldownJitter,
+  /**
+   * Pins the cooldown jitter draw so a test can assert an exact cooldown instead of a
+   * range. Pass null to restore `Math.random`.
+   */
+  setFailureCooldownJitterSource: (source: (() => number) | null) => {
+    failureCooldownJitterSource = source ?? Math.random;
+  },
 };
 

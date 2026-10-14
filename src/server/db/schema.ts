@@ -213,6 +213,9 @@ export const oauthRouteUnitMembers = sqliteTable('oauth_route_unit_members', {
   consecutiveFailCount: integer('consecutive_fail_count').notNull().default(0),
   cooldownLevel: integer('cooldown_level').notNull().default(0),
   cooldownUntil: text('cooldown_until'),
+  // Why this member is cooling: 'provider_quota' (an upstream-dictated window) vs
+  // 'metapi_backoff' (our own escalation). See routeChannels.cooldownSource.
+  cooldownSource: text('cooldown_source'),
   createdAt: text('created_at').default(sql`(datetime('now'))`),
   updatedAt: text('updated_at').default(sql`(datetime('now'))`),
 }, (table) => ({
@@ -243,6 +246,19 @@ export const routeChannels = sqliteTable('route_channels', {
   consecutiveFailCount: integer('consecutive_fail_count').notNull().default(0),
   cooldownLevel: integer('cooldown_level').notNull().default(0),
   cooldownUntil: text('cooldown_until'),
+  /**
+   * Why this channel is cooling, stated rather than inferred:
+   *   'provider_quota'  - the upstream dictated the window (a 429 limit / reset hint).
+   *     Probing such a channel early is pointless and looks like abuse to the provider.
+   *   'metapi_backoff'  - our own failure escalation, which a recovery probe may cut short.
+   * Null means not cooling (or a legacy row written before this column existed).
+   *
+   * This replaces reading the shape of the counters: a provider-directed cooldown used to
+   * be recognised as "cooldownUntil set while failCount/consecutiveFailCount/cooldownLevel
+   * are all 0", an implicit contract that silently broke the moment any of those counters
+   * changed meaning.
+   */
+  cooldownSource: text('cooldown_source'),
 }, (table) => ({
   routeIdIdx: index('route_channels_route_id_idx').on(table.routeId),
   accountIdIdx: index('route_channels_account_id_idx').on(table.accountId),

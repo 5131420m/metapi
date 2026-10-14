@@ -4,7 +4,7 @@ import { isUsableAccountToken } from './accountTokenService.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { proxyChannelCoordinator } from './proxyChannelCoordinator.js';
 import { probeRuntimeModel } from './runtimeModelProbe.js';
-import { tokenRouter } from './tokenRouter.js';
+import { isProviderDirectedCooldown, tokenRouter } from './tokenRouter.js';
 import { isExactTokenRouteModelPattern } from '../../shared/tokenRoutePatterns.js';
 
 type RecoveryProbeSource = 'cooldown' | 'active';
@@ -77,13 +77,18 @@ function resolveProbeTokenValue(row: {
   return fallbackApiToken || null;
 }
 
-function isProviderDirectedCooldown(row: {
+/**
+ * A provider-directed cooldown has to be waited out, so it is skipped by recovery sweeps:
+ * probing before the upstream's own window expires cannot succeed and looks like abuse.
+ *
+ * The classification now comes from the channel's recorded `cooldownSource` (see
+ * `isProviderDirectedCooldown` in tokenRouter) rather than being re-derived here from the
+ * shape of the failure counters.
+ */
+function isProviderDirectedCooldownRow(row: {
   route_channels: typeof schema.routeChannels.$inferSelect;
 }): boolean {
-  return !!row.route_channels.cooldownUntil
-    && (row.route_channels.failCount ?? 0) <= 0
-    && (row.route_channels.consecutiveFailCount ?? 0) <= 0
-    && (row.route_channels.cooldownLevel ?? 0) <= 0;
+  return isProviderDirectedCooldown(row.route_channels);
 }
 
 async function mapWithConcurrency<T>(
@@ -122,7 +127,7 @@ async function loadCoolingProbeCandidates(nowIso: string): Promise<RecoveryProbe
     .all();
 
   return rows.flatMap((row) => {
-    if (isProviderDirectedCooldown(row)) return [];
+    if (isProviderDirectedCooldownRow(row)) return [];
     const modelName = resolveProbeModelName(row);
     const tokenValue = resolveProbeTokenValue(row);
     if (!modelName || !tokenValue) return [];

@@ -69,6 +69,7 @@ type BackupRouteChannelRow = Omit<RouteChannelRow,
   | 'consecutiveFailCount'
   | 'cooldownLevel'
   | 'cooldownUntil'
+  | 'cooldownSource'
 > & Partial<Pick<RouteChannelRow,
   'successCount'
   | 'failCount'
@@ -80,6 +81,7 @@ type BackupRouteChannelRow = Omit<RouteChannelRow,
   | 'consecutiveFailCount'
   | 'cooldownLevel'
   | 'cooldownUntil'
+  | 'cooldownSource'
 >>;
 
 type BackupSiteDisabledModelRow = Pick<SiteDisabledModelRow, 'siteId' | 'modelName'>;
@@ -163,6 +165,7 @@ type RouteChannelRuntimeSnapshot = Pick<RouteChannelRow,
   | 'consecutiveFailCount'
   | 'cooldownLevel'
   | 'cooldownUntil'
+  | 'cooldownSource'
 >;
 
 type ProxyLogSnapshot = ProxyLogRow & {
@@ -544,6 +547,7 @@ async function collectCurrentRuntimeStateSnapshot(): Promise<RuntimeStateSnapsho
       consecutiveFailCount: row.consecutiveFailCount ?? 0,
       cooldownLevel: row.cooldownLevel ?? 0,
       cooldownUntil: row.cooldownUntil ?? null,
+      cooldownSource: row.cooldownSource ?? null,
     });
   }
 
@@ -1425,6 +1429,7 @@ async function exportAccountsSection(): Promise<AccountsBackupSection> {
       consecutiveFailCount: _consecutiveFailCount,
       cooldownLevel: _cooldownLevel,
       cooldownUntil: _cooldownUntil,
+      cooldownSource: _cooldownSource,
       ...row
     }) => row),
     routeGroupSources,
@@ -1804,6 +1809,7 @@ async function importAccountsSection(section: AccountsBackupSection): Promise<Ar
         consecutiveFailCount: runtimeChannel?.consecutiveFailCount ?? row.consecutiveFailCount ?? 0,
         cooldownLevel: runtimeChannel?.cooldownLevel ?? row.cooldownLevel ?? 0,
         cooldownUntil: runtimeChannel?.cooldownUntil ?? row.cooldownUntil,
+        cooldownSource: runtimeChannel?.cooldownSource ?? row.cooldownSource ?? null,
       }).run();
     }
 

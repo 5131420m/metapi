@@ -2307,6 +2307,14 @@ export async function settingsRoutes(app: FastifyInstance) {
   app.post('/api/settings/maintenance/clear-usage', async () => {
     const deletedProxyLogs = (await db.delete(schema.proxyLogs).run()).changes;
 
+    // Usage maintenance resets counters and history only. Cooldown state
+    // (`cooldownUntil` / `cooldownLevel` / `consecutiveFailCount` / `lastFailAt`) is live
+    // routing protection, not usage statistics: clearing it here would silently release
+    // every channel still inside an upstream rate-limit window, and the very next request
+    // wave would re-trip that limit. Releasing a cooldown is an explicit operation and
+    // stays owned by the dedicated endpoints:
+    //   POST /api/routes/:id/cooldown/clear
+    //   POST /api/channels/:channelId/cooldown/clear
     await db.update(schema.routeChannels).set({
       successCount: 0,
       failCount: 0,
@@ -2314,10 +2322,6 @@ export async function settingsRoutes(app: FastifyInstance) {
       totalCost: 0,
       lastUsedAt: null,
       lastSelectedAt: null,
-      lastFailAt: null,
-      consecutiveFailCount: 0,
-      cooldownLevel: 0,
-      cooldownUntil: null,
     }).run();
 
     await db.update(schema.accounts).set({

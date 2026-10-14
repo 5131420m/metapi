@@ -181,8 +181,11 @@ describe('TokenRouter selection scoring', () => {
     const selected = await router.selectPreferredChannel('gpt-5.2', preferredChannel.id);
     expect(selected?.channel.id).toBe(preferredChannel.id);
 
+    // "Unhealthy" is an ACTIVE failure streak, not a lifetime failure total: a channel
+    // that failed four times in a row and has not recovered yet.
     await db.update(schema.routeChannels).set({
       failCount: 4,
+      consecutiveFailCount: 4,
       lastFailAt: new Date().toISOString(),
     }).where(eq(schema.routeChannels.id, preferredChannel.id)).run();
     invalidateTokenRouterCache();

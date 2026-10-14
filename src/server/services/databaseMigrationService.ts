@@ -1,4 +1,4 @@
-﻿import Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import currentSchemaContract from '../db/generated/schemaContract.json' with { type: 'json' };
 import { db, schema } from '../db/index.js';
 import {
@@ -556,7 +556,7 @@ function buildStatements(
   for (const row of snapshot.accounts.routeChannels) {
     statements.push({
       table: 'route_channels',
-      columns: ['id', 'route_id', 'account_id', 'token_id', 'source_model', 'priority', 'weight', 'enabled', 'manual_override', 'success_count', 'fail_count', 'total_latency_ms', 'total_cost', 'last_used_at', 'last_selected_at', 'last_fail_at', 'consecutive_fail_count', 'cooldown_level', 'cooldown_until'],
+      columns: ['id', 'route_id', 'account_id', 'token_id', 'source_model', 'priority', 'weight', 'enabled', 'manual_override', 'success_count', 'fail_count', 'total_latency_ms', 'total_cost', 'last_used_at', 'last_selected_at', 'last_fail_at', 'consecutive_fail_count', 'cooldown_level', 'cooldown_until', 'cooldown_source'],
       values: [
         asNumber(row.id, 0),
         asNumber(row.routeId, 0),
@@ -577,6 +577,7 @@ function buildStatements(
         asNumber(row.consecutiveFailCount, 0),
         asNumber(row.cooldownLevel, 0),
         asNullableString(row.cooldownUntil),
+        asNullableString(row.cooldownSource),
       ],
     });
   }

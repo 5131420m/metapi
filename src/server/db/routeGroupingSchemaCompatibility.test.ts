@@ -4,30 +4,34 @@ import {
   type RouteGroupingSchemaInspector,
 } from './routeGroupingSchemaCompatibility.js';
 
+type TrackedTable = 'token_routes' | 'route_channels' | 'oauth_route_unit_members';
+type TrackedTableOrCreated = TrackedTable | 'route_group_sources';
+
 function createInspector(
   dialect: RouteGroupingSchemaInspector['dialect'],
   options?: {
-    existingColumnsByTable?: Partial<Record<'token_routes' | 'route_channels', string[]>>;
-    existingTables?: Array<'token_routes' | 'route_channels' | 'route_group_sources'>;
+    existingColumnsByTable?: Partial<Record<TrackedTable, string[]>>;
+    existingTables?: TrackedTableOrCreated[];
   },
 ) {
   const executedSql: string[] = [];
-  const existingTables = new Set(options?.existingTables ?? ['token_routes', 'route_channels']);
-  const existingColumnsByTable = {
+  const existingTables = new Set<TrackedTableOrCreated>(
+    options?.existingTables ?? ['token_routes', 'route_channels', 'oauth_route_unit_members'],
+  );
+  const existingColumnsByTable: Record<TrackedTable, Set<string>> = {
     token_routes: new Set(options?.existingColumnsByTable?.token_routes ?? []),
     route_channels: new Set(options?.existingColumnsByTable?.route_channels ?? []),
+    oauth_route_unit_members: new Set(options?.existingColumnsByTable?.oauth_route_unit_members ?? []),
   };
 
   const inspector: RouteGroupingSchemaInspector = {
     dialect,
     async tableExists(table) {
-      return existingTables.has(table as 'token_routes' | 'route_channels' | 'route_group_sources');
+      return existingTables.has(table as TrackedTableOrCreated);
     },
     async columnExists(table, column) {
-      if (table === 'token_routes' || table === 'route_channels') {
-        return existingColumnsByTable[table].has(column);
-      }
-      return false;
+      const tracked = existingColumnsByTable[table as TrackedTable];
+      return tracked ? tracked.has(column) : false;
     },
     async execute(sqlText) {
       executedSql.push(sqlText);
@@ -55,6 +59,8 @@ describe('ensureRouteGroupingSchemaCompatibility', () => {
         'ALTER TABLE route_channels ADD COLUMN last_selected_at text;',
         'ALTER TABLE route_channels ADD COLUMN consecutive_fail_count integer NOT NULL DEFAULT 0;',
         'ALTER TABLE route_channels ADD COLUMN cooldown_level integer NOT NULL DEFAULT 0;',
+        'ALTER TABLE route_channels ADD COLUMN cooldown_source text;',
+        'ALTER TABLE oauth_route_unit_members ADD COLUMN cooldown_source text;',
       ],
     },
     {
@@ -73,6 +79,8 @@ describe('ensureRouteGroupingSchemaCompatibility', () => {
         'ALTER TABLE "route_channels" ADD COLUMN "last_selected_at" TEXT',
         'ALTER TABLE "route_channels" ADD COLUMN "consecutive_fail_count" INTEGER NOT NULL DEFAULT 0',
         'ALTER TABLE "route_channels" ADD COLUMN "cooldown_level" INTEGER NOT NULL DEFAULT 0',
+        'ALTER TABLE "route_channels" ADD COLUMN "cooldown_source" TEXT',
+        'ALTER TABLE "oauth_route_unit_members" ADD COLUMN "cooldown_source" TEXT',
       ],
     },
     {
@@ -91,6 +99,8 @@ describe('ensureRouteGroupingSchemaCompatibility', () => {
         'ALTER TABLE `route_channels` ADD COLUMN `last_selected_at` TEXT NULL',
         'ALTER TABLE `route_channels` ADD COLUMN `consecutive_fail_count` INT NOT NULL DEFAULT 0',
         'ALTER TABLE `route_channels` ADD COLUMN `cooldown_level` INT NOT NULL DEFAULT 0',
+        'ALTER TABLE `route_channels` ADD COLUMN `cooldown_source` TEXT NULL',
+        'ALTER TABLE `oauth_route_unit_members` ADD COLUMN `cooldown_source` TEXT NULL',
       ],
     },
   ])('adds missing route grouping columns for $dialect', async ({ dialect, expectedSql }) => {
@@ -105,9 +115,10 @@ describe('ensureRouteGroupingSchemaCompatibility', () => {
     const { inspector, executedSql } = createInspector('postgres', {
       existingColumnsByTable: {
         token_routes: ['display_name', 'display_icon', 'route_mode', 'decision_snapshot', 'decision_refreshed_at', 'routing_strategy'],
-        route_channels: ['source_model', 'last_selected_at', 'consecutive_fail_count', 'cooldown_level'],
+        route_channels: ['source_model', 'last_selected_at', 'consecutive_fail_count', 'cooldown_level', 'cooldown_source'],
+        oauth_route_unit_members: ['cooldown_source'],
       },
-      existingTables: ['token_routes', 'route_channels', 'route_group_sources'],
+      existingTables: ['token_routes', 'route_channels', 'oauth_route_unit_members', 'route_group_sources'],
     });
 
     await ensureRouteGroupingSchemaCompatibility(inspector);
