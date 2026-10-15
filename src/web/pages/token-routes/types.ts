@@ -29,6 +29,18 @@ export type RouteChannelRouteUnit = {
   members?: RouteChannelRouteUnitMember[];
 };
 
+export type RouteChannelQuality = {
+  firstByteEmaMs: number | null;
+  firstByteSampleCount: number;
+  tpsEma: number | null;
+  tpsSampleCount: number;
+  recentSuccessCount: number | null;
+  recentFailureCount: number | null;
+  recentSuccessRate: number | null;
+  recentSampleCount: number;
+  lastUpdatedAtMs: number | null;
+};
+
 export type RouteChannel = {
   id: number;
   routeId?: number;
@@ -42,6 +54,8 @@ export type RouteChannel = {
   successCount: number;
   failCount: number;
   cooldownUntil?: string | null;
+  /** Display-only recent quality measured on this channel; null before first traffic. */
+  quality?: RouteChannelQuality | null;
   account?: {
     username: string | null;
     accessToken?: string | null;

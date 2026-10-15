@@ -1,6 +1,6 @@
-import { useState, type CSSProperties } from 'react';
+import { Fragment, useState, type CSSProperties, type ReactNode } from 'react';
 import ModernSelect from '../../components/ModernSelect.js';
-import type { SortableChannelRowProps } from './types.js';
+import type { RouteChannel, SortableChannelRowProps } from './types.js';
 import {
   buildFixedTokenOptionDescription,
   buildFixedTokenOptionLabel,
@@ -8,6 +8,13 @@ import {
   resolveTokenBindingConnectionMode,
 } from './tokenBindingPresentation.js';
 import { getChannelDecisionState, getPriorityTagStyle, getProbabilityColor } from './utils.js';
+import {
+  firstByteTone,
+  qualityToneBgColor,
+  qualityToneColor,
+  successRateTone,
+  tokensPerSecondTone,
+} from '../helpers/qualityBadges.js';
 
 function getRouteUnitStrategyLabel(strategy: string | null | undefined): string {
   return strategy === 'stick_until_unavailable' ? '单个用到不可用再切' : '轮询';
@@ -17,6 +24,176 @@ function formatRouteUnitMemberLabel(member: { accountId: number; username: strin
   const accountLabel = member.username?.trim() || `account-${member.accountId}`;
   const siteLabel = member.siteName?.trim();
   return siteLabel ? `${accountLabel} @ ${siteLabel}` : accountLabel;
+}
+
+const CHANNEL_QUALITY_STALE_MS = 30 * 60 * 1000;
+const CHANNEL_QUALITY_MIN_SAMPLES = 3;
+
+function formatQualityLatency(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+}
+
+/**
+ * The channel's right-corner quality strip: recent first-byte latency, stream
+ * throughput, and one merged stats badge carrying the lifetime success/fail counts
+ * beside the recent-window success rate. All measured on THIS channel's own traffic;
+ * routing scoring currently consumes the site-level signals, and the tooltip says so,
+ * because for multi-channel sites the two numbers are legitimately different.
+ *
+ * When the payload carries no quality object at all (older backend), the merged
+ * stats badge still renders so the lifetime counts keep a home.
+ */
+function buildChannelQualityBadges(channel: RouteChannel, suppressTooltips: boolean) {
+  const quality = channel.quality ?? null;
+  const stale = quality?.lastUpdatedAtMs != null
+    && (Date.now() - quality.lastUpdatedAtMs) > CHANNEL_QUALITY_STALE_MS;
+  const staleNote = stale ? '；最近 30 分钟无流量，数据可能过时' : '';
+  const scoringNote = '。首字/速度/成功率为通道自身实测，路由评分当前按站点×模型聚合';
+
+  const badges: Array<{ key: string; node: ReactNode }> = [];
+
+  if (quality) {
+    if (quality.firstByteEmaMs != null && Number.isFinite(quality.firstByteEmaMs)) {
+      const insufficient = quality.firstByteSampleCount < CHANNEL_QUALITY_MIN_SAMPLES
+        ? '；样本不足，仅供参考'
+        : '';
+      badges.push({
+        key: 'firstByte',
+        node: (
+          <span
+            className="badge"
+            style={{
+              fontSize: 10,
+              background: qualityToneBgColor(firstByteTone(quality.firstByteEmaMs)),
+              color: qualityToneColor(firstByteTone(quality.firstByteEmaMs)),
+              opacity: stale ? 0.6 : 1,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+            data-tooltip={suppressTooltips ? undefined : `近期首字延迟 ${Math.round(quality.firstByteEmaMs)}ms（${quality.firstByteSampleCount} 个样本${insufficient}${staleNote}${scoringNote}）`}
+          >
+            首字 {formatQualityLatency(quality.firstByteEmaMs)}
+          </span>
+        ),
+      });
+    } else {
+      badges.push({
+        key: 'firstByte',
+        node: (
+          <span className="badge badge-muted" style={{ fontSize: 10 }} data-tooltip={suppressTooltips ? undefined : '该通道尚无首字延迟样本'}>
+            首字 —
+          </span>
+        ),
+      });
+    }
+
+    if (quality.tpsEma != null && Number.isFinite(quality.tpsEma) && quality.tpsEma > 0) {
+      const insufficient = quality.tpsSampleCount < CHANNEL_QUALITY_MIN_SAMPLES
+        ? '；样本不足，仅供参考'
+        : '';
+      badges.push({
+        key: 'speed',
+        node: (
+          <span
+            className="badge"
+            style={{
+              fontSize: 10,
+              background: qualityToneBgColor(tokensPerSecondTone(quality.tpsEma)),
+              color: qualityToneColor(tokensPerSecondTone(quality.tpsEma)),
+              opacity: stale ? 0.6 : 1,
+              fontVariantNumeric: 'tabular-nums',
+            }}
+            data-tooltip={suppressTooltips ? undefined : `近期流式吞吐 ${quality.tpsEma.toFixed(1)} tokens/s（${quality.tpsSampleCount} 个样本${insufficient}${staleNote}${scoringNote}）`}
+          >
+            速度 {quality.tpsEma.toFixed(1)}tps
+          </span>
+        ),
+      });
+    } else {
+      badges.push({
+        key: 'speed',
+        node: (
+          <span className="badge badge-muted" style={{ fontSize: 10 }} data-tooltip={suppressTooltips ? undefined : '该通道尚无流式吞吐样本（非流式请求不计入速度统计）'}>
+            速度 —
+          </span>
+        ),
+      });
+    }
+  }
+
+  const lifetimeSuccess = Math.max(0, channel.successCount || 0);
+  const lifetimeFail = Math.max(0, channel.failCount || 0);
+  const recentSuccess = quality?.recentSuccessCount != null && Number.isFinite(quality.recentSuccessCount)
+    ? quality.recentSuccessCount
+    : null;
+  const recentFail = quality?.recentFailureCount != null && Number.isFinite(quality.recentFailureCount)
+    ? quality.recentFailureCount
+    : null;
+  const recentRate = quality?.recentSuccessRate != null && Number.isFinite(quality.recentSuccessRate)
+    ? quality.recentSuccessRate
+    : null;
+  const rateTone = recentRate != null ? successRateTone(recentRate) : null;
+  const mergedTooltipParts = [];
+  if (recentSuccess != null && recentFail != null) {
+    mergedTooltipParts.push(`近期成功/失败 ${recentSuccess.toFixed(2)}/${recentFail.toFixed(2)}（30 分钟半衰窗口，随时间指数遗忘）`);
+  } else {
+    mergedTooltipParts.push('近期成功/失败：尚无样本');
+  }
+  if (recentRate != null) {
+    const insufficient = (quality?.recentSampleCount ?? 0) < CHANNEL_QUALITY_MIN_SAMPLES
+      ? '；样本不足，仅供参考'
+      : '';
+    mergedTooltipParts.push(`近期成功率 ${(recentRate * 100).toFixed(1)}%（${quality?.recentSampleCount ?? 0} 个样本${insufficient}${staleNote}）`);
+  } else {
+    mergedTooltipParts.push('近期成功率：尚无样本');
+  }
+  mergedTooltipParts.push(`累计成功/失败 ${lifetimeSuccess}/${lifetimeFail}（自通道创建起，供参考）`);
+  badges.push({
+    key: 'stats',
+    node: (
+      <span
+        className={`badge ${rateTone ? '' : 'badge-muted'}`}
+        style={{
+          fontSize: 10,
+          fontVariantNumeric: 'tabular-nums',
+          opacity: stale ? 0.6 : 1,
+        }}
+        data-tooltip={suppressTooltips ? undefined : mergedTooltipParts.join('；')}
+      >
+        成功率
+        {recentSuccess != null && recentFail != null ? (
+          <>
+            <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>{Math.round(recentSuccess)}</span>
+            <span style={{ color: 'var(--color-text-muted)' }}>/</span>
+            <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>{Math.round(recentFail)}</span>
+          </>
+        ) : (
+          <span>—</span>
+        )}
+        <span style={{ color: 'var(--color-text-muted)' }}>/</span>
+        {recentRate != null ? (
+          <span style={{ color: rateTone ? qualityToneColor(rateTone) : 'var(--color-text-secondary)' }}>
+            {(recentRate * 100).toFixed(0)}%
+          </span>
+        ) : (
+          <span>—</span>
+        )}
+      </span>
+    ),
+  });
+
+  return badges.map((badge) => <Fragment key={badge.key}>{badge.node}</Fragment>);
+}
+
+function ChannelQualityStrip({ channel, suppressTooltips, style }: {
+  channel: RouteChannel;
+  suppressTooltips: boolean;
+  style?: CSSProperties;
+}) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', ...style }}>
+      {buildChannelQualityBadges(channel, suppressTooltips)}
+    </div>
+  );
 }
 
 export function SortableChannelRow({
@@ -160,11 +337,7 @@ export function SortableChannelRow({
                 {channel.site?.name || 'unknown'}
               </span>
 
-              <span style={{ fontSize: 11, color: 'var(--color-text-muted)', marginLeft: 'auto' }}>
-                成功/失败 <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>{channel.successCount || 0}</span>
-                <span style={{ color: 'var(--color-text-muted)', margin: '0 2px' }}>/</span>
-                <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>{channel.failCount || 0}</span>
-              </span>
+              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} />
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
@@ -478,6 +651,8 @@ export function SortableChannelRow({
           </>
         ) : null}
 
+        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} />
+
         {routeUnitMemberSummaryText ? (
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, width: '100%', flexWrap: 'wrap' }}>
             <span style={{ fontSize: 11, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
@@ -524,13 +699,6 @@ export function SortableChannelRow({
               {decisionState.probability.toFixed(1)}%
             </span>
           </div>
-
-          <span style={{ fontSize: 11, color: 'var(--color-text-muted)' }}>成功/失败</span>
-          <span style={{ fontSize: 11 }}>
-            <span style={{ color: 'var(--color-success)', fontWeight: 600 }}>{channel.successCount || 0}</span>
-            <span style={{ color: 'var(--color-text-muted)', margin: '0 2px' }}>/</span>
-            <span style={{ color: 'var(--color-danger)', fontWeight: 600 }}>{channel.failCount || 0}</span>
-          </span>
         </div>
       </div>
 

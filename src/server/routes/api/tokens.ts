@@ -1,4 +1,4 @@
-﻿import { FastifyInstance, type FastifyReply } from 'fastify';
+import { FastifyInstance, type FastifyReply } from 'fastify';
 import { and, eq, inArray } from 'drizzle-orm';
 import { RateLimiterMemory, RateLimiterRes } from 'rate-limiter-flexible';
 import { db, schema } from '../../db/index.js';
@@ -625,6 +625,18 @@ async function fetchChannelsForRouteRows(
       const priorityDiff = (left.priority ?? 0) - (right.priority ?? 0);
       return priorityDiff !== 0 ? priorityDiff : (left.id ?? 0) - (right.id ?? 0);
     });
+  }
+
+  // Display-only per-channel quality (recent first-byte / throughput / success rate).
+  // One bulk getter for the whole fetch; routing scoring never reads this field.
+  const qualityChannelIds = Array.from(channelsByActualRouteId.values())
+    .flatMap((channels) => channels.map((channel) => channel.id))
+    .filter((id): id is number => Number.isFinite(id));
+  const qualityByChannelId = await tokenRouter.getChannelQualitySnapshots(qualityChannelIds);
+  for (const channels of channelsByActualRouteId.values()) {
+    for (const channel of channels) {
+      channel.quality = qualityByChannelId[String(channel.id)] ?? null;
+    }
   }
 
   const channelsByRoute = new Map<number, any[]>();

@@ -101,6 +101,40 @@ type SiteRuntimeHealthState = {
   tpsSampleCount: number;
 };
 
+/**
+ * Structural host of the quality EMAs. Both the site runtime health state and the
+ * channel quality state carry these fields, so EMA updates and hydration share one
+ * implementation.
+ */
+type QualityEmaHost = {
+  firstByteEmaMs: number | null;
+  firstByteSampleCount: number;
+  tpsEma: number | null;
+  tpsSampleCount: number;
+};
+
+/**
+ * Structural host of the decaying recent outcome window. Shared by site and channel
+ * quality states so the snapshot math (priors, half-life, confidence) cannot drift
+ * between the two granularities.
+ */
+type RecentOutcomeWindowHost = {
+  recentSuccessCount: number;
+  recentFailureCount: number;
+  recentWindowUpdatedAtMs: number;
+  lastUpdatedAtMs: number | null;
+};
+
+/**
+ * Per-channel quality telemetry for DISPLAY ONLY (step one of the channel-granularity
+ * rollout): first-byte / throughput EMAs and a decaying recent success window, keyed by
+ * the channel the request actually ran on. Scoring keeps consuming the site-level
+ * signals until the divergence between channels of one site has actually been observed.
+ */
+type ChannelQualityState = QualityEmaHost & RecentOutcomeWindowHost & {
+  lastUpdatedAtMs: number;
+};
+
 const FAILURE_BACKOFF_BASE_SEC = 15;
 const SHORT_WINDOW_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 /**
@@ -318,6 +352,8 @@ type SiteRuntimeHealthPersistencePayload = {
   savedAtMs: number;
   globalBySiteId: Record<string, SiteRuntimeHealthState>;
   modelBySiteId: Record<string, Record<string, SiteRuntimeHealthState>>;
+  /** Display-only per-channel quality EMAs; absent in payloads written before it existed. */
+  channelById?: Record<string, ChannelQualityState>;
 };
 
 type SiteRuntimeHealthDetails = {
@@ -378,6 +414,7 @@ type StableFirstObservationProgressState = {
 
 const siteRuntimeHealthStates = new Map<number, SiteRuntimeHealthState>();
 const siteModelRuntimeHealthStates = new Map<number, Map<string, SiteRuntimeHealthState>>();
+const channelQualityByChannelId = new Map<number, ChannelQualityState>();
 const stableFirstLastSelectedSiteByKey = new Map<string, number>();
 const MAX_STABLE_FIRST_ROTATION_KEYS = 1024;
 const stableFirstObservationProgressByKey = new Map<string, StableFirstObservationProgressState>();
@@ -639,7 +676,7 @@ function buildRecentOutcomeSnapshot(
   };
 }
 
-function getRecentOutcomeSnapshot(state: SiteRuntimeHealthState | null | undefined, nowMs = Date.now()): RecentOutcomeSnapshot {
+function getRecentOutcomeSnapshot(state: RecentOutcomeWindowHost | null | undefined, nowMs = Date.now()): RecentOutcomeSnapshot {
   if (!state) {
     return buildRecentOutcomeSnapshot(0, 0);
   }
@@ -651,7 +688,7 @@ function getRecentOutcomeSnapshot(state: SiteRuntimeHealthState | null | undefin
   );
 }
 
-function refreshRecentOutcomeWindow(state: SiteRuntimeHealthState, nowMs = Date.now()): void {
+function refreshRecentOutcomeWindow(state: RecentOutcomeWindowHost, nowMs = Date.now()): void {
   const snapshot = getRecentOutcomeSnapshot(state, nowMs);
   state.recentSuccessCount = snapshot.successCount;
   state.recentFailureCount = snapshot.failureCount;
@@ -909,6 +946,25 @@ function cloneSiteRuntimeHealthState(state: SiteRuntimeHealthState): SiteRuntime
   };
 }
 
+function hydrateChannelQualityState(raw: unknown): ChannelQualityState | null {
+  if (!isRecord(raw)) return null;
+
+  const lastUpdatedAtMs = readFiniteInteger(raw.lastUpdatedAtMs) ?? Date.now();
+  const recentWindowUpdatedAtMs = readFiniteInteger(raw.recentWindowUpdatedAtMs) ?? lastUpdatedAtMs;
+  const firstByteEmaMs = readFiniteNumber(raw.firstByteEmaMs);
+  const tpsEma = readFiniteNumber(raw.tpsEma);
+  return {
+    firstByteEmaMs: firstByteEmaMs != null && firstByteEmaMs >= 0 ? firstByteEmaMs : null,
+    firstByteSampleCount: Math.max(0, readFiniteNumber(raw.firstByteSampleCount) ?? 0),
+    tpsEma: tpsEma != null && tpsEma > 0 ? tpsEma : null,
+    tpsSampleCount: Math.max(0, readFiniteNumber(raw.tpsSampleCount) ?? 0),
+    recentSuccessCount: Math.max(0, readFiniteNumber(raw.recentSuccessCount) ?? 0),
+    recentFailureCount: Math.max(0, readFiniteNumber(raw.recentFailureCount) ?? 0),
+    recentWindowUpdatedAtMs: Math.max(0, recentWindowUpdatedAtMs),
+    lastUpdatedAtMs: Math.max(0, lastUpdatedAtMs),
+  };
+}
+
 function getOrCreateRuntimeHealthState<K>(states: Map<K, SiteRuntimeHealthState>, key: K, nowMs = Date.now()): SiteRuntimeHealthState {
   const existing = states.get(key);
   if (!existing) {
@@ -1062,6 +1118,49 @@ export type RuntimeSuccessQualityMetrics = {
   tokensPerSecond?: number | null;
 };
 
+/**
+ * Read-only, display-facing quality snapshot for one channel. Null fields mean
+ * "no sample yet" — the UI renders them as an em dash, never as zero.
+ */
+export type ChannelQualitySnapshot = {
+  firstByteEmaMs: number | null;
+  firstByteSampleCount: number;
+  tpsEma: number | null;
+  tpsSampleCount: number;
+  /** Decayed-window success count (30-min half-life); null when the channel has no state. */
+  recentSuccessCount: number | null;
+  /** Decayed-window failure count (30-min half-life); null when the channel has no state. */
+  recentFailureCount: number | null;
+  /** Decaying-window success rate with priors; null when the window has no samples. */
+  recentSuccessRate: number | null;
+  recentSampleCount: number;
+  lastUpdatedAtMs: number | null;
+};
+
+/**
+ * Feed first-byte / throughput observations into a quality EMA host. One implementation
+ * for both granularities (site and channel) so their smoothing behaviour cannot drift.
+ */
+function applyQualityEmaUpdates(state: QualityEmaHost, quality: RuntimeSuccessQualityMetrics): void {
+  const firstByteLatencyMs = readFiniteNumber(quality.firstByteLatencyMs);
+  if (firstByteLatencyMs != null && firstByteLatencyMs >= 0) {
+    const normalizedFirstByteMs = Math.trunc(firstByteLatencyMs);
+    state.firstByteEmaMs = state.firstByteEmaMs == null
+      ? normalizedFirstByteMs
+      : (state.firstByteEmaMs * (1 - SITE_RUNTIME_LATENCY_EMA_ALPHA))
+        + (normalizedFirstByteMs * SITE_RUNTIME_LATENCY_EMA_ALPHA);
+    state.firstByteSampleCount += 1;
+  }
+  const tokensPerSecond = readFiniteNumber(quality.tokensPerSecond);
+  if (tokensPerSecond != null && tokensPerSecond > 0) {
+    state.tpsEma = state.tpsEma == null
+      ? tokensPerSecond
+      : (state.tpsEma * (1 - SITE_RUNTIME_TPS_EMA_ALPHA))
+        + (tokensPerSecond * SITE_RUNTIME_TPS_EMA_ALPHA);
+    state.tpsSampleCount += 1;
+  }
+}
+
 function applyRuntimeHealthSuccess(
   state: SiteRuntimeHealthState,
   latencyMs: number,
@@ -1081,23 +1180,7 @@ function applyRuntimeHealthSuccess(
     ? normalizedLatencyMs
     : (state.latencyEmaMs * (1 - SITE_RUNTIME_LATENCY_EMA_ALPHA))
       + (normalizedLatencyMs * SITE_RUNTIME_LATENCY_EMA_ALPHA);
-  const firstByteLatencyMs = readFiniteNumber(quality.firstByteLatencyMs);
-  if (firstByteLatencyMs != null && firstByteLatencyMs >= 0) {
-    const normalizedFirstByteMs = Math.trunc(firstByteLatencyMs);
-    state.firstByteEmaMs = state.firstByteEmaMs == null
-      ? normalizedFirstByteMs
-      : (state.firstByteEmaMs * (1 - SITE_RUNTIME_LATENCY_EMA_ALPHA))
-        + (normalizedFirstByteMs * SITE_RUNTIME_LATENCY_EMA_ALPHA);
-    state.firstByteSampleCount += 1;
-  }
-  const tokensPerSecond = readFiniteNumber(quality.tokensPerSecond);
-  if (tokensPerSecond != null && tokensPerSecond > 0) {
-    state.tpsEma = state.tpsEma == null
-      ? tokensPerSecond
-      : (state.tpsEma * (1 - SITE_RUNTIME_TPS_EMA_ALPHA))
-        + (tokensPerSecond * SITE_RUNTIME_TPS_EMA_ALPHA);
-    state.tpsSampleCount += 1;
-  }
+  applyQualityEmaUpdates(state, quality);
 }
 
 function shouldPersistSiteRuntimeHealthState(state: SiteRuntimeHealthState, nowMs = Date.now()): boolean {
@@ -1121,6 +1204,7 @@ function shouldPersistSiteRuntimeHealthState(state: SiteRuntimeHealthState, nowM
 function buildSiteRuntimeHealthPersistencePayload(nowMs = Date.now()): SiteRuntimeHealthPersistencePayload {
   const globalBySiteId: Record<string, SiteRuntimeHealthState> = {};
   const modelBySiteId: Record<string, Record<string, SiteRuntimeHealthState>> = {};
+  const channelById: Record<string, ChannelQualityState> = {};
 
   for (const [siteId, state] of siteRuntimeHealthStates.entries()) {
     if (!shouldPersistSiteRuntimeHealthState(state, nowMs)) continue;
@@ -1138,11 +1222,19 @@ function buildSiteRuntimeHealthPersistencePayload(nowMs = Date.now()): SiteRunti
     }
   }
 
+  // Channel quality is display-only, so a state untouched for the stale TTL (deleted
+  // channels, retired experiments) simply ages out instead of growing the blob.
+  for (const [channelId, state] of channelQualityByChannelId.entries()) {
+    if ((nowMs - state.lastUpdatedAtMs) > SITE_RUNTIME_HEALTH_PERSIST_STALE_TTL_MS) continue;
+    channelById[String(channelId)] = { ...state };
+  }
+
   return {
     version: 1,
     savedAtMs: nowMs,
     globalBySiteId,
     modelBySiteId,
+    channelById,
   };
 }
 
@@ -1176,6 +1268,7 @@ function scheduleSiteRuntimeHealthPersistence(): void {
 async function loadSiteRuntimeHealthStateFromSettings(): Promise<void> {
   siteRuntimeHealthStates.clear();
   siteModelRuntimeHealthStates.clear();
+  channelQualityByChannelId.clear();
 
   const row = await db.select({ value: schema.settings.value })
     .from(schema.settings)
@@ -1215,6 +1308,15 @@ async function loadSiteRuntimeHealthStateFromSettings(): Promise<void> {
     if (hydratedModelStates.size > 0) {
       siteModelRuntimeHealthStates.set(siteId, hydratedModelStates);
     }
+  }
+
+  const channelById = isRecord(parsed.channelById) ? parsed.channelById : {};
+  for (const [channelIdKey, stateRaw] of Object.entries(channelById)) {
+    const channelId = Number(channelIdKey);
+    if (!Number.isFinite(channelId) || channelId <= 0) continue;
+    const state = hydrateChannelQualityState(stateRaw);
+    if (!state) continue;
+    channelQualityByChannelId.set(channelId, state);
   }
 }
 
@@ -1261,9 +1363,59 @@ function recordSiteRuntimeSuccess(
   scheduleSiteRuntimeHealthPersistence();
 }
 
+function getOrCreateChannelQualityState(channelId: number, nowMs = Date.now()): ChannelQualityState {
+  const existing = channelQualityByChannelId.get(channelId);
+  if (existing) return existing;
+  const initial: ChannelQualityState = {
+    firstByteEmaMs: null,
+    firstByteSampleCount: 0,
+    tpsEma: null,
+    tpsSampleCount: 0,
+    recentSuccessCount: 0,
+    recentFailureCount: 0,
+    recentWindowUpdatedAtMs: nowMs,
+    lastUpdatedAtMs: nowMs,
+  };
+  channelQualityByChannelId.set(channelId, initial);
+  return initial;
+}
+
+/**
+ * Display-only success bookkeeping for the channel the request actually ran on. A
+ * usage/rate-limit failure COUNTS here even though the site-level health deliberately
+ * ignores it (line-level comment at the call sites): being throttled is exactly the
+ * kind of per-credential divergence this panel exists to surface.
+ */
+function recordChannelQualitySuccess(
+  channelId: number,
+  quality: RuntimeSuccessQualityMetrics = {},
+  nowMs = Date.now(),
+): void {
+  const state = getOrCreateChannelQualityState(channelId, nowMs);
+  refreshRecentOutcomeWindow(state, nowMs);
+  state.recentSuccessCount += 1;
+  state.lastUpdatedAtMs = nowMs;
+  applyQualityEmaUpdates(state, quality);
+  scheduleSiteRuntimeHealthPersistence();
+}
+
+/**
+ * Display-only failure bookkeeping. Exempt first-byte timeouts are skipped, mirroring
+ * the site-level rule: a timeout within budget policy is not evidence about health.
+ */
+function recordChannelQualityFailure(channelId: number, context: SiteRuntimeFailureContext, nowMs = Date.now()): void {
+  if (isExemptTimeoutFailure(context)) return;
+  const state = getOrCreateChannelQualityState(channelId, nowMs);
+  refreshRecentOutcomeWindow(state, nowMs);
+  state.recentFailureCount += 1;
+  state.lastUpdatedAtMs = nowMs;
+  scheduleSiteRuntimeHealthPersistence();
+}
+
 export function resetSiteRuntimeHealthState(): void {
   siteRuntimeHealthStates.clear();
   siteModelRuntimeHealthStates.clear();
+  channelQualityByChannelId.clear();
   stableFirstObservationProgressByKey.clear();
   stableFirstObservationSiteCooldownByKey.clear();
   siteRuntimeHealthLoaded = false;
@@ -2845,6 +2997,7 @@ export class TokenRouter {
       .where(eq(schema.routeChannels.id, channelId))
       .get();
     if (!row) return;
+    recordChannelQualitySuccess(channelId, quality);
     const ch = row.route_channels;
     const account = row.accounts;
     const nowIso = new Date().toISOString();
@@ -3168,6 +3321,10 @@ export class TokenRouter {
           cooldownSource,
           updatedAt: nowIso,
         }).where(eq(schema.oauthRouteUnitMembers.id, memberRow.member.id)).run();
+        // Channel-level display quality counts every real failure, including the
+        // usage limits the site health below deliberately ignores: a throttled
+        // credential is exactly the per-channel divergence the panel exists to show.
+        recordChannelQualityFailure(channelId, normalizedContext, nowMs);
         // 用量限流属于凭据/渠道级状态，不把单个成员的冷却扩散到整个站点。
         if (!shortWindowLimitCooldownUntil) {
           recordSiteRuntimeFailure(memberRow.account.siteId, normalizedContext, nowMs);
@@ -3249,10 +3406,56 @@ export class TokenRouter {
       });
     }
 
+    // Channel-level display quality counts usage limits too (the site health below
+    // skips them): being throttled is per-credential evidence the panel should show.
+    recordChannelQualityFailure(channelId, normalizedContext, nowMs);
+
     // 用量限流属于凭据/渠道级状态，不把单次限流扩散成站点级健康惩罚。
     if (!shortWindowLimitCooldownUntil) {
       recordSiteRuntimeFailure(account.siteId, normalizedContext, nowMs);
     }
+  }
+
+  /**
+   * Display-only per-channel quality snapshot, keyed by channel id as string for
+   * direct JSON serialization. Awaits the persisted state first so a request right
+   * after boot still sees the last known quality. Never consumed by scoring.
+   */
+  async getChannelQualitySnapshots(channelIds: Array<number>): Promise<Record<string, ChannelQualitySnapshot>> {
+    await ensureSiteRuntimeHealthStateLoaded();
+    const nowMs = Date.now();
+    const snapshots: Record<string, ChannelQualitySnapshot> = {};
+    for (const channelId of channelIds) {
+      if (!Number.isFinite(channelId)) continue;
+      const state = channelQualityByChannelId.get(channelId);
+      if (!state) {
+        snapshots[String(channelId)] = {
+          firstByteEmaMs: null,
+          firstByteSampleCount: 0,
+          tpsEma: null,
+          tpsSampleCount: 0,
+          recentSuccessCount: null,
+          recentFailureCount: null,
+          recentSuccessRate: null,
+          recentSampleCount: 0,
+          lastUpdatedAtMs: null,
+        };
+        continue;
+      }
+      const recent = getRecentOutcomeSnapshot(state, nowMs);
+      snapshots[String(channelId)] = {
+        firstByteEmaMs: state.firstByteEmaMs,
+        firstByteSampleCount: state.firstByteSampleCount,
+        tpsEma: state.tpsEma,
+        tpsSampleCount: state.tpsSampleCount,
+        recentSuccessCount: recent.successCount,
+        recentFailureCount: recent.failureCount,
+        recentSuccessRate: recent.sampleCount > 0 ? recent.successRate : null,
+        recentSampleCount: recent.sampleCount,
+        lastUpdatedAtMs: state.lastUpdatedAtMs,
+      };
+    }
+    return snapshots;
   }
 
   /**

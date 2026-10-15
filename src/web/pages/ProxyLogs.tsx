@@ -32,6 +32,7 @@ import { useIsMobile } from "../components/useIsMobile.js";
 import { formatDateTimeLocal } from "./helpers/checkinLogTime.js";
 import ModernSelect from "../components/ModernSelect.js";
 import { parseProxyLogPathMeta } from "./helpers/proxyLogPathMeta.js";
+import { firstByteTone, qualityToneBgColor, qualityToneColor } from "./helpers/qualityBadges.js";
 import { tr } from "../i18n.js";
 
 type ProxyLogRenderItem = ProxyLogListItem & {
@@ -308,17 +309,11 @@ function latencyBgColor(ms: number) {
 }
 
 function firstByteColor(ms: number) {
-  if (ms >= 3000) return "var(--color-danger)";
-  if (ms >= 1000) return "var(--color-warning)";
-  return "var(--color-primary)";
+  return qualityToneColor(firstByteTone(ms));
 }
 
 function firstByteBgColor(ms: number) {
-  if (ms >= 3000)
-    return "color-mix(in srgb, var(--color-danger) 12%, transparent)";
-  if (ms >= 1000)
-    return "color-mix(in srgb, var(--color-warning) 12%, transparent)";
-  return "color-mix(in srgb, var(--color-primary) 12%, transparent)";
+  return qualityToneBgColor(firstByteTone(ms));
 }
 
 function formatStreamModeLabel(isStream: boolean | null | undefined) {
