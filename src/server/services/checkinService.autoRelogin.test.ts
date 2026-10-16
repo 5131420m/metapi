@@ -7,6 +7,7 @@ const adapterMock = {
 
 const notifyMock = vi.fn();
 const reportTokenExpiredMock = vi.fn();
+const noteAccountAuthFailureSuspectedMock = vi.fn();
 const refreshBalanceMock = vi.fn();
 const decryptPasswordMock = vi.fn();
 
@@ -70,6 +71,7 @@ vi.mock('./notifyService.js', () => ({
 
 vi.mock('./alertService.js', () => ({
   reportTokenExpired: (...args: unknown[]) => reportTokenExpiredMock(...args),
+  noteAccountAuthFailureSuspected: (...args: unknown[]) => noteAccountAuthFailureSuspectedMock(...args),
 }));
 
 vi.mock('./balanceService.js', () => ({
@@ -86,6 +88,7 @@ describe('checkinService auto relogin', () => {
     adapterMock.login.mockReset();
     notifyMock.mockReset();
     reportTokenExpiredMock.mockReset();
+    noteAccountAuthFailureSuspectedMock.mockReset();
     refreshBalanceMock.mockReset();
     decryptPasswordMock.mockReset();
     selectAllMock.mockReset();

@@ -1,6 +1,7 @@
 import { and, eq, inArray, isNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { upsertSetting } from '../db/upsertSetting.js';
+import { resetAccountAuthFailureStreak } from './accountAuthFailureStreak.js';
 import {
   config,
   normalizeTokenRouterFailureCooldownMaxSec,
@@ -1077,6 +1078,48 @@ function getSiteRuntimeHealthDetails(siteId: number, modelName?: string | null, 
     tpsConfidence: tpsSource
       ? clampNumber(tpsSource.tpsSampleCount / SITE_RUNTIME_SIGNAL_CONFIDENCE_SAMPLES, 0, 1)
       : 0,
+  };
+}
+
+/**
+ * Evidence chain for the weighted first-byte / speed components (step two of the
+ * channel-granularity rollout): the channel's own EMA when it has one, else the
+ * site-level detail above (model-scoped first, site-global second).
+ *
+ * Channel-first means a credential with its own measurement is no longer smeared by
+ * its siblings' traffic, while a fresh channel inherits the site's evidence instead
+ * of starting blind. Confidence follows whichever state actually supplied the value.
+ */
+type ChannelQualityEmaEvidence = {
+  firstByteEmaMs: number | null;
+  firstByteConfidence: number;
+  tpsEma: number | null;
+  tpsConfidence: number;
+  /** Where each value came from — the reason string annotates it (·通道 / ·站点). */
+  firstByteFromChannel: boolean;
+  tpsFromChannel: boolean;
+};
+
+function resolveChannelQualityEmaEvidence(
+  channelId: number | null | undefined,
+  siteDetail: SiteRuntimeHealthDetails,
+): ChannelQualityEmaEvidence {
+  const channelState = Number.isFinite(channelId ?? NaN)
+    ? channelQualityByChannelId.get(Math.trunc(channelId!))
+    : undefined;
+  const firstByteFromChannel = channelState?.firstByteEmaMs != null;
+  const tpsFromChannel = channelState?.tpsEma != null;
+  return {
+    firstByteEmaMs: firstByteFromChannel ? channelState!.firstByteEmaMs : siteDetail.firstByteEmaMs,
+    firstByteConfidence: firstByteFromChannel
+      ? clampNumber((channelState?.firstByteSampleCount ?? 0) / SITE_RUNTIME_SIGNAL_CONFIDENCE_SAMPLES, 0, 1)
+      : siteDetail.firstByteConfidence,
+    tpsEma: tpsFromChannel ? channelState!.tpsEma : siteDetail.tpsEma,
+    tpsConfidence: tpsFromChannel
+      ? clampNumber((channelState?.tpsSampleCount ?? 0) / SITE_RUNTIME_SIGNAL_CONFIDENCE_SAMPLES, 0, 1)
+      : siteDetail.tpsConfidence,
+    firstByteFromChannel,
+    tpsFromChannel,
   };
 }
 
@@ -2998,6 +3041,9 @@ export class TokenRouter {
       .get();
     if (!row) return;
     recordChannelQualitySuccess(channelId, quality);
+    // A success between two auth failures proves the credential still works, so the
+    // 401s are not consecutive — clear the expiry-confirmation streak.
+    resetAccountAuthFailureStreak(row.accounts.id);
     const ch = row.route_channels;
     const account = row.accounts;
     const nowIso = new Date().toISOString();
@@ -3417,9 +3463,11 @@ export class TokenRouter {
   }
 
   /**
-   * Display-only per-channel quality snapshot, keyed by channel id as string for
-   * direct JSON serialization. Awaits the persisted state first so a request right
-   * after boot still sees the last known quality. Never consumed by scoring.
+   * Per-channel quality snapshot for display payloads, keyed by channel id as string
+   * for direct JSON serialization. Awaits the persisted state first so a request right
+   * after boot still sees the last known quality. Since step two of the
+   * channel-granularity rollout the same underlying states also feed the weighted
+   * first-byte / speed components; this getter itself remains read-only display API.
    */
   async getChannelQualitySnapshots(channelIds: Array<number>): Promise<Record<string, ChannelQualitySnapshot>> {
     await ensureSiteRuntimeHealthStateLoaded();
@@ -4222,23 +4270,32 @@ export class TokenRouter {
       const totalUsed = (candidate.channel.successCount ?? 0) + (candidate.channel.failCount ?? 0);
       const recentUsage = Math.max(totalUsed, 1);
       const runtimeDetail = runtimeHealthDetails[i];
-      const firstByteScore = runtimeDetail.firstByteEmaMs != null
+      // Step two of the channel-granularity rollout: first-byte / speed prefer the
+      // channel's own EMA and fall back to the site detail; the SR component keeps
+      // the site-level recent window but its historical fallback now uses the
+      // channel's own lifetime counters, so a sibling's bad history can no longer
+      // stain this credential (and a new channel no longer inherits a bad one).
+      const channelEvidence = resolveChannelQualityEmaEvidence(candidate.channel.id, runtimeDetail);
+      const firstByteScore = channelEvidence.firstByteEmaMs != null
         ? blendQualityComponentScore(
-          clampNumber(SITE_RUNTIME_LATENCY_BASELINE_MS / Math.max(1, runtimeDetail.firstByteEmaMs), 0, 1),
-          runtimeDetail.firstByteConfidence,
+          clampNumber(SITE_RUNTIME_LATENCY_BASELINE_MS / Math.max(1, channelEvidence.firstByteEmaMs), 0, 1),
+          channelEvidence.firstByteConfidence,
         )
         : NEUTRAL_VALUE_COMPONENT_SCORE;
-      const speedScore = runtimeDetail.tpsEma != null
+      const speedScore = channelEvidence.tpsEma != null
         ? blendQualityComponentScore(
-          clampNumber(runtimeDetail.tpsEma / SITE_RUNTIME_SPEED_TARGET_TPS, 0, 1),
-          runtimeDetail.tpsConfidence,
+          clampNumber(channelEvidence.tpsEma / SITE_RUNTIME_SPEED_TARGET_TPS, 0, 1),
+          channelEvidence.tpsConfidence,
         )
         : NEUTRAL_VALUE_COMPONENT_SCORE;
+      const channelHistoricalSuccessRate = totalUsed > 0
+        ? Math.max(0, candidate.channel.successCount ?? 0) / totalUsed
+        : null;
       const successScore = resolveStableFirstSuccessRate(
         runtimeDetail,
-        siteHistoricalHealthMetrics.get(candidate.site.id)?.successRate,
+        channelHistoricalSuccessRate,
       );
-      return { unitCost, balance, recentUsage, firstByteScore, speedScore, successScore };
+      return { unitCost, balance, recentUsage, firstByteScore, speedScore, successScore, channelEvidence, channelHistoricalSuccessRate };
     });
     const cheapestUnitCost = Math.min(...componentScores.map((c) => c.unitCost));
     const maxBalance = Math.max(...componentScores.map((c) => c.balance), 0);
@@ -4358,14 +4415,24 @@ export class TokenRouter {
         : `${siteRuntimeDetail.globalMultiplier.toFixed(2)}`;
       const runtimeLoadText = formatChannelRuntimeLoad(channelRuntimeLoad);
       const recentSuccessRateText = `${(siteRuntimeDetail.recentSuccessRate * 100).toFixed(1)}%`;
+      // Each mode consumes a different blend: stable-first scores the site-level
+      // resolution, while weighted mode (step two) scores with channel-granular
+      // evidence — own EMA, own lifetime history as the SR fallback. The reason
+      // string must show the values its mode actually consumed.
       const stableFirstSuccessRate = resolveStableFirstSuccessRate(siteRuntimeDetail, siteHistoricalHealth?.successRate);
       const stableFirstSuccessRateText = `${(stableFirstSuccessRate * 100).toFixed(1)}%`;
-      const firstByteEmaText = siteRuntimeDetail.firstByteEmaMs == null
+      const weightedSuccessRate = resolveStableFirstSuccessRate(
+        siteRuntimeDetail,
+        componentScores[i].channelHistoricalSuccessRate,
+      );
+      const weightedSuccessRateText = `${(weightedSuccessRate * 100).toFixed(1)}%`;
+      const channelEvidence = componentScores[i].channelEvidence;
+      const firstByteEmaText = channelEvidence.firstByteEmaMs == null
         ? '—'
-        : `${siteRuntimeDetail.firstByteEmaMs}ms`;
-      const tpsEmaText = siteRuntimeDetail.tpsEma == null
+        : `${channelEvidence.firstByteEmaMs}ms${channelEvidence.firstByteFromChannel ? '·通道' : '·站点'}`;
+      const tpsEmaText = channelEvidence.tpsEma == null
         ? '—'
-        : `${siteRuntimeDetail.tpsEma.toFixed(1)}tps`;
+        : `${channelEvidence.tpsEma.toFixed(1)}tps${channelEvidence.tpsFromChannel ? '·通道' : '·站点'}`;
       const valueScoreText = valueScores[i].toFixed(3);
       const stableSiteOrder = this.getStableFirstSiteOrder(candidates, candidate.site.id);
       const reasonPrefix = selectionMode === 'stable_first'
@@ -4389,8 +4456,8 @@ export class TokenRouter {
           ? `${reasonPrefix}，近期成功率=${recentSuccessRateText}（样本=${siteRuntimeDetail.recentSampleCount.toFixed(2)}，置信=${siteRuntimeDetail.recentConfidence.toFixed(2)}），回退成功率=${historicalSuccessRateText}，综合近期成功率=${stableFirstSuccessRateText}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，同站点通道=${siteChannels}${stablePoolText}，评分占比≈${(probability * 100).toFixed(1)}%）`
           : (
             candidates.length === 1
-              ? `${reasonPrefix}，W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，价值分=${valueScoreText}（首字=${firstByteEmaText}，速度=${tpsEmaText}，成功率=${stableFirstSuccessRateText}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
-              : `按权重随机（W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，价值分=${valueScoreText}（首字=${firstByteEmaText}，速度=${tpsEmaText}，成功率=${stableFirstSuccessRateText}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
+              ? `${reasonPrefix}，W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，价值分=${valueScoreText}（首字=${firstByteEmaText}，速度=${tpsEmaText}，成功率=${weightedSuccessRateText}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
+              : `按权重随机（W=${weight}，成本=${costSourceText}:${(cost?.unitCost || 1).toFixed(6)}，站点权重=${siteGlobalWeight.toFixed(2)}x下游倍率=${normalizedDownstreamSiteMultiplier.toFixed(2)}=${combinedSiteWeight.toFixed(2)}，运行时健康=${runtimeHealthText}，会话负载=${runtimeLoadText}，价值分=${valueScoreText}（首字=${firstByteEmaText}，速度=${tpsEmaText}，成功率=${weightedSuccessRateText}），同站点通道=${siteChannels}，概率≈${(probability * 100).toFixed(1)}%）`
           ),
       };
     });

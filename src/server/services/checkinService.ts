@@ -3,7 +3,7 @@ import { getAdapter } from './platforms/index.js';
 import { eq, and } from 'drizzle-orm';
 import { sendNotification } from './notifyService.js';
 import { isCloudflareChallenge, isTokenExpiredError } from './alertRules.js';
-import { reportTokenExpired } from './alertService.js';
+import { noteAccountAuthFailureSuspected } from './alertService.js';
 import { refreshBalance } from './balanceService.js';
 import { parseCheckinRewardAmount } from './checkinRewardParser.js';
 import {
@@ -334,7 +334,10 @@ export async function checkinAccount(accountId: number, options?: { skipEvent?: 
       source: 'checkin',
     });
     if (isTokenExpiredError({ message: result.message })) {
-      await reportTokenExpired({
+      // Background probes only suspect: a check-in 401 can be network or proxy
+      // trouble with the key perfectly fine, so it must not own the hard expiry
+      // transition — event + notification for a human to verify.
+      await noteAccountAuthFailureSuspected({
         accountId: account.id,
         username: account.username,
         siteName: site.name,

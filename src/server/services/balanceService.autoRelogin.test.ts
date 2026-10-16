@@ -10,6 +10,7 @@ const selectGetMock = vi.fn();
 const updateSetMock = vi.fn();
 const insertValuesMock = vi.fn();
 const reportTokenExpiredMock = vi.fn();
+const noteAccountAuthFailureSuspectedMock = vi.fn();
 const sendNotificationMock = vi.fn();
 const decryptPasswordMock = vi.fn();
 const setAccountRuntimeHealthMock = vi.fn();
@@ -66,6 +67,7 @@ vi.mock('./platforms/index.js', () => ({
 
 vi.mock('./alertService.js', () => ({
   reportTokenExpired: (...args: unknown[]) => reportTokenExpiredMock(...args),
+  noteAccountAuthFailureSuspected: (...args: unknown[]) => noteAccountAuthFailureSuspectedMock(...args),
 }));
 
 vi.mock('./notifyService.js', () => ({
@@ -94,6 +96,7 @@ describe('balanceService auto relogin', () => {
     updateSetMock.mockReset();
     insertValuesMock.mockReset();
     reportTokenExpiredMock.mockReset();
+    noteAccountAuthFailureSuspectedMock.mockReset();
     sendNotificationMock.mockReset();
     decryptPasswordMock.mockReset();
     setAccountRuntimeHealthMock.mockReset();
@@ -303,7 +306,10 @@ describe('balanceService auto relogin', () => {
     await expect(refreshBalance(2)).rejects.toThrow('access token');
 
     expect(adapterMock.login).not.toHaveBeenCalled();
-    expect(reportTokenExpiredMock).toHaveBeenCalledTimes(1);
+    // Background balance probes no longer own the hard expiry transition: they only
+    // raise a suspected-auth-failure notification for a human to verify.
+    expect(noteAccountAuthFailureSuspectedMock).toHaveBeenCalledTimes(1);
+    expect(reportTokenExpiredMock).not.toHaveBeenCalled();
   });
 
   it('does not report token expired for generic forbidden balance errors', async () => {

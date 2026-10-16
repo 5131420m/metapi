@@ -2,7 +2,7 @@ import { db, schema } from '../db/index.js';
 import { getAdapter } from './platforms/index.js';
 import { eq } from 'drizzle-orm';
 import { appendSessionTokenRebindHint, isTokenExpiredError } from './alertRules.js';
-import { reportTokenExpired } from './alertService.js';
+import { noteAccountAuthFailureSuspected } from './alertService.js';
 import {
   buildStoredSub2ApiSubscriptionSummary,
   getAutoReloginConfig,
@@ -345,7 +345,10 @@ export async function refreshBalance(accountId: number) {
       source: 'balance',
     });
     if (shouldReportExpired(message)) {
-      await reportTokenExpired({
+      // Background probes only suspect: a balance-check 401 can be network or
+      // proxy trouble with the key perfectly fine, so it must not own the hard
+      // expiry transition — event + notification for a human to verify.
+      await noteAccountAuthFailureSuspected({
         accountId: account.id,
         username: account.username,
         siteName: site.name,

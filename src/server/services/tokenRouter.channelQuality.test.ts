@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { eq } from 'drizzle-orm';
 
 type DbModule = typeof import('../db/index.js');
 type TokenRouterModule = typeof import('./tokenRouter.js');
@@ -13,10 +14,12 @@ describe('TokenRouter channel quality telemetry', () => {
   let TokenRouter: TokenRouterModule['TokenRouter'];
   let resetSiteRuntimeHealthState: TokenRouterModule['resetSiteRuntimeHealthState'];
   let flushSiteRuntimeHealthPersistence: TokenRouterModule['flushSiteRuntimeHealthPersistence'];
+  let invalidateTokenRouterCache: TokenRouterModule['invalidateTokenRouterCache'];
   let config: ConfigModule['config'];
   let dataDir = '';
   let idSeed = 0;
   let originalTimeoutCountsAsChannelFailure: boolean;
+  let originalRoutingWeights: typeof config.routingWeights;
 
   const nextId = () => {
     idSeed += 1;
@@ -36,13 +39,16 @@ describe('TokenRouter channel quality telemetry', () => {
     TokenRouter = tokenRouterModule.TokenRouter;
     resetSiteRuntimeHealthState = tokenRouterModule.resetSiteRuntimeHealthState;
     flushSiteRuntimeHealthPersistence = tokenRouterModule.flushSiteRuntimeHealthPersistence;
+    invalidateTokenRouterCache = tokenRouterModule.invalidateTokenRouterCache;
     config = configModule.config;
     originalTimeoutCountsAsChannelFailure = config.timeoutCountsAsChannelFailure;
+    originalRoutingWeights = { ...config.routingWeights };
   });
 
   beforeEach(async () => {
     idSeed = 0;
     config.timeoutCountsAsChannelFailure = originalTimeoutCountsAsChannelFailure;
+    config.routingWeights = { ...originalRoutingWeights };
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
     await db.delete(schema.settings).run();
@@ -54,6 +60,7 @@ describe('TokenRouter channel quality telemetry', () => {
 
   afterAll(() => {
     config.timeoutCountsAsChannelFailure = originalTimeoutCountsAsChannelFailure;
+    config.routingWeights = { ...originalRoutingWeights };
     resetSiteRuntimeHealthState();
     delete process.env.DATA_DIR;
   });
@@ -232,5 +239,166 @@ describe('TokenRouter channel quality telemetry', () => {
     expect(quality.recentSuccessRate).toBeNull();
     expect(quality.recentSampleCount).toBe(0);
     expect(quality.lastUpdatedAtMs).toBeNull();
+  });
+
+  async function createSharedSiteFixture(modelPattern: string, channelCount: number) {
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern,
+      enabled: true,
+    }).returning().get();
+    const site = await db.insert(schema.sites).values({
+      name: `score-site-${nextId()}`,
+      url: `https://score-${nextId()}.example.com`,
+      platform: 'new-api',
+      status: 'active',
+    }).returning().get();
+    const channels = [];
+    for (let index = 0; index < channelCount; index += 1) {
+      const account = await db.insert(schema.accounts).values({
+        siteId: site.id,
+        username: `score-user-${nextId()}`,
+        accessToken: `access-${nextId()}`,
+        apiToken: `sk-${nextId()}`,
+        status: 'active',
+      }).returning().get();
+      const token = await db.insert(schema.accountTokens).values({
+        accountId: account.id,
+        name: `score-token-${index}`,
+        token: `token-score-${nextId()}`,
+        enabled: true,
+        isDefault: false,
+      }).returning().get();
+      channels.push(await db.insert(schema.routeChannels).values({
+        routeId: route.id,
+        accountId: account.id,
+        tokenId: token.id,
+        priority: 0,
+        weight: 10,
+        enabled: true,
+      }).returning().get());
+    }
+    invalidateTokenRouterCache();
+    return { route, site, channels };
+  }
+
+  it('scores the weighted first-byte component from the channel EMA with site fallback', async () => {
+    const { channels } = await createSharedSiteFixture('gpt-cq-score', 3);
+    const [slowChannel, fastChannel, quietChannel] = channels;
+    const router = new TokenRouter();
+    for (let index = 0; index < 12; index += 1) {
+      await router.recordSuccess(slowChannel.id, 60000, 0, 'gpt-cq-score', undefined, {
+        firstByteLatencyMs: 8000,
+        isStream: false,
+      });
+    }
+    for (let index = 0; index < 12; index += 1) {
+      await router.recordSuccess(fastChannel.id, 60000, 0, 'gpt-cq-score', undefined, {
+        firstByteLatencyMs: 200,
+        isStream: false,
+      });
+    }
+
+    config.routingWeights = {
+      baseWeightFactor: 0.3,
+      valueScoreFactor: 0.7,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+      firstByteWeight: 1,
+      speedWeight: 0,
+      successWeight: 0,
+    };
+
+    const decision = await router.explainSelection('gpt-cq-score');
+    const byChannelId = new Map(decision.candidates.map((candidate) => [candidate.channelId, candidate]));
+    const slow = byChannelId.get(slowChannel.id)!;
+    const fast = byChannelId.get(fastChannel.id)!;
+    const quiet = byChannelId.get(quietChannel.id)!;
+
+    // The channel's own EMA drives the component: 8000ms → clamp(2500/8000) = 0.3125,
+    // 200ms → saturated 1.0. Site-level scoring would hand both channels the same
+    // blended site EMA (~308ms) and equal probabilities.
+    expect(fast.probability).toBeGreaterThan(slow.probability);
+    expect(slow.reason).toContain('首字=8000ms·通道');
+    expect(fast.reason).toContain('首字=200ms·通道');
+    // The quiet channel has no samples of its own → site fallback, annotated as such.
+    expect(quiet.reason).toContain('首字=');
+    expect(quiet.reason).toContain('·站点');
+    expect(quiet.reason).not.toContain('·通道');
+  });
+
+  it('scores the weighted speed component from the channel tps EMA', async () => {
+    const { channels } = await createSharedSiteFixture('gpt-cq-speed', 2);
+    const [slowChannel, fastChannel] = channels;
+    const router = new TokenRouter();
+    for (let index = 0; index < 12; index += 1) {
+      await router.recordSuccess(slowChannel.id, 5000, 0, 'gpt-cq-speed', undefined, {
+        firstByteLatencyMs: 300,
+        completionTokens: 10,
+        isStream: true,
+      });
+    }
+    for (let index = 0; index < 12; index += 1) {
+      await router.recordSuccess(fastChannel.id, 5000, 0, 'gpt-cq-speed', undefined, {
+        firstByteLatencyMs: 300,
+        completionTokens: 900,
+        isStream: true,
+      });
+    }
+
+    config.routingWeights = {
+      baseWeightFactor: 0.3,
+      valueScoreFactor: 0.7,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 1,
+      successWeight: 0,
+    };
+
+    const decision = await router.explainSelection('gpt-cq-speed');
+    const byChannelId = new Map(decision.candidates.map((candidate) => [candidate.channelId, candidate]));
+    const slow = byChannelId.get(slowChannel.id)!;
+    const fast = byChannelId.get(fastChannel.id)!;
+
+    // 10 tokens over a (5000-300)ms window ≈ 2.1tps vs 900 tokens ≈ 191tps (saturated).
+    expect(fast.probability).toBeGreaterThan(slow.probability);
+    expect(slow.reason).toContain('速度=2.1tps·通道');
+    expect(fast.reason).toContain('·通道');
+  });
+
+  it('uses the channel lifetime success rate as the weighted SR historical fallback', async () => {
+    const { channels } = await createSharedSiteFixture('gpt-cq-sr', 2);
+    const [mixedChannel, perfectChannel] = channels;
+    await db.update(schema.routeChannels).set({ successCount: 1, failCount: 1 })
+      .where(eq(schema.routeChannels.id, mixedChannel.id)).run();
+    await db.update(schema.routeChannels).set({ successCount: 3, failCount: 0 })
+      .where(eq(schema.routeChannels.id, perfectChannel.id)).run();
+    invalidateTokenRouterCache();
+
+    config.routingWeights = {
+      baseWeightFactor: 0.3,
+      valueScoreFactor: 0.7,
+      costWeight: 0,
+      balanceWeight: 0,
+      usageWeight: 0,
+      firstByteWeight: 0,
+      speedWeight: 0,
+      successWeight: 1,
+    };
+
+    const router = new TokenRouter();
+    const decision = await router.explainSelection('gpt-cq-sr');
+    const byChannelId = new Map(decision.candidates.map((candidate) => [candidate.channelId, candidate]));
+    const mixed = byChannelId.get(mixedChannel.id)!;
+    const perfect = byChannelId.get(perfectChannel.id)!;
+
+    // Empty recent window → confidence 0 → the blend is pure historical. Channel
+    // granularity: mixed shows its own 50%, perfect its own 100% — the site
+    // aggregate (4/5 = 80%) would have made both candidates identical.
+    expect(mixed.reason).toContain('成功率=50.0%');
+    expect(perfect.reason).toContain('成功率=100.0%');
+    expect(perfect.probability).toBeGreaterThan(mixed.probability);
   });
 });
