@@ -13,6 +13,36 @@
  */
 
 /**
+ * What a client is told when the upstream stream broke AFTER the response was already
+ * committed, together with the machine code for the same failure.
+ *
+ * They live together, and here, because both the presentation layer
+ * (`downstreamErrorPolicy`) and the protocol layer (the chat/responses stream transformers)
+ * have to agree on them, and neither may import the other.
+ *
+ * The TEXT is a diagnosis, not only a redaction. It replaces the upstream's own wording so the
+ * upstream's identity — and any credential it echoed — never reaches the client, but the
+ * failure CLASS has to survive that redaction. The first version of this message named no class
+ * at all ("the upstream stream failed after output began"), so clients that classify on text —
+ * which is most of them, including the coding agents this proxy serves — had nothing to match,
+ * filed a dropped connection under "unknown error, do not retry", and killed the session. A
+ * transport interruption has to read like one.
+ *
+ * Wording constraints, all load-bearing:
+ *  - classify as a transport failure: "connection" / "terminated" / "stream ended before …" are
+ *    the words the common classifiers match;
+ *  - carry no HTTP status digits and no `quota` / `auth` / `too large` wording, because those
+ *    checks run FIRST in those classifiers and would map this to a non-retryable class
+ *    (401/403/413/429/5xx);
+ *  - name no upstream, which is the whole point of the redaction.
+ *
+ * The CODE is for clients that read structured errors instead of prose; it is stable, and it is
+ * attached wherever this proxy reports a post-output stream break.
+ */
+export const POSTCOMMIT_STREAM_FAILURE_MESSAGE = 'The upstream connection was terminated after output began.';
+export const POSTCOMMIT_STREAM_FAILURE_CODE = 'metapi_stream_interrupted';
+
+/**
  * Signals that the upstream is relaying a failure of its OWN upstream, rather than
  * rejecting the shape of our request.
  *

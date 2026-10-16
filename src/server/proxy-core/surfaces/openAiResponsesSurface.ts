@@ -49,7 +49,8 @@ import {
 } from '../../transformers/gemini/generate-content/cliBridge.js';
 import { isCodexResponsesSurface } from '../cliProfiles/codexProfile.js';
 import { getObservedResponseMeta } from '../firstByteTimeout.js';
-import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../responseTimeoutPolicy.js';
+import { withStreamIdleTimeout } from '../streamIdleTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs, resolveStreamIdleTimeoutMs } from '../responseTimeoutPolicy.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { runCodexHttpSessionTask } from '../runtime/codexHttpSessionQueue.js';
 import {
@@ -261,6 +262,16 @@ export async function handleOpenAiResponsesSurfaceRequest(
     const requestedModel = requestEnvelope.model;
     const isStream = requestEnvelope.stream;
     const isCompactRequest = downstreamPath === '/v1/responses/compact';
+    // How long the upstream may stay silent while a stream is open. Shares the first-byte budget
+    // on purpose; see `resolveStreamIdleTimeoutMs`.
+    const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(
+      resolveResponseTimeoutKind({
+        downstreamPath,
+        isStream,
+        body: requestEnvelope.parsed.normalizedBody,
+      }),
+      config,
+    );
     if (isCompactRequest && isStream) {
       return reply.code(400).send({
         error: {
@@ -985,7 +996,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                     stickySessionKey,
                     selected,
                   });
-              await failureToolkit.recordStreamFailure({
+              const streamFailureOutcome = await failureToolkit.handleStreamFailure({
                     selected,
                     requestedModel,
                   modelName,
@@ -996,40 +1007,34 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   completionTokens: parsedUsage.completionTokens,
                   totalTokens: parsedUsage.totalTokens,
                   upstreamPath: successfulUpstreamPath,
-                  originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failure: streamResult.failure ?? { status: streamFailureStatus },
                 failureSource: streamResult.failureSource,
+                isStream,
+                firstByteLatencyMs,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                });
+                retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
+              });
                 await finalizeDebugFailure(streamFailureStatus, {
                   error: {
                     message: streamResult.errorMessage,
                     type: 'stream_error',
                   },
                 }, successfulUpstreamPath);
+                if (streamFailureOutcome.action === 'retry') {
+                  retryCount += 1;
+                  continue;
+                }
                 if (!isResponseCommitted()) {
-                  const terminalFailure = failureToolkit.resolveTerminalFailure({
-                    selected,
-                    requestedModel,
-                    modelName,
-                    status: streamFailureStatus,
-                    message: streamResult.errorMessage || 'stream processing failed',
-                    isStream,
-                    originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                  });
                   if (websocketTransportRequest) {
                     startSseResponse();
                     writeLines([
-                      `event: response.failed\ndata: ${JSON.stringify(streamResult.failure?.payload ?? terminalFailure.payload)}\n\n`,
+                      `event: response.failed\ndata: ${JSON.stringify(streamResult.failure?.payload ?? streamFailureOutcome.payload)}\n\n`,
                       'data: [DONE]\n\n',
                     ]);
                     streamResponse.end();
                     return;
                   }
-                  return reply.code(terminalFailure.status).send(terminalFailure.payload);
+                  return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
                 }
                 return;
                 }
@@ -1117,7 +1122,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   stickySessionKey,
                   selected,
                 });
-              await failureToolkit.recordStreamFailure({
+              const streamFailureOutcome = await failureToolkit.handleStreamFailure({
                   selected,
                   requestedModel,
                 modelName,
@@ -1128,10 +1133,12 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 completionTokens: parsedUsage.completionTokens,
                 totalTokens: parsedUsage.totalTokens,
                 upstreamPath: successfulUpstreamPath,
-                originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failure: streamResult.failure ?? { status: streamFailureStatus },
                 failureSource: streamResult.failureSource,
+                isStream,
+                firstByteLatencyMs,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
               });
               await finalizeDebugFailure(streamFailureStatus, {
                                 error: {
@@ -1139,29 +1146,21 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   type: 'stream_error',
                 },
               }, successfulUpstreamPath);
+              if (streamFailureOutcome.action === 'retry') {
+                retryCount += 1;
+                continue;
+              }
               if (!isResponseCommitted()) {
-                const terminalFailure = failureToolkit.resolveTerminalFailure({
-                  selected,
-                  requestedModel,
-                  modelName,
-                  status: streamFailureStatus,
-                  message: streamResult.errorMessage || 'stream processing failed',
-                  isStream,
-                  originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                });
                 if (websocketTransportRequest) {
                   startSseResponse();
                   writeLines([
-                    `event: response.failed\ndata: ${JSON.stringify(streamResult.failure?.payload ?? terminalFailure.payload)}\n\n`,
+                    `event: response.failed\ndata: ${JSON.stringify(streamResult.failure?.payload ?? streamFailureOutcome.payload)}\n\n`,
                     'data: [DONE]\n\n',
                   ]);
                   streamResponse.end();
                   return;
                 }
-                return reply.code(terminalFailure.status).send(terminalFailure.payload);
+                return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
               }
               return;
               }
@@ -1228,7 +1227,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
               const latency = Date.now() - startTime;
               if (streamResult.status === 'failed') {
                 const streamFailureStatus = streamResult.failure?.status ?? 502;
-              await failureToolkit.recordStreamFailure({
+              const streamFailureOutcome = await failureToolkit.handleStreamFailure({
                   selected,
                   requestedModel,
                   modelName,
@@ -1239,40 +1238,34 @@ export async function handleOpenAiResponsesSurfaceRequest(
                   completionTokens: parsedUsage.completionTokens,
                   totalTokens: parsedUsage.totalTokens,
                   upstreamPath: successfulUpstreamPath,
-                  originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
+                failure: streamResult.failure ?? { status: streamFailureStatus },
                 failureSource: streamResult.failureSource,
+                isStream,
+                firstByteLatencyMs,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                });
+                retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
+              });
                 await finalizeDebugFailure(streamFailureStatus, {
                   error: {
                     message: streamResult.errorMessage,
                     type: 'stream_error',
                   },
                 }, successfulUpstreamPath);
+                if (streamFailureOutcome.action === 'retry') {
+                  retryCount += 1;
+                  continue;
+                }
                 if (!isResponseCommitted()) {
-                  const terminalFailure = failureToolkit.resolveTerminalFailure({
-                    selected,
-                    requestedModel,
-                    modelName,
-                    status: streamFailureStatus,
-                    message: streamResult.errorMessage || 'stream processing failed',
-                    isStream,
-                    originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                  });
                   if (websocketTransportRequest) {
                     startSseResponse();
                     writeLines([
-                      `event: response.failed\ndata: ${JSON.stringify(streamResult.failure?.payload ?? terminalFailure.payload)}\n\n`,
+                      `event: response.failed\ndata: ${JSON.stringify(streamResult.failure?.payload ?? streamFailureOutcome.payload)}\n\n`,
                       'data: [DONE]\n\n',
                     ]);
                     streamResponse.end();
                     return;
                   }
-                  return reply.code(terminalFailure.status).send(terminalFailure.payload);
+                  return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
                 }
                 return;
               }
@@ -1312,7 +1305,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
               },
             }
             : baseReader;
-          const streamResult = await streamSession.run(reader, streamResponse);
+          // A channel that stops sending while holding the connection open must fail the read
+          // rather than hang the downstream request: the failure then travels the ordinary
+          // reader-error path (failover before a commit, in-band terminal frame after one).
+          const streamResult = await streamSession.run(
+            withStreamIdleTimeout(reader, { idleTimeoutMs: streamIdleTimeoutMs }),
+            streamResponse,
+          );
           rawText += decoder.decode();
 
           const latency = Date.now() - startTime;
@@ -1322,7 +1321,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 stickySessionKey,
                 selected,
               });
-              await failureToolkit.recordStreamFailure({
+              const streamFailureOutcome = await failureToolkit.handleStreamFailure({
                 selected,
                 requestedModel,
               modelName,
@@ -1333,39 +1332,34 @@ export async function handleOpenAiResponsesSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              originalPayload: streamResult.failure?.payload,
-              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-            });
+                failure: streamResult.failure ?? { status: streamFailureStatus },
+                failureSource: streamResult.failureSource,
+                isStream,
+                firstByteLatencyMs,
+                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
+              });
             await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
+            if (streamFailureOutcome.action === 'retry') {
+              retryCount += 1;
+              continue;
+            }
             if (!isResponseCommitted()) {
-              const terminalFailure = failureToolkit.resolveTerminalFailure({
-                selected,
-                requestedModel,
-                modelName,
-                status: streamFailureStatus,
-                message: streamResult.errorMessage || 'stream processing failed',
-                isStream,
-                originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-              });
-              return reply.code(terminalFailure.status).send(terminalFailure.payload);
+              return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
             }
             return;
           }
 
-          // Once SSE has been hijacked and bytes may already be on the wire, we
-          // must not attempt to convert stream failures into a fresh HTTP error
-          // response or retry on another channel. Responses stream failures are
-            // handled in-band by the proxy stream session.
-
-            await finalizeStreamSuccess(
+          // Once SSE has been hijacked and bytes may already be on the wire, the failure is
+          // not recoverable by this proxy. Stream failures that arrive BEFORE the commit are
+          // handled above by `handleStreamFailure`, which decides between failing over to
+          // another channel and answering now.
+          await finalizeStreamSuccess(
               parsedUsage,
               latency,
               debugTrace?.options.captureStreamChunks ? rawText : { stream: true, usage: parsedUsage },

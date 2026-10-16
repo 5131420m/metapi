@@ -1877,3 +1877,182 @@ describe('indeterminate 4xx channel retry', () => {
     });
   });
 });
+
+/**
+ * The stream-failure path a surface takes when nothing has been written downstream yet: the
+ * failure is recorded, and then the SAME retry vocabulary a rejected attempt goes through
+ * decides whether spending another channel is worth it. Before this, the surface answered
+ * immediately, so one flaky channel looked fatal to the client.
+ */
+describe('stream failure retry', () => {
+  const selected = {
+    channel: { id: 11, routeId: 22 },
+    account: { id: 33, username: 'oauth-user' },
+    site: { name: 'Relay Site' },
+    actualModel: 'upstream-model',
+  };
+
+  beforeEach(() => {
+    recordFailureMock.mockReset();
+    shouldRetryProxyRequestMock.mockReset();
+    insertProxyLogMock.mockReset();
+    composeProxyLogMessageMock.mockReset();
+    formatUtcSqlDateTimeMock.mockReset();
+    composeProxyLogMessageMock.mockReturnValue('normalized error');
+    formatUtcSqlDateTimeMock.mockReturnValue('2026-03-21 22:00:00');
+    insertProxyLogMock.mockResolvedValue(undefined);
+    recordFailureMock.mockResolvedValue(undefined);
+    shouldRetryProxyRequestMock.mockReturnValue(false);
+  });
+
+  async function buildToolkit(downstreamApiKeyId: number | null = null) {
+    const { createSurfaceFailureToolkit } = await import('./sharedSurface.js');
+    return createSurfaceFailureToolkit({
+      warningScope: 'chat',
+      downstreamPath: '/v1/chat/completions',
+      maxRetries: 2,
+      clientContext: null,
+      downstreamApiKeyId,
+    });
+  }
+
+  function streamFailure(toolkit: Awaited<ReturnType<typeof buildToolkit>>, args: {
+    retryCount: number;
+    phase?: 'precommit' | 'postcommit';
+    failureSource?: 'upstream' | 'processing';
+    retryAllowed?: boolean;
+    status?: number;
+    errorMessage?: string;
+  }) {
+    return toolkit.handleStreamFailure({
+      selected,
+      requestedModel: 'gpt-5.6',
+      modelName: 'upstream-model',
+      httpStatus: args.status ?? 502,
+      failure: { status: args.status ?? 502, message: args.errorMessage ?? 'upstream chat stream interrupted', payload: { error: { message: args.errorMessage ?? 'upstream chat stream interrupted' } } },
+      errorMessage: args.errorMessage ?? 'upstream chat stream interrupted',
+      isStream: true,
+      firstByteLatencyMs: 120,
+      latencyMs: 480,
+      retryCount: args.retryCount,
+      phase: args.phase ?? 'precommit',
+      failureSource: args.failureSource,
+      retryAllowed: args.retryAllowed,
+    });
+  }
+
+  it('retries a pre-commit upstream stream failure through the shared retry vocabulary', async () => {
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    const toolkit = await buildToolkit();
+
+    await expect(streamFailure(toolkit, { retryCount: 0 })).resolves.toEqual({ action: 'retry' });
+    expect(shouldRetryProxyRequestMock).toHaveBeenCalledWith(502, 'upstream chat stream interrupted');
+  });
+
+  it('answers once the attempt budget is spent', async () => {
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    const toolkit = await buildToolkit();
+
+    const outcome = await streamFailure(toolkit, { retryCount: 2 });
+    expect(outcome).toMatchObject({ action: 'respond', status: 502 });
+    expect(outcome.payload).toMatchObject({ error: { message: 'upstream chat stream interrupted' } });
+  });
+
+  it('does not authorize a retry the surface cannot reach', async () => {
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    const toolkit = await buildToolkit();
+
+    // A tester-pinned channel cannot be replaced, so the outcome is a plain answer: a retry
+    // outcome would leave the caller with nothing to send.
+    const outcome = await streamFailure(toolkit, { retryCount: 0, retryAllowed: false });
+    expect(outcome).toMatchObject({ action: 'respond', status: 502 });
+  });
+
+  it('never retries a transformer-side processing failure', async () => {
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    const toolkit = await buildToolkit();
+
+    // Another channel would return the same payload our own transformer failed to parse, so
+    // the attempt budget would be spent re-downloading it.
+    const outcome = await streamFailure(toolkit, { retryCount: 0, failureSource: 'processing' });
+    expect(outcome).toMatchObject({ action: 'respond', status: 502 });
+    expect(shouldRetryProxyRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('never retries a committed stream failure', async () => {
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    const toolkit = await buildToolkit();
+
+    const outcome = await streamFailure(toolkit, { retryCount: 0, phase: 'postcommit' });
+    expect(outcome).toMatchObject({ action: 'respond', status: 502 });
+    expect(shouldRetryProxyRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('flags a committed upstream stream break as stream-interrupted channel damage', async () => {
+    const toolkit = await buildToolkit();
+    await streamFailure(toolkit, { retryCount: 1, phase: 'postcommit' });
+
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      modelName: 'upstream-model',
+      failureKind: 'stream-interrupted',
+    }));
+  });
+
+  it('does not blame the channel for a pre-commit or processing failure', async () => {
+    const toolkit = await buildToolkit();
+
+    await streamFailure(toolkit, { retryCount: 1, failureSource: 'processing' });
+    expect(recordFailureMock).not.toHaveBeenCalled();
+
+    await streamFailure(toolkit, { retryCount: 1, phase: 'precommit' });
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.not.objectContaining({
+      failureKind: expect.anything(),
+    }));
+  });
+
+  /**
+   * The operator's failure keyword list used to apply only to whole-body reads, so a streaming
+   * client — the one that cannot route around a bad channel by itself — silently did not get it.
+   */
+  it('retries a stream failure whose text matches a configured failure keyword', async () => {
+    const { config } = await import('../../config.js');
+    const previousKeywords = config.proxyErrorKeywords;
+    config.proxyErrorKeywords = ['insufficient balance'];
+    // The failure carries a status the standard vocabulary declines, so only the keyword rule can
+    // authorize this retry. 502 is the status the whole-body path assigns on a match.
+    shouldRetryProxyRequestMock.mockImplementation((status: number) => status === 502);
+    try {
+      const toolkit = await buildToolkit();
+      const outcome = await streamFailure(toolkit, {
+        retryCount: 0,
+        status: 400,
+        errorMessage: 'insufficient balance in upstream account',
+      });
+
+      expect(outcome).toEqual({ action: 'retry' });
+      expect(shouldRetryProxyRequestMock).toHaveBeenCalledWith(400, 'insufficient balance in upstream account');
+      expect(shouldRetryProxyRequestMock).toHaveBeenCalledWith(502, 'insufficient balance in upstream account');
+    } finally {
+      config.proxyErrorKeywords = previousKeywords;
+    }
+  });
+
+  it('answers when the stream failure text matches no configured keyword', async () => {
+    const { config } = await import('../../config.js');
+    const previousKeywords = config.proxyErrorKeywords;
+    config.proxyErrorKeywords = ['insufficient balance'];
+    shouldRetryProxyRequestMock.mockImplementation((status: number) => status === 502);
+    try {
+      const toolkit = await buildToolkit();
+      const outcome = await streamFailure(toolkit, {
+        retryCount: 0,
+        status: 400,
+        errorMessage: 'model not found on this channel',
+      });
+
+      expect(outcome).toMatchObject({ action: 'respond', status: 400 });
+    } finally {
+      config.proxyErrorKeywords = previousKeywords;
+    }
+  });
+});

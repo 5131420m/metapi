@@ -23,6 +23,7 @@ import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { reportProxyAllFailed } from '../../services/alertService.js';
 import { markResponsesWebsocketBridgeRequest } from './responsesWebsocketBridgeContext.js';
 import { sanitizePostcommitFailureMessage } from '../../services/downstreamErrorPolicy.js';
+import { POSTCOMMIT_STREAM_FAILURE_CODE } from '../../services/upstreamFailureSignals.js';
 
 const installedApps = new WeakSet<FastifyInstance>();
 const WS_TURN_STATE_HEADER = 'x-codex-turn-state';
@@ -320,9 +321,9 @@ function sanitizeResponsesWebsocketTerminalPayload(
   if (message === sourceError.message) return payload;
   const cloned = cloneJsonObject(payload);
   if (isRecord(cloned.response) && isRecord(cloned.response.error)) {
-    cloned.response.error = { ...cloned.response.error, message };
+    cloned.response.error = { ...cloned.response.error, message, code: POSTCOMMIT_STREAM_FAILURE_CODE };
   } else if (isRecord(cloned.error)) {
-    cloned.error = { ...cloned.error, message };
+    cloned.error = { ...cloned.error, message, code: POSTCOMMIT_STREAM_FAILURE_CODE };
   }
   return cloned;
 }

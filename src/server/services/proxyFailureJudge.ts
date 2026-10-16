@@ -19,6 +19,27 @@ function normalizeKeywords(values: string[]): string[] {
     .map((item) => item.toLowerCase());
 }
 
+/**
+ * The configured failure keyword this text matches, if any.
+ *
+ * Exported because the rule has two consumers that must agree on it: the whole-body judge below,
+ * and the stream-failure path, which only ever sees the upstream's error text rather than a body.
+ * A stream that dies mid-answer previously skipped this rule entirely — the operator's keyword
+ * list silently did not apply to streaming clients, which are exactly the ones that cannot
+ * recover from a bad channel by themselves.
+ *
+ * Matching is a plain lowercased substring test: the list is operator-authored, so a regular
+ * expression here would be a second, undocumented language in a settings field.
+ */
+export function findProxyFailureKeyword(rawText: string | null | undefined): string | null {
+  const text = typeof rawText === 'string' ? rawText : '';
+  if (!text) return null;
+  const keywords = normalizeKeywords(config.proxyErrorKeywords || []);
+  if (keywords.length === 0) return null;
+  const normalizedText = text.toLowerCase();
+  return keywords.find((keyword) => normalizedText.includes(keyword)) ?? null;
+}
+
 function toNonNegativeInt(value: unknown): number {
   const n = typeof value === 'number' ? value : Number(value);
   if (!Number.isFinite(n)) return 0;
@@ -175,16 +196,12 @@ export function detectProxyFailure(input: {
   totalTokens?: number;
 }): FailureResult | null {
   const rawText = typeof input.rawText === 'string' ? input.rawText : '';
-  const keywords = normalizeKeywords(config.proxyErrorKeywords || []);
-  if (keywords.length > 0) {
-    const normalizedText = rawText.toLowerCase();
-    const matched = keywords.find((keyword) => normalizedText.includes(keyword));
-    if (matched) {
-      return {
-        status: 502,
-        reason: `Upstream response matched failure keyword: ${matched}`,
-      };
-    }
+  const matchedKeyword = findProxyFailureKeyword(rawText);
+  if (matchedKeyword) {
+    return {
+      status: 502,
+      reason: `Upstream response matched failure keyword: ${matchedKeyword}`,
+    };
   }
 
   if (config.proxyEmptyContentFailEnabled) {

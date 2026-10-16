@@ -1,4 +1,4 @@
-import { isUpstreamWrapperFailureText } from './upstreamFailureSignals.js';
+import { POSTCOMMIT_STREAM_FAILURE_MESSAGE, isUpstreamWrapperFailureText } from './upstreamFailureSignals.js';
 
 export const DOWNSTREAM_ERROR_POLICY_MODES = [
   'off',
@@ -153,6 +153,14 @@ export function resolveIndeterminateRetryCeiling(input: {
   );
 }
 
+/**
+ * The public wording for a stream that broke after the response was committed, for a
+ * downstream key that opted into resilient failures.
+ *
+ * Returns the caller's own message unchanged for any other key: the redaction is a per-key
+ * service level, so a deployment that did not ask for it keeps seeing the upstream's text (and
+ * its own diagnosis).
+ */
 export function sanitizePostcommitFailureMessage(input: {
   message: string;
   downstreamApiKeyId?: number | null;
@@ -165,7 +173,7 @@ export function sanitizePostcommitFailureMessage(input: {
   ) {
     return input.message;
   }
-  return 'The upstream stream failed after output began.';
+  return POSTCOMMIT_STREAM_FAILURE_MESSAGE;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -13,6 +13,7 @@ import {
   serializePublicTerminalFailure,
   sanitizePostcommitFailureMessage,
 } from './downstreamErrorPolicy.js';
+import { POSTCOMMIT_STREAM_FAILURE_MESSAGE } from './upstreamFailureSignals.js';
 
 const resilientPolicy = parseDownstreamErrorPolicyConfig({
   mode: 'resilient',
@@ -42,12 +43,22 @@ describe('downstream terminal error policy', () => {
       message: 'invalid api key sk-secret from upstream vendor',
       downstreamApiKeyId: 12,
       policy,
-    })).toBe('The upstream stream failed after output began.');
+    })).toBe(POSTCOMMIT_STREAM_FAILURE_MESSAGE);
     expect(sanitizePostcommitFailureMessage({
       message: 'invalid api key sk-secret from upstream vendor',
       downstreamApiKeyId: 13,
       policy,
     })).toBe('invalid api key sk-secret from upstream vendor');
+  });
+
+  it('keeps the failure class readable through the redaction', () => {
+    // A downstream client that classifies on text (which is most of them) must be able to tell
+    // a dropped connection from a request defect, or it files this under "unknown error, do not
+    // retry" and ends the session. The wording is a contract, so it is asserted, not assumed.
+    expect(POSTCOMMIT_STREAM_FAILURE_MESSAGE).toMatch(/connection|terminated|stream ended/i);
+    // …and must NOT trip the classes those clients check FIRST, which are non-retryable.
+    expect(POSTCOMMIT_STREAM_FAILURE_MESSAGE).not.toMatch(/\b(?:400|401|403|413|422|429|5\d\d)\b/);
+    expect(POSTCOMMIT_STREAM_FAILURE_MESSAGE).not.toMatch(/quota|invalid.?request|api.?key/i);
   });
   it('does not rewrite an attempt-level upstream failure', () => {
     const failure = {

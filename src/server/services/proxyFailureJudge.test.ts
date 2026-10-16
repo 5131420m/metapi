@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { config } from '../config.js';
-import { detectProxyFailure } from './proxyFailureJudge.js';
+import { detectProxyFailure, findProxyFailureKeyword } from './proxyFailureJudge.js';
 
 describe('detectProxyFailure (empty content)', () => {
   const originalEmptyFail = config.proxyEmptyContentFailEnabled;
@@ -135,5 +135,37 @@ describe('detectProxyFailure (empty content)', () => {
     });
 
     expect(failure).toMatchObject({ status: 502 });
+  });
+});
+
+/**
+ * The keyword rule is shared: the whole-body judge reads it off a response body, and the
+ * stream-failure path reads it off the upstream's error text. Both must agree, so it is one
+ * exported predicate rather than two list scans.
+ */
+describe('findProxyFailureKeyword', () => {
+  const originalKeywords = Array.isArray(config.proxyErrorKeywords) ? [...config.proxyErrorKeywords] : config.proxyErrorKeywords;
+
+  afterEach(() => {
+    config.proxyErrorKeywords = originalKeywords as any;
+  });
+
+  it('matches case-insensitively after trimming the configured entries', () => {
+    config.proxyErrorKeywords = ['  Insufficient Balance  '];
+    expect(findProxyFailureKeyword('upstream says: INSUFFICIENT BALANCE in account')).toBe('insufficient balance');
+  });
+
+  it('returns null when nothing matches, when the text is empty, or when none are configured', () => {
+    config.proxyErrorKeywords = ['quota exceeded'];
+    expect(findProxyFailureKeyword('upstream chat stream interrupted')).toBeNull();
+    expect(findProxyFailureKeyword('')).toBeNull();
+    expect(findProxyFailureKeyword(null)).toBeNull();
+    config.proxyErrorKeywords = [];
+    expect(findProxyFailureKeyword('quota exceeded')).toBeNull();
+  });
+
+  it('ignores blank entries instead of matching every text', () => {
+    config.proxyErrorKeywords = ['', '   '];
+    expect(findProxyFailureKeyword('anything at all')).toBeNull();
   });
 });

@@ -105,3 +105,26 @@ export function resolveResponseTimeoutMs(
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return 0;
   return Math.trunc(raw * 1000);
 }
+
+/**
+ * The budget for a silence AFTER the stream has started, applied per read.
+ *
+ * Deliberately the same knob as the first-byte budget: both answer one operator question — "how
+ * long may the upstream be silent before we stop waiting?" — and a second knob would let a
+ * deployment configure them inconsistently (a 10s first-byte budget beside a 10-minute mid-stream
+ * budget cannot be what was meant). Disabled with it too: an operator who removed the wait limit
+ * must not receive a hidden deadline instead.
+ *
+ * The trade-off is real and is why this is one sentence rather than one number: a deployment that
+ * keeps the first-byte budget short (a healthy failover trigger for slow channels) now also caps
+ * an inter-chunk gap, so a relay that legitimately goes quiet mid-answer for longer must raise the
+ * setting. Only streaming responses are watched — a non-stream or media body arrives as one piece,
+ * so its observed-timeout budget already covers the whole wait.
+ */
+export function resolveStreamIdleTimeoutMs(
+  kind: ResponseTimeoutKind,
+  settings: ResponseTimeoutSettingsLike,
+): number {
+  if (kind !== 'stream') return 0;
+  return resolveResponseTimeoutMs('stream', settings);
+}

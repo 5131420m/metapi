@@ -44,6 +44,9 @@ it('uses a public-message sanitizer only for postcommit Chat terminal bytes', as
   expect(result.errorMessage).toBe('invalid api key sk-secret');
   expect(lines.join('')).toContain('sanitized postcommit failure');
   expect(lines.join('')).not.toContain('sk-secret');
+  // The machine code travels with the frame, so a client that reads structured errors can route
+  // on it instead of pattern-matching prose.
+  expect(lines.join('')).toContain('metapi_stream_interrupted');
 });
 
 function createSession(lines: string[], downstreamFormat: 'openai' | 'claude' = 'openai') {

@@ -76,7 +76,19 @@ export type SiteRuntimeFailureContext = {
   status?: number | null;
   errorText?: string | null;
   modelName?: string | null;
-  failureKind?: 'first-byte-timeout' | null;
+  /**
+   * What kind of failure this was, when the caller knows more than status and text say.
+   *
+   * `first-byte-timeout` is an observed timeout budget being spent, not channel damage, so it
+   * is exempt from the failure bookkeeping entirely (see `isExemptTimeoutFailure`).
+   *
+   * `stream-interrupted` is its opposite. The channel accepted the request, produced output,
+   * and then broke the stream AFTER the response was already committed downstream — a failure
+   * the proxy cannot recover from, because the bytes are on the wire. That is confirmed
+   * channel damage rather than one unlucky request, so it escalates a cooldown immediately
+   * instead of waiting for the ordinary failure streak (see `isStreamInterruptedFailure`).
+   */
+  failureKind?: 'first-byte-timeout' | 'stream-interrupted' | null;
 };
 
 type SiteRuntimeHealthState = {
@@ -191,13 +203,21 @@ const SOFT_AVOIDANCE_MAX_MS = 10 * 60 * 1000;
  * explicit reset hint). Such a cooldown must be waited out: probing it early achieves
  * nothing and looks like abuse to the provider. `METAPI_BACKOFF` is our own failure
  * escalation, which a successful recovery probe is allowed to cut short.
+ *
+ * `STREAM_INTERRUPTED` is our own escalation too, but states a stronger reason: the channel
+ * had already started answering and then dropped the stream. It is kept distinct from
+ * `METAPI_BACKOFF` because the two answer different operator questions — "this channel is
+ * failing" versus "this channel breaks mid-answer" — and because a stream break escalates on
+ * its own scale rather than through the consecutive-failure streak.
  */
 export const COOLDOWN_SOURCE_PROVIDER_QUOTA = 'provider_quota';
 export const COOLDOWN_SOURCE_METAPI_BACKOFF = 'metapi_backoff';
+export const COOLDOWN_SOURCE_STREAM_INTERRUPTED = 'stream_interrupted';
 
 export type CooldownSource =
   | typeof COOLDOWN_SOURCE_PROVIDER_QUOTA
-  | typeof COOLDOWN_SOURCE_METAPI_BACKOFF;
+  | typeof COOLDOWN_SOURCE_METAPI_BACKOFF
+  | typeof COOLDOWN_SOURCE_STREAM_INTERRUPTED;
 
 type CooldownSourceAwareChannel = {
   cooldownUntil?: string | null;
@@ -783,6 +803,53 @@ function resolveStreamTimingQualityMetrics(
 function isExemptTimeoutFailure(context: SiteRuntimeFailureContext = {}): boolean {
   if (config.timeoutCountsAsChannelFailure) return false;
   return context.failureKind === 'first-byte-timeout';
+}
+
+/**
+ * A stream that broke after the response was already committed downstream.
+ *
+ * Escalation is immediate rather than streak-based, and the reason is the failure itself
+ * rather than the request: the channel accepted the request, answered, and then dropped the
+ * connection. Two things follow.
+ *
+ *  - The downstream request is already damaged and cannot be recovered by this proxy, so the
+ *    only thing that can prevent a repeat is keeping the channel out of selection. Waiting
+ *    for three consecutive failures (the round-robin threshold) means the next two requests
+ *    are allowed to hit the same channel and break the same way.
+ *  - The evidence is stronger than a failed attempt: an HTTP 5xx can come from the request,
+ *    while a mid-stream break after a successful start is the channel's own link failing.
+ *
+ * The streak is deliberately NOT consulted for the level, and is reset after escalating: this
+ * branch counts stream breaks on its own scale, so mixing an ordinary failure streak into it
+ * would escalate twice for one underlying fault.
+ */
+function isStreamInterruptedFailure(context: SiteRuntimeFailureContext = {}): boolean {
+  return context.failureKind === 'stream-interrupted';
+}
+
+/**
+ * One step up the shared cooldown ladder for a channel we have just caught breaking a stream.
+ *
+ * Reuses `ROUND_ROBIN_COOLDOWN_LEVELS_SEC` on purpose: one ladder for "how long do we keep a
+ * damaged channel out", so the two mechanisms cannot drift into disagreeing about severity.
+ * Level `0` is a zero-second entry, so the first stream break lands on the next rung (10
+ * minutes) rather than on no cooldown at all.
+ */
+function resolveStreamInterruptedCooldown(level: number, nowMs: number): {
+  cooldownLevel: number;
+  cooldownUntil: string | null;
+} {
+  const escalatedLevel = Math.min(
+    Math.max(0, Math.trunc(level)) + 1,
+    ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1,
+  );
+  const cooldownSec = resolveRoundRobinCooldownSec(escalatedLevel);
+  return {
+    cooldownLevel: escalatedLevel,
+    cooldownUntil: cooldownSec > 0
+      ? new Date(nowMs + resolveJitteredFailureCooldownMs(cooldownSec * 1000)).toISOString()
+      : null,
+  };
 }
 
 // NOTE: deliberately has NO timeout exemption of its own. Its only caller chain is
@@ -3341,6 +3408,15 @@ export class TokenRouter {
           cooldownSource = COOLDOWN_SOURCE_PROVIDER_QUOTA;
           consecutiveFailCount = 0;
           cooldownLevel = 0;
+        } else if (isStreamInterruptedFailure(normalizedContext)) {
+          // Confirmed damage outranks the configured strategy: a member that breaks streams
+          // mid-answer is cooled on its own scale even under stick_until_unavailable, which
+          // by design never cools on ordinary failures.
+          const escalated = resolveStreamInterruptedCooldown(cooldownLevel, nowMs);
+          cooldownLevel = escalated.cooldownLevel;
+          cooldownUntil = escalated.cooldownUntil;
+          cooldownSource = cooldownUntil ? COOLDOWN_SOURCE_STREAM_INTERRUPTED : null;
+          consecutiveFailCount = 0;
         } else if (routeUnitStrategy === 'round_robin') {
           if (consecutiveFailCount >= ROUND_ROBIN_FAILURE_THRESHOLD) {
             cooldownLevel = Math.min(cooldownLevel + 1, ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1);
@@ -3413,6 +3489,16 @@ export class TokenRouter {
       cooldownSource = COOLDOWN_SOURCE_PROVIDER_QUOTA;
       consecutiveFailCount = 0;
       cooldownLevel = 0;
+    } else if (isStreamInterruptedFailure(normalizedContext)) {
+      // Deliberately before the strategy split, so the escalation does not depend on the
+      // route being round-robin: the round-robin threshold exists to keep one unlucky
+      // request from cooling a channel, and a mid-stream break after a successful start is
+      // not that — it is the channel's own link failing.
+      const escalated = resolveStreamInterruptedCooldown(cooldownLevel, nowMs);
+      cooldownLevel = escalated.cooldownLevel;
+      cooldownUntil = escalated.cooldownUntil;
+      cooldownSource = cooldownUntil ? COOLDOWN_SOURCE_STREAM_INTERRUPTED : null;
+      consecutiveFailCount = 0;
     } else if (routeStrategy === 'round_robin') {
       if (consecutiveFailCount >= ROUND_ROBIN_FAILURE_THRESHOLD) {
         cooldownLevel = Math.min(cooldownLevel + 1, ROUND_ROBIN_COOLDOWN_LEVELS_SEC.length - 1);

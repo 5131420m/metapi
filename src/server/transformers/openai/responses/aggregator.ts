@@ -1348,6 +1348,12 @@ export function failResponsesStream(
       ? errorPayload.error.message
       : (typeof errorPayload?.message === 'string' ? errorPayload.message : 'upstream stream failed')
   );
+  // The failure code travels with the frame when the payload carries one, so a client that reads
+  // structured errors can route on it instead of pattern-matching prose. Absent for every caller
+  // that does not set one, so the emitted shape is unchanged there.
+  const errorCode = isRecord(errorPayload?.error) && typeof errorPayload.error.code === 'string' && errorPayload.error.code.length > 0
+    ? errorPayload.error.code
+    : null;
   return [
     ...lines,
     serializeSse('response.failed', {
@@ -1356,6 +1362,7 @@ export function failResponsesStream(
       error: {
         message,
         type: 'upstream_error',
+        ...(errorCode ? { code: errorCode } : {}),
       },
     }),
     serializeDone(),

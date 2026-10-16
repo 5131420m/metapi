@@ -1595,7 +1595,11 @@ export default function Settings() {
               marginBottom: 12,
             }}
           />
-          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 12 }}>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
+            关键词用于<strong>非流式</strong>响应正文，也用于<strong>流式</strong>请求的上游报错文本。
+            流式下模型正文里的同一个词不会被当作失败（正文里出现「额度不足」这类说明是正常输出）。
+          </div>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--color-text-secondary)', marginBottom: 6 }}>
             <input
               type="checkbox"
               checked={runtime.proxyEmptyContentFailEnabled}
@@ -1603,10 +1607,17 @@ export default function Settings() {
             />
             空内容（completion=0，即使 prompt 有 token 也算）判定失败
           </label>
+          <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 12 }}>
+            仅适用于<strong>完整到达</strong>的响应：非流式响应正文，以及正常收尾的流式响应（按{' '}
+            <code style={{ fontFamily: 'var(--font-mono)' }}>OpenAI Chat / Responses</code>
+            {' '}格式判定完整输出）。
+            流中途断掉属于传输故障，由下面的终态错误策略处理，不受此项控制。
+          </div>
           <div style={{ borderTop: '1px solid var(--color-border)', paddingTop: 12, marginTop: 4, marginBottom: 12 }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>下游终态错误策略</div>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 8 }}>
-              仅在通道尝试预算耗尽或无候选路由、且响应尚未提交时生效。禁止伪造 2xx、assistant 文本和 tool call。
+              改写<strong>尚未提交</strong>时的终态错误（通道尝试预算耗尽或无候选路由），并<strong>脱敏已提交后</strong>的
+              中断错误文本。任何情况下都不伪造 2xx、assistant 文本和 tool call。
             </div>
             <select
               value={runtime.downstreamErrorPolicy.mode}
@@ -1624,7 +1635,15 @@ export default function Settings() {
             </select>
             {runtime.downstreamErrorPolicy.mode === 'resilient' && (
               <div style={{ display: 'grid', gap: 6 }}>
-                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>专用下游 API Key（可多选）</div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)' }}>
+                  专用下游 API Key（可多选）——只有勾选的 Key 享受下面的改写与脱敏
+                </div>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 2 }}>
+                  响应已经开始下发之后上游才断流时，无法换通道重来（客户端已经拿到半截内容）。
+                  此时把上游原文替换为一句固定的传输类错误文本，并带上稳定错误码{' '}
+                  <code style={{ fontFamily: 'var(--font-mono)' }}>metapi_stream_interrupted</code>
+                  {' '}——脱敏只去掉上游身份，不去掉「故障类别」，否则按文本分类的客户端会把它当成未知错误而整轮终止。
+                </div>
                 {downstreamApiKeys.length === 0 ? (
                   <div style={{ fontSize: 12, color: 'var(--color-warning)' }}>暂无已管理的下游 API Key，请先在下游 API Keys 页面创建专用 Key。</div>
                 ) : downstreamApiKeys.map((item) => (

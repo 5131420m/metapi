@@ -9,6 +9,7 @@ import {
 import { openAiChatStream } from './streamBridge.js';
 import { config } from '../../../config.js';
 import { extractTypedStreamFailure, type TypedStreamFailure } from '../../shared/streamFailure.js';
+import { POSTCOMMIT_STREAM_FAILURE_CODE } from '../../../services/upstreamFailureSignals.js';
 
 type StreamReader = {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -106,13 +107,13 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
     }
     if (input.downstreamFormat === 'openai') {
       input.writeLines([
-        `data: ${JSON.stringify({ error: { message: publicErrorMessage, type: 'upstream_error' } })}\n\n`,
+        `data: ${JSON.stringify({ error: { message: publicErrorMessage, type: 'upstream_error', code: POSTCOMMIT_STREAM_FAILURE_CODE } })}\n\n`,
         ...downstreamTransformer.serializeDone(streamContext, claudeContext),
       ]);
       return;
     }
     input.writeLines([
-      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: publicErrorMessage } })}\n\n`,
+      `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', code: POSTCOMMIT_STREAM_FAILURE_CODE, message: publicErrorMessage } })}\n\n`,
     ]);
   };
 
@@ -353,14 +354,14 @@ export function createChatProxyStreamSession(input: ChatProxyStreamSessionInput)
         if (input.downstreamFormat === 'openai') {
           const publicErrorMessage = toPublicFailureMessage(terminalResult.errorMessage || 'upstream stream failed');
           input.writeLines([
-            `data: ${JSON.stringify({ error: { message: publicErrorMessage, type: 'upstream_error' } })}\n\n`,
+            `data: ${JSON.stringify({ error: { message: publicErrorMessage, type: 'upstream_error', code: POSTCOMMIT_STREAM_FAILURE_CODE } })}\n\n`,
             ...downstreamTransformer.serializeDone(streamContext, claudeContext),
           ]);
           return true;
         }
         const publicErrorMessage = toPublicFailureMessage(terminalResult.errorMessage || 'upstream stream failed');
         input.writeLines([
-          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', message: publicErrorMessage } })}\n\n`,
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'upstream_error', code: POSTCOMMIT_STREAM_FAILURE_CODE, message: publicErrorMessage } })}\n\n`,
         ]);
         return true;
       }

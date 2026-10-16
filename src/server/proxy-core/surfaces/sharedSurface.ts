@@ -8,6 +8,7 @@ import type { DownstreamRoutingPolicy } from '../../services/downstreamPolicyTyp
 import { reportProxyAllFailed, reportTokenExpired } from '../../services/alertService.js';
 import { isTokenExpiredError } from '../../services/alertRules.js';
 import { shouldRetryProxyRequest } from '../../services/proxyRetryPolicy.js';
+import { findProxyFailureKeyword } from '../../services/proxyFailureJudge.js';
 import { composeProxyLogMessage } from '../../services/proxyLogMessage.js';
 import { resolveProxyLogBilling } from '../../services/proxyBilling.js';
 import type { DownstreamClientContext } from '../downstreamClientContext.js';
@@ -58,6 +59,20 @@ type SurfaceFailureResponse = {
 type SurfaceFailureOutcome =
   | { action: 'retry' }
   | SurfaceFailureResponse;
+
+/**
+ * The part of a transformer's typed stream failure the failure toolkit has to reason about.
+ *
+ * Structural rather than an import of `TypedStreamFailure`: the toolkit's job is to decide
+ * whether a channel is worth spending again, and that decision needs the status and the raw
+ * payload, not the transformer's own type. Keeping it structural also means a surface that
+ * reports a stream failure it built itself cannot fail to type-check against this contract.
+ */
+type SurfaceStreamFailure = {
+  status?: number;
+  message?: string;
+  payload?: unknown;
+};
 
 type SurfaceOauthRefreshSelectedChannel = {
   account: {
@@ -740,6 +755,109 @@ export function createSurfaceFailureToolkit(input: {
       });
   };
 
+  /**
+   * Records one stream failure: the canonical terminal-failure evidence, the channel-health
+   * failure, and the proxy log entry.
+   *
+   * Kept as a free function rather than a member so `handleStreamFailure` can call it: the
+   * retry decision has to run AFTER the failure is recorded (a retry must not leave the
+   * failed attempt unaccounted for), and object-literal members cannot reach each other
+   * without `this`. Both are exported on the toolkit because the surfaces' post-commit paths
+   * record a failure they cannot act on.
+   */
+  const recordStreamFailure = async (args: {
+    selected: SurfaceSelectedChannel;
+    requestedModel: string;
+    modelName: string;
+    errorMessage: string | null;
+    isStream?: boolean | null;
+    firstByteLatencyMs?: number | null;
+    latencyMs: number;
+    retryCount: number;
+    promptTokens?: number | null;
+    completionTokens?: number | null;
+    totalTokens?: number | null;
+    upstreamPath?: string | null;
+    httpStatus?: number;
+    runtimeFailureStatus?: number | null;
+    failureSource?: 'upstream' | 'processing';
+    originalPayload?: unknown;
+    phase?: 'precommit' | 'postcommit';
+    terminalScope?: 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
+    attemptedChannelCount?: number;
+    maxChannelAttempts?: number;
+    eligibleChannelCount?: number;
+    /**
+     * What kind of failure this was, when the caller knows more than the status says.
+     *
+     * `stream-interrupted` marks a stream that broke mid-answer and is the ONLY value the
+     * channel-health path escalates immediately (see `isStreamInterruptedFailure`). A
+     * transformer-side `processing` fault must not carry it: that failure is our own defect
+     * and says nothing about the channel, so it is recorded as an ordinary failure.
+     */
+    failureKind?: 'stream-interrupted' | null;
+  }) => {
+    const errorMessage = args.errorMessage || 'stream processing failed';
+    if (args.failureSource === 'processing') {
+      await log({
+        selected: args.selected,
+        modelRequested: args.requestedModel,
+        status: 'failed',
+        httpStatus: args.httpStatus ?? 200,
+        isStream: args.isStream ?? null,
+        firstByteLatencyMs: args.firstByteLatencyMs ?? null,
+        latencyMs: args.latencyMs,
+        errorMessage,
+        retryCount: args.retryCount,
+        promptTokens: args.promptTokens,
+        completionTokens: args.completionTokens,
+        totalTokens: args.totalTokens,
+        upstreamPath: args.upstreamPath,
+      });
+      return;
+    }
+    terminalFailures.push(buildCanonicalUpstreamFailure({
+      status: args.runtimeFailureStatus ?? args.httpStatus ?? 502,
+      message: errorMessage,
+      protocol: input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat',
+      transport: 'sse',
+      phase: args.phase ?? 'postcommit',
+      terminalScope: args.terminalScope,
+      attemptedChannelCount: args.attemptedChannelCount,
+      maxChannelAttempts: args.maxChannelAttempts,
+      eligibleChannelCount: args.eligibleChannelCount,
+      requestedModel: args.requestedModel,
+      upstreamModel: args.modelName,
+      channelId: args.selected.channel.id,
+      downstreamApiKeyId: input.downstreamApiKeyId,
+      originalPayload: args.originalPayload,
+    }));
+    // Built conditionally so a plain stream failure keeps the exact context shape it had
+    // before `failureKind` existed: only the new, stronger reason adds a field.
+    const failureContext = {
+      ...(typeof args.runtimeFailureStatus === 'number' ? { status: args.runtimeFailureStatus } : {}),
+      errorText: errorMessage,
+      modelName: args.modelName,
+      ...(args.failureKind ? { failureKind: args.failureKind } : {}),
+    };
+    await tokenRouter.recordFailure(args.selected.channel.id, failureContext);
+    await log({
+      selected: args.selected,
+      modelRequested: args.requestedModel,
+      status: 'failed',
+      httpStatus: args.httpStatus ?? 200,
+      isStream: args.isStream ?? null,
+      firstByteLatencyMs: args.firstByteLatencyMs ?? null,
+      latencyMs: args.latencyMs,
+      errorMessage,
+      retryCount: args.retryCount,
+      promptTokens: args.promptTokens,
+      completionTokens: args.completionTokens,
+      totalTokens: args.totalTokens,
+      upstreamPath: args.upstreamPath,
+    });
+  };
+
   return {
     log,
     /**
@@ -963,6 +1081,148 @@ export function createSurfaceFailureToolkit(input: {
       });
     },
 
+    /**
+     * The stream-failure sibling of `handleUpstreamFailure`, sharing its retry vocabulary.
+     *
+     * A stream that fails BEFORE anything was written downstream is recoverable by this
+     * proxy: the client has not been answered yet, so another channel can still produce the
+     * whole response. Routing it through the same predicates as a rejected attempt is what
+     * keeps the two paths from disagreeing — a mid-stream error carrying a retryable status
+     * (or a body a sibling channel would accept) is exactly the failure a resilience policy
+     * exists to absorb.
+     *
+     * The caller decides whether retrying is physically possible; this only decides whether
+     * it is worth spending a channel on.
+     */
+    async handleStreamFailure(args: {
+      selected: SurfaceSelectedChannel;
+      requestedModel: string;
+      modelName: string;
+      httpStatus?: number;
+      failure: SurfaceStreamFailure;
+      errorMessage: string | null;
+      failureSource?: 'upstream' | 'processing';
+      isStream?: boolean | null;
+      transport?: 'sse' | 'http' | 'websocket';
+      firstByteLatencyMs?: number | null;
+      latencyMs: number;
+      retryCount: number;
+      promptTokens?: number | null;
+      completionTokens?: number | null;
+      totalTokens?: number | null;
+      upstreamPath?: string | null;
+      /** Where the failure happened relative to the downstream commit. */
+      phase?: 'precommit' | 'postcommit';
+      /**
+       * Whether the surface can still reach another channel for this request.
+       *
+       * A retry this toolkit authorizes is only reachable if the caller can actually select
+       * another channel (a tester-pinned channel cannot). The caller owns that fact, so it is
+       * passed in rather than guessed: authorizing a retry the surface then refuses would leave
+       * the handler with no response to send. Omitted means "assume reachable".
+       */
+      retryAllowed?: boolean;
+      terminalScope?: 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
+      attemptedChannelCount?: number;
+      maxChannelAttempts?: number;
+      eligibleChannelCount?: number;
+    }): Promise<SurfaceFailureOutcome> {
+      // The caller's summary wins over the payload's own message: for a reader failure it is
+      // the transport error text, which is exactly what the retry predicates match on.
+      const errText = args.errorMessage || args.failure.message || 'upstream stream failed';
+      const runtimeFailureStatus = typeof args.failure.status === 'number'
+        ? args.failure.status
+        : (args.httpStatus ?? 502);
+      const phase = args.phase ?? 'postcommit';
+      const upstreamFailure = args.failureSource !== 'processing';
+      const terminalScope = args.terminalScope
+        ?? (args.retryCount >= input.maxRetries ? 'attempt_budget_exhausted' : 'attempt');
+
+      await recordStreamFailure({
+        selected: args.selected,
+        requestedModel: args.requestedModel,
+        modelName: args.modelName,
+        errorMessage: args.errorMessage,
+        isStream: args.isStream,
+        firstByteLatencyMs: args.firstByteLatencyMs ?? null,
+        latencyMs: args.latencyMs,
+        retryCount: args.retryCount,
+        promptTokens: args.promptTokens ?? null,
+        completionTokens: args.completionTokens ?? null,
+        totalTokens: args.totalTokens ?? null,
+        upstreamPath: args.upstreamPath ?? null,
+        httpStatus: args.httpStatus,
+        runtimeFailureStatus: upstreamFailure ? runtimeFailureStatus : null,
+        failureSource: args.failureSource,
+        originalPayload: args.failure.payload,
+        phase,
+        terminalScope,
+        attemptedChannelCount: args.attemptedChannelCount,
+        maxChannelAttempts: args.maxChannelAttempts,
+        eligibleChannelCount: args.eligibleChannelCount,
+        // Only a committed upstream stream break is the channel's own link failing: a
+        // pre-commit break has a failover path (below) and needs no escalation, and a
+        // processing fault is our own defect.
+        failureKind: phase === 'postcommit' && upstreamFailure ? 'stream-interrupted' : null,
+      });
+
+      if (phase === 'precommit' && upstreamFailure && args.retryAllowed !== false) {
+        // Both halves of the retry vocabulary, in `handleUpstreamFailure`'s order: a
+        // retryable status/text first, then the key-scoped indeterminate-4xx probe. A stream
+        // failure that names no status reads as 502, matching how a broken connection is
+        // treated elsewhere — not the request's fault.
+        const retryableStatus = runtimeFailureStatus > 0 ? runtimeFailureStatus : 502;
+        if (shouldRetryProxyRequest(retryableStatus, errText)) {
+          const retry = maybeRetry(args.retryCount);
+          if (retry) return retry;
+        }
+        // The operator's failure keyword list, which the whole-body path applies to the response
+        // text. A stream failure only ever has the upstream's error text, so without this the
+        // setting silently did not apply to streaming clients — and a matched keyword means
+        // "this channel is bad", which is exactly what a retry is for. Evaluated with 502, the
+        // same status the whole-body path assigns on a match, so the two paths cannot disagree
+        // about retryability.
+        if (findProxyFailureKeyword(errText) && shouldRetryProxyRequest(502, errText)) {
+          const retry = maybeRetry(args.retryCount);
+          if (retry) return retry;
+        }
+        // No empty-content check belongs here, and adding one would be wrong: a pre-commit
+        // stream failure has by definition forwarded no output, so the case that setting targets
+        // (usage with no completion) is already retryable through the predicates above, while its
+        // `hasOutput` half cannot be evaluated from an error text at all.
+        const indeterminateRetry = maybeRetryIndeterminate({
+          status: retryableStatus,
+          retryCount: args.retryCount,
+          errText,
+          originalPayload: args.failure.payload,
+        });
+        if (indeterminateRetry) return indeterminateRetry;
+      }
+
+      runBestEffort('report proxy all failed', () => reportProxyAllFailed({
+        model: args.requestedModel,
+        reason: errText,
+      }));
+
+      return resolveTerminalResponse({
+        status: runtimeFailureStatus,
+        message: errText,
+        requestedModel: args.requestedModel,
+        modelName: args.modelName,
+        selected: args.selected,
+        transport: args.transport
+          ?? (input.downstreamTransport === 'websocket' ? 'websocket' : args.isStream ? 'sse' : 'http'),
+        phase,
+        runtimeFailureStatus: upstreamFailure ? runtimeFailureStatus : null,
+        failureSource: args.failureSource,
+        terminalScope,
+        attemptedChannelCount: terminalFailures.length,
+        maxChannelAttempts: args.maxChannelAttempts ?? input.maxRetries + 1,
+        eligibleChannelCount: args.eligibleChannelCount,
+        originalPayload: args.failure.payload,
+      });
+    },
+
     async handleExecutionError(args: {
       selected: SurfaceSelectedChannel;
       requestedModel: string;
@@ -1020,91 +1280,6 @@ export function createSurfaceFailureToolkit(input: {
       });
     },
 
-    async recordStreamFailure(args: {
-      selected: SurfaceSelectedChannel;
-      requestedModel: string;
-      modelName: string;
-      errorMessage: string | null;
-      isStream?: boolean | null;
-      firstByteLatencyMs?: number | null;
-      latencyMs: number;
-      retryCount: number;
-      promptTokens?: number | null;
-      completionTokens?: number | null;
-      totalTokens?: number | null;
-      upstreamPath?: string | null;
-      httpStatus?: number;
-      runtimeFailureStatus?: number | null;
-      failureSource?: 'upstream' | 'processing';
-      originalPayload?: unknown;
-      phase?: 'precommit' | 'postcommit';
-      terminalScope?: 'attempt' | 'attempt_budget_exhausted' | 'route_exhausted';
-      attemptedChannelCount?: number;
-      maxChannelAttempts?: number;
-      eligibleChannelCount?: number;
-    }) {
-      const errorMessage = args.errorMessage || 'stream processing failed';
-      if (args.failureSource === 'processing') {
-        await log({
-          selected: args.selected,
-          modelRequested: args.requestedModel,
-          status: 'failed',
-          httpStatus: args.httpStatus ?? 200,
-          isStream: args.isStream ?? null,
-          firstByteLatencyMs: args.firstByteLatencyMs ?? null,
-          latencyMs: args.latencyMs,
-          errorMessage,
-          retryCount: args.retryCount,
-          promptTokens: args.promptTokens,
-          completionTokens: args.completionTokens,
-          totalTokens: args.totalTokens,
-          upstreamPath: args.upstreamPath,
-        });
-        return;
-      }
-      terminalFailures.push(buildCanonicalUpstreamFailure({
-        status: args.runtimeFailureStatus ?? args.httpStatus ?? 502,
-        message: errorMessage,
-        protocol: input.warningScope === 'responses' ? 'responses' : input.downstreamPath.startsWith('/v1/messages') ? 'messages' : 'chat',
-        transport: 'sse',
-        phase: args.phase ?? 'postcommit',
-        terminalScope: args.terminalScope,
-        attemptedChannelCount: args.attemptedChannelCount,
-        maxChannelAttempts: args.maxChannelAttempts,
-        eligibleChannelCount: args.eligibleChannelCount,
-        requestedModel: args.requestedModel,
-        upstreamModel: args.modelName,
-        channelId: args.selected.channel.id,
-        downstreamApiKeyId: input.downstreamApiKeyId,
-        originalPayload: args.originalPayload,
-      }));
-      if (typeof args.runtimeFailureStatus === 'number') {
-        await tokenRouter.recordFailure(args.selected.channel.id, {
-          status: args.runtimeFailureStatus,
-          errorText: errorMessage,
-          modelName: args.modelName,
-        });
-      } else {
-        await tokenRouter.recordFailure(args.selected.channel.id, {
-          errorText: errorMessage,
-          modelName: args.modelName,
-        });
-      }
-      await log({
-        selected: args.selected,
-        modelRequested: args.requestedModel,
-        status: 'failed',
-        httpStatus: args.httpStatus ?? 200,
-        isStream: args.isStream ?? null,
-        firstByteLatencyMs: args.firstByteLatencyMs ?? null,
-        latencyMs: args.latencyMs,
-        errorMessage,
-        retryCount: args.retryCount,
-        promptTokens: args.promptTokens,
-        completionTokens: args.completionTokens,
-        totalTokens: args.totalTokens,
-        upstreamPath: args.upstreamPath,
-      });
-    },
+    recordStreamFailure,
   };
 }

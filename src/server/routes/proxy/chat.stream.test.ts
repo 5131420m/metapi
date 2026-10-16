@@ -19,6 +19,7 @@ const reportTokenExpiredMock = vi.fn();
 const estimateProxyCostMock = vi.fn(async (_arg?: any) => 0);
 const buildProxyBillingDetailsMock = vi.fn(async (_arg?: any) => null);
 const fetchModelPricingCatalogMock = vi.fn(async (_arg?: any): Promise<any> => null);
+const shouldRetryProxyRequestMock = vi.fn((..._args: unknown[]) => false);
 const resolveProxyUsageWithSelfLogFallbackMock = vi.fn(async ({ usage }: any) => ({
   ...usage,
   estimatedCostFromQuota: 0,
@@ -67,7 +68,9 @@ vi.mock('../../services/modelPricingService.js', () => ({
 }));
 
 vi.mock('../../services/proxyRetryPolicy.js', () => ({
-  shouldRetryProxyRequest: () => false,
+  // Controllable per test, defaulting to false: this file's other cases assert endpoint and
+  // channel behaviour that must not start depending on the retry classification.
+  shouldRetryProxyRequest: (...args: unknown[]) => shouldRetryProxyRequestMock(...args),
   shouldAbortSameSiteEndpointFallback: () => false,
   RETRYABLE_TIMEOUT_PATTERNS: [/(request timed out|connection timed out|read timeout|\btimed out\b)/i],
 }));
@@ -137,6 +140,8 @@ describe('chat proxy stream behavior', () => {
     refreshModelsAndRebuildRoutesMock.mockReset();
     reportProxyAllFailedMock.mockReset();
     reportTokenExpiredMock.mockReset();
+    shouldRetryProxyRequestMock.mockReset();
+    shouldRetryProxyRequestMock.mockReturnValue(false);
     estimateProxyCostMock.mockClear();
     buildProxyBillingDetailsMock.mockClear();
     fetchModelPricingCatalogMock.mockReset();
@@ -255,6 +260,10 @@ describe('chat proxy stream behavior', () => {
   it('does not retry another channel after committed chat SSE bytes even when retries and a spare channel are available', async () => {
     const previousAttempts = (config as any).proxyMaxChannelAttempts;
     (config as any).proxyMaxChannelAttempts = 3;
+    // Everything that COULD authorize a retry is available here: the predicate says yes, the
+    // budget allows it, and a spare channel is configured. The only thing stopping the failover
+    // is that bytes already reached the client.
+    shouldRetryProxyRequestMock.mockReturnValue(true);
     selectNextChannelMock.mockReturnValue({
       channel: { id: 99, routeId: 98 },
       site: { name: 'spare-site', url: 'https://spare.example.com' },
@@ -299,6 +308,292 @@ describe('chat proxy stream behavior', () => {
       expect(response.body).toContain('[DONE]');
       expect(response.body).not.toContain('"object":"error"');
       expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(selectNextChannelMock).not.toHaveBeenCalled();
+    } finally {
+      (config as any).proxyMaxChannelAttempts = previousAttempts;
+    }
+  });
+
+  it('fails over to the next channel when a chat SSE stream breaks before anything was written', async () => {
+    const previousAttempts = (config as any).proxyMaxChannelAttempts;
+    (config as any).proxyMaxChannelAttempts = 3;
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { name: 'spare-site', url: 'https://spare.example.com' },
+      account: { id: 34, username: 'spare-user' },
+      tokenName: 'spare',
+      tokenValue: 'sk-spare',
+      actualModel: 'upstream-gpt',
+    });
+
+    try {
+      const encoder = new TextEncoder();
+      const brokenBody = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          // Fails before any frame is produced, so the client has nothing yet.
+          controller.error(new Error('upstream chat stream interrupted'));
+        },
+      });
+      const healthyBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"id":"chatcmpl-failover","model":"upstream-gpt","choices":[{"delta":{"content":"served by the second channel"},"finish_reason":null}]}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      fetchMock
+        .mockResolvedValueOnce(new Response(brokenBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }))
+        .mockResolvedValueOnce(new Response(healthyBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'gpt-4o-mini',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('served by the second channel');
+      expect(response.body).not.toContain('upstream chat stream interrupted');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(selectNextChannelMock).toHaveBeenCalledTimes(1);
+      // The failed attempt is still accounted for, so a channel cannot break silently.
+      expect(recordFailureMock.mock.calls.some(([channelId]) => channelId === 11)).toBe(true);
+      expect(recordSuccessMock.mock.calls.some(([channelId]) => channelId === 12)).toBe(true);
+    } finally {
+      (config as any).proxyMaxChannelAttempts = previousAttempts;
+    }
+  });
+
+  it('reports the exhausted route, not the dead channel, when an uncommitted stream break has nowhere to fail over to', async () => {
+    const previousAttempts = (config as any).proxyMaxChannelAttempts;
+    (config as any).proxyMaxChannelAttempts = 3;
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    // No spare channel: the retry is authorized but cannot be served.
+    selectNextChannelMock.mockReturnValue(null);
+
+    try {
+      const brokenBody = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.error(new Error('upstream chat stream interrupted'));
+        },
+      });
+      fetchMock.mockResolvedValue(new Response(brokenBody, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+      }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'gpt-4o-mini',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+
+      // This is the same answer every other failure family gives once the channel budget is
+      // gone, and it is what a single-channel deployment now sees instead of the upstream's own
+      // 502: an exhausted route is the honest description, and it stays a retryable class for
+      // clients that route on status. Nothing was committed, so it is still a plain HTTP error.
+      expect(response.statusCode, response.body).toBe(503);
+      expect(response.headers['content-type']).not.toContain('text/event-stream');
+      expect(response.json()).toMatchObject({
+        error: { message: 'No available channels for this model' },
+      });
+      expect(recordFailureMock.mock.calls.some(([channelId]) => channelId === 11)).toBe(true);
+    } finally {
+      (config as any).proxyMaxChannelAttempts = previousAttempts;
+    }
+  });
+
+  it('fails over to the next channel when a chat SSE stream stalls before anything was written', async () => {
+    const previousAttempts = (config as any).proxyMaxChannelAttempts;
+    const previousFirstByte = config.proxyFirstByteTimeoutSec;
+    (config as any).proxyMaxChannelAttempts = 3;
+    // The idle budget shares the first-byte knob (see resolveStreamIdleTimeoutMs), so a 1s
+    // budget makes "the upstream went quiet" reachable in a test.
+    config.proxyFirstByteTimeoutSec = 1;
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { name: 'spare-site', url: 'https://spare.example.com' },
+      account: { id: 34, username: 'spare-user' },
+      tokenName: 'spare',
+      tokenValue: 'sk-spare',
+      actualModel: 'upstream-gpt',
+    });
+
+    try {
+      const encoder = new TextEncoder();
+      const stalledBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // A role-only frame is not forwarded (the transformer holds it back), so the response
+          // is still uncommitted when the channel goes silent — and then never sends again.
+          controller.enqueue(encoder.encode('data: {"id":"chatcmpl-stall","model":"upstream-gpt","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'));
+        },
+      });
+      const healthyBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"id":"chatcmpl-failover","model":"upstream-gpt","choices":[{"delta":{"content":"served after the stall"},"finish_reason":null}]}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      fetchMock
+        .mockResolvedValueOnce(new Response(stalledBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }))
+        .mockResolvedValueOnce(new Response(healthyBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'gpt-4o-mini',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.body).toContain('served after the stall');
+      expect(response.body).not.toContain('idle timeout');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(recordFailureMock.mock.calls.some(([channelId]) => channelId === 11)).toBe(true);
+      expect(recordSuccessMock.mock.calls.some(([channelId]) => channelId === 12)).toBe(true);
+    } finally {
+      (config as any).proxyMaxChannelAttempts = previousAttempts;
+      config.proxyFirstByteTimeoutSec = previousFirstByte;
+    }
+  }, 15_000);
+
+  it('answers in-band and cools the channel when a committed chat stream stalls', async () => {
+    const previousAttempts = (config as any).proxyMaxChannelAttempts;
+    const previousFirstByte = config.proxyFirstByteTimeoutSec;
+    (config as any).proxyMaxChannelAttempts = 3;
+    config.proxyFirstByteTimeoutSec = 1;
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { name: 'spare-site', url: 'https://spare.example.com' },
+      account: { id: 34, username: 'spare-user' },
+      tokenName: 'spare',
+      tokenValue: 'sk-spare',
+      actualModel: 'upstream-gpt',
+    });
+
+    try {
+      const encoder = new TextEncoder();
+      const stalledBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // This delta IS forwarded, so the client already holds a partial answer and the
+          // response is committed: failing over would mean splicing a second answer into it.
+          controller.enqueue(encoder.encode('data: {"id":"chatcmpl-stall","model":"upstream-gpt","choices":[{"delta":{"content":"partial answer"},"finish_reason":null}]}\n\n'));
+        },
+      });
+      fetchMock.mockResolvedValue(new Response(stalledBody, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+      }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/chat/completions',
+        payload: {
+          model: 'gpt-4o-mini',
+          stream: true,
+          messages: [{ role: 'user', content: 'hi' }],
+        },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('partial answer');
+      expect(response.body).toContain('"error"');
+      expect(response.body).toMatch(/timeout/i);
+      expect(response.body).toContain('[DONE]');
+      // One attempt only: nothing to fail over to once bytes are on the wire…
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      // …and the channel is booked as a mid-answer stream break, not as an ordinary failure.
+      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+        failureKind: 'stream-interrupted',
+      }));
+    } finally {
+      (config as any).proxyMaxChannelAttempts = previousAttempts;
+      config.proxyFirstByteTimeoutSec = previousFirstByte;
+    }
+  }, 15_000);
+
+  it('fails over to the next channel when a Responses stream breaks before anything was written', async () => {
+    const previousAttempts = (config as any).proxyMaxChannelAttempts;
+    (config as any).proxyMaxChannelAttempts = 3;
+    shouldRetryProxyRequestMock.mockReturnValue(true);
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { name: 'spare-site', url: 'https://spare.example.com' },
+      account: { id: 34, username: 'spare-user' },
+      tokenName: 'spare',
+      tokenValue: 'sk-spare',
+      actualModel: 'upstream-gpt',
+    });
+
+    try {
+      const encoder = new TextEncoder();
+      const brokenBody = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.error(new Error('upstream responses stream interrupted'));
+        },
+      });
+      const healthyBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"served by the second channel"}\n\n'));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      fetchMock
+        .mockResolvedValueOnce(new Response(brokenBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }))
+        .mockResolvedValueOnce(new Response(healthyBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/responses',
+        payload: {
+          model: 'gpt-5.2',
+          input: 'hello',
+          stream: true,
+        },
+      });
+
+      expect(response.statusCode, response.body).toBe(200);
+      expect(response.headers['content-type']).toContain('text/event-stream');
+      expect(response.body).toContain('served by the second channel');
+      expect(response.body).toContain('response.completed');
+      expect(response.body).not.toContain('upstream responses stream interrupted');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(selectNextChannelMock).toHaveBeenCalledTimes(1);
     } finally {
       (config as any).proxyMaxChannelAttempts = previousAttempts;
     }

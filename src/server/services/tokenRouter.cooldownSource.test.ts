@@ -203,6 +203,73 @@ describe('cooldown source', () => {
     expect(isProviderDirectedCooldown(afterThird!)).toBe(false);
   });
 
+  /**
+   * A stream that broke mid-answer is confirmed channel damage, not one unlucky request: the
+   * downstream response was already committed, so the proxy cannot recover it. Waiting for the
+   * ordinary round-robin streak would let the next requests break the same way.
+   */
+  it('cools a stream-interrupted channel on the first failure, whatever the strategy', async () => {
+    const { channel } = await seedChannel({ routingStrategy: 'round_robin' });
+    const router = new TokenRouter();
+
+    await router.recordFailure(channel.id, {
+      status: 502,
+      errorText: 'upstream stream failed after output began',
+      modelName: 'gpt-4o-mini',
+      failureKind: 'stream-interrupted',
+    });
+
+    const row = await readChannel(channel.id);
+    // Round-robin needs three ordinary failures before it cools anything; a committed stream
+    // break escalates immediately instead.
+    expect(row?.cooldownLevel).toBe(1);
+    expect(row?.cooldownUntil).toBeTruthy();
+    expect(row?.cooldownSource).toBe('stream_interrupted');
+    expect(isProviderDirectedCooldown(row!)).toBe(false);
+    // The streak is cleared: this branch counts stream breaks on its own scale, so carrying a
+    // failure streak forward would escalate twice for one underlying fault.
+    expect(row?.consecutiveFailCount).toBe(0);
+  });
+
+  it('escalates the stream-interrupted cooldown on each further break', async () => {
+    const { channel } = await seedChannel({ routingStrategy: 'round_robin' });
+    const router = new TokenRouter();
+    const recordBreak = () => router.recordFailure(channel.id, {
+      status: 502,
+      errorText: 'upstream stream failed after output began',
+      modelName: 'gpt-4o-mini',
+      failureKind: 'stream-interrupted',
+    });
+
+    await recordBreak();
+    const first = await readChannel(channel.id);
+    await recordBreak();
+    const second = await readChannel(channel.id);
+
+    expect(first?.cooldownLevel).toBe(1);
+    expect(second?.cooldownLevel).toBe(2);
+    expect(Date.parse(String(second?.cooldownUntil))).toBeGreaterThan(Date.parse(String(first?.cooldownUntil)));
+    expect(second?.cooldownSource).toBe('stream_interrupted');
+  });
+
+  it('leaves ordinary stream failures on the strategy path', async () => {
+    const { channel } = await seedChannel({ routingStrategy: 'round_robin' });
+    const router = new TokenRouter();
+
+    await router.recordFailure(channel.id, {
+      status: 502,
+      errorText: 'upstream stream failed before output began',
+      modelName: 'gpt-4o-mini',
+    });
+
+    const row = await readChannel(channel.id);
+    // Same status and text as the escalation above, but the caller did not say the stream was
+    // interrupted — so nothing is cooled and the source stays unstated.
+    expect(row?.cooldownUntil).toBeNull();
+    expect(row?.cooldownSource).toBeNull();
+    expect(row?.cooldownLevel).toBe(0);
+  });
+
   it('clears the source when a success releases the channel', async () => {
     const { channel } = await seedChannel();
     const router = new TokenRouter();

@@ -4,6 +4,7 @@ import { AddressInfo } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../../config.js';
+import { POSTCOMMIT_STREAM_FAILURE_CODE, POSTCOMMIT_STREAM_FAILURE_MESSAGE } from '../../services/upstreamFailureSignals.js';
 import { resetCodexSessionResponseStore } from '../../proxy-core/runtime/codexSessionResponseStore.js';
 
 const fetchMock = vi.fn();
@@ -2458,7 +2459,11 @@ describe('responses websocket transport', () => {
       const message = await failedPromise;
       socket.close();
 
-      expect(message?.response?.error?.message).toBe('The upstream stream failed after output began.');
+      expect(message?.response?.error?.message).toBe(POSTCOMMIT_STREAM_FAILURE_MESSAGE);
+      // The redaction must carry the failure class through, not just hide the secret: a client
+      // that classifies on text has to be able to see this was a dropped connection.
+      expect(message?.response?.error?.message).toMatch(/connection|terminated|stream ended/i);
+      expect(message?.response?.error?.code).toBe(POSTCOMMIT_STREAM_FAILURE_CODE);
       expect(message?.response?.error?.message).not.toContain('sk-upstream-secret');
       expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
         errorText: 'invalid api key sk-upstream-secret',
@@ -2502,7 +2507,8 @@ describe('responses websocket transport', () => {
       const message = await errorPromise;
       socket.close();
 
-      expect(message?.error?.message).toBe('The upstream stream failed after output began.');
+      expect(message?.error?.message).toBe(POSTCOMMIT_STREAM_FAILURE_MESSAGE);
+      expect(message?.error?.code).toBe(POSTCOMMIT_STREAM_FAILURE_CODE);
       expect(message?.error?.message).not.toContain('«redacted:sk-…»');
     } finally {
       config.downstreamErrorPolicy = previousPolicy;

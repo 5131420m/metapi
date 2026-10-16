@@ -10,6 +10,7 @@ import {
 } from './streamBridge.js';
 import { config } from '../../../config.js';
 import { extractTypedStreamFailure, type TypedStreamFailure } from '../../shared/streamFailure.js';
+import { POSTCOMMIT_STREAM_FAILURE_CODE } from '../../../services/upstreamFailureSignals.js';
 
 type StreamReader = {
   read(): Promise<{ done: boolean; value?: Uint8Array }>;
@@ -112,7 +113,7 @@ export function createResponsesProxyStreamSession(input: ResponsesProxyStreamSes
     if (publicMessage === message) return payload;
     return {
       type: 'response.failed',
-      error: { message: publicMessage, type: 'upstream_error' },
+      error: { message: publicMessage, type: 'upstream_error', code: POSTCOMMIT_STREAM_FAILURE_CODE },
     };
   };
 

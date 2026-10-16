@@ -51,7 +51,8 @@ import {
 import { geminiGenerateContentTransformer } from '../../transformers/gemini/generate-content/index.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
 import { getObservedResponseMeta } from '../firstByteTimeout.js';
-import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../responseTimeoutPolicy.js';
+import { withStreamIdleTimeout } from '../streamIdleTimeout.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs, resolveStreamIdleTimeoutMs } from '../responseTimeoutPolicy.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { detectDownstreamClientContext } from '../downstreamClientContext.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
@@ -314,6 +315,13 @@ export async function handleChatSurfaceRequest(
     upstreamBody,
     claudeOriginalBody,
   } = requestEnvelope.parsed;
+  // How long the upstream may stay silent while a stream is open, resolved once so the two
+  // stream read paths cannot answer it differently. Shares the first-byte budget on purpose;
+  // see `resolveStreamIdleTimeoutMs`.
+  const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(
+    resolveResponseTimeoutKind({ downstreamPath, isStream, body: upstreamBody }),
+    config,
+  );
   if (downstreamFormat === 'claude') {
     const handledSearch = await maybeHandleWebSearchOnlySimulation({
       app: request.server,
@@ -872,14 +880,20 @@ export async function handleChatSurfaceRequest(
               rawText += chunk;
             },
           );
-          const streamResult = await streamSession.run(nativeReader, streamResponse);
+          // A channel that stops sending while holding the connection open must fail the read
+          // rather than hang the downstream request: the failure then travels the ordinary
+          // reader-error path (failover before a commit, in-band terminal frame after one).
+          const streamResult = await streamSession.run(
+            withStreamIdleTimeout(nativeReader, { idleTimeoutMs: streamIdleTimeoutMs }),
+            streamResponse,
+          );
           const latency = Date.now() - startTime;
           if (streamResult.status === 'failed') {
             clearSurfaceStickyChannel({
               stickySessionKey,
               selected,
             });
-            await failureToolkit.recordStreamFailure({
+            const streamFailureOutcome = await failureToolkit.handleStreamFailure({
               selected,
               requestedModel,
               modelName,
@@ -890,7 +904,12 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              runtimeFailureStatus: 502,
+              failure: streamResult.failure ?? { status: 502 },
+              failureSource: streamResult.failureSource,
+              isStream,
+              firstByteLatencyMs,
+              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+              retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
             });
             await finalizeDebugFailure(502, {
               error: {
@@ -898,13 +917,12 @@ export async function handleChatSurfaceRequest(
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
-            if (!streamStarted) {
-              return reply.code(502).send({
-                error: {
-                  message: streamResult.errorMessage,
-                  type: 'upstream_error',
-                },
-              });
+            if (streamFailureOutcome.action === 'retry') {
+              retryCount += 1;
+              continue;
+            }
+            if (!isResponseCommitted()) {
+              return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
             }
             return;
           }
@@ -941,7 +959,7 @@ export async function handleChatSurfaceRequest(
                 selected,
               });
               const streamFailureStatus = streamResult.failure?.status ?? 502;
-              await failureToolkit.recordStreamFailure({
+              const streamFailureOutcome = await failureToolkit.handleStreamFailure({
                 selected,
                 requestedModel,
                 modelName,
@@ -952,13 +970,15 @@ export async function handleChatSurfaceRequest(
                 completionTokens: parsedUsage.completionTokens,
                 totalTokens: parsedUsage.totalTokens,
                 upstreamPath: successfulUpstreamPath,
-                originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
                 terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
                 attemptedChannelCount: excludeChannelIds.length,
                 maxChannelAttempts: maxRetries + 1,
+                failure: streamResult.failure ?? { status: streamFailureStatus },
+                failureSource: streamResult.failureSource,
+                isStream,
+                firstByteLatencyMs,
+                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+                retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
               });
               await finalizeDebugFailure(streamFailureStatus, {
                 error: {
@@ -966,23 +986,12 @@ export async function handleChatSurfaceRequest(
                   type: 'stream_error',
                 },
               }, successfulUpstreamPath);
+              if (streamFailureOutcome.action === 'retry') {
+                retryCount += 1;
+                continue;
+              }
               if (!isResponseCommitted()) {
-                const terminalFailure = failureToolkit.resolveTerminalFailure({
-                  selected,
-                  requestedModel,
-                  modelName,
-                  status: streamFailureStatus,
-                  message: streamResult.errorMessage || 'stream processing failed',
-                  isStream,
-                  originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                  phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                  terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
-                  attemptedChannelCount: excludeChannelIds.length,
-                  maxChannelAttempts: maxRetries + 1,
-                });
-                return reply.code(terminalFailure.status).send(terminalFailure.payload);
+                return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
               }
               return;
             }
@@ -1068,7 +1077,7 @@ export async function handleChatSurfaceRequest(
               stickySessionKey,
               selected,
             });
-            await failureToolkit.recordStreamFailure({
+            const streamFailureOutcome = await failureToolkit.handleStreamFailure({
               selected,
               requestedModel,
               modelName,
@@ -1079,35 +1088,28 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              originalPayload: streamResult.failure?.payload,
-              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
               terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
               attemptedChannelCount: excludeChannelIds.length,
               maxChannelAttempts: maxRetries + 1,
-              });
+              failure: streamResult.failure ?? { status: streamFailureStatus },
+              failureSource: streamResult.failureSource,
+              isStream,
+              firstByteLatencyMs,
+              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+              retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
+            });
             await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
+            if (streamFailureOutcome.action === 'retry') {
+              retryCount += 1;
+              continue;
+            }
             if (!isResponseCommitted()) {
-              const terminalFailure = failureToolkit.resolveTerminalFailure({
-                selected,
-                requestedModel,
-                modelName,
-                status: streamFailureStatus,
-                message: streamResult.errorMessage || 'stream processing failed',
-                isStream,
-                originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
-                attemptedChannelCount: excludeChannelIds.length,
-                maxChannelAttempts: maxRetries + 1,
-              });
-              return reply.code(terminalFailure.status).send(terminalFailure.payload);
+              return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
             }
             return;
           }
@@ -1148,7 +1150,12 @@ export async function handleChatSurfaceRequest(
               },
             }
             : baseReader;
-          const streamResult = await streamSession.run(reader, streamResponse);
+          // See the gemini-native branch above: a silent upstream has to fail the read instead of
+          // holding the downstream request open forever.
+          const streamResult = await streamSession.run(
+            withStreamIdleTimeout(reader, { idleTimeoutMs: streamIdleTimeoutMs }),
+            streamResponse,
+          );
           rawText += decoder.decode();
 
           const latency = Date.now() - startTime;
@@ -1158,7 +1165,7 @@ export async function handleChatSurfaceRequest(
               stickySessionKey,
               selected,
             });
-            await failureToolkit.recordStreamFailure({
+            const streamFailureOutcome = await failureToolkit.handleStreamFailure({
               selected,
               requestedModel,
               modelName,
@@ -1169,43 +1176,36 @@ export async function handleChatSurfaceRequest(
               completionTokens: parsedUsage.completionTokens,
               totalTokens: parsedUsage.totalTokens,
               upstreamPath: successfulUpstreamPath,
-              originalPayload: streamResult.failure?.payload,
-              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
               terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
               attemptedChannelCount: excludeChannelIds.length,
               maxChannelAttempts: maxRetries + 1,
-              });
+              failure: streamResult.failure ?? { status: streamFailureStatus },
+              failureSource: streamResult.failureSource,
+              isStream,
+              firstByteLatencyMs,
+              phase: isResponseCommitted() ? 'postcommit' : 'precommit',
+              retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
+            });
             await finalizeDebugFailure(streamFailureStatus, {
               error: {
                 message: streamResult.errorMessage,
                 type: 'stream_error',
               },
             }, successfulUpstreamPath);
+            if (streamFailureOutcome.action === 'retry') {
+              retryCount += 1;
+              continue;
+            }
             if (!isResponseCommitted()) {
-              const terminalFailure = failureToolkit.resolveTerminalFailure({
-                selected,
-                requestedModel,
-                modelName,
-                status: streamFailureStatus,
-                message: streamResult.errorMessage || 'stream processing failed',
-                isStream,
-                originalPayload: streamResult.failure?.payload,
-                runtimeFailureStatus: streamResult.failureSource === 'processing' ? null : streamFailureStatus,
-                failureSource: streamResult.failureSource,
-                phase: isResponseCommitted() ? 'postcommit' : 'precommit',
-                terminalScope: retryCount >= maxRetries ? 'attempt_budget_exhausted' : 'attempt',
-                attemptedChannelCount: excludeChannelIds.length,
-                maxChannelAttempts: maxRetries + 1,
-              });
-              return reply.code(terminalFailure.status).send(terminalFailure.payload);
+              return reply.code(streamFailureOutcome.status).send(streamFailureOutcome.payload);
             }
             return;
           }
 
-          // Once SSE has been hijacked and streamed downstream, we can no longer
-          // safely fall back to an HTTP error response or retry by switching the
-          // channel mid-flight. Stream-level failures must be handled in-band by
-          // the proxy stream session itself.
+          // Once SSE has been hijacked and bytes are already on the wire, the failure is not
+          // recoverable by this proxy: the client holds a partial response and the transformer
+          // has written its in-band terminal frame. Stream failures that arrive BEFORE the
+          // commit are handled in the branch above, which may fail over to another channel.
         }
 
         const latency = Date.now() - startTime;
