@@ -1,11 +1,9 @@
 import { and, eq, gt, inArray, isNotNull } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
-import { isUsableAccountToken } from './accountTokenService.js';
-import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { proxyChannelCoordinator } from './proxyChannelCoordinator.js';
 import { probeRuntimeModel } from './runtimeModelProbe.js';
 import { isProviderDirectedCooldown, tokenRouter } from './tokenRouter.js';
-import { isExactTokenRouteModelPattern } from '../../shared/tokenRoutePatterns.js';
+import { resolveProbeModelName, resolveProbeTokenValue } from './channelProbeContext.js';
 
 type RecoveryProbeSource = 'cooldown' | 'active';
 
@@ -47,35 +45,9 @@ function resolveRecoveryProbeWindowMs(source: RecoveryProbeSource): number {
     : CHANNEL_RECOVERY_ACTIVE_RECHECK_MS;
 }
 
-function resolveProbeModelName(row: {
-  route_channels: typeof schema.routeChannels.$inferSelect;
-  token_routes: typeof schema.tokenRoutes.$inferSelect;
-}): string {
-  const sourceModel = String(row.route_channels.sourceModel || '').trim();
-  if (sourceModel) return sourceModel;
-  const routeModelPattern = String(row.token_routes.modelPattern || '').trim();
-  return isExactTokenRouteModelPattern(routeModelPattern) ? routeModelPattern : '';
-}
-
-function resolveProbeTokenValue(row: {
-  route_channels: typeof schema.routeChannels.$inferSelect;
-  accounts: typeof schema.accounts.$inferSelect;
-  account_tokens: typeof schema.accountTokens.$inferSelect | null;
-}): string | null {
-  if (typeof row.route_channels.tokenId === 'number' && row.route_channels.tokenId > 0) {
-    if (!row.account_tokens || !isUsableAccountToken(row.account_tokens)) return null;
-    const tokenValue = String(row.account_tokens.token || '').trim();
-    return tokenValue || null;
-  }
-
-  if (getOauthInfoFromAccount(row.accounts)) {
-    const accessToken = String(row.accounts.accessToken || '').trim();
-    return accessToken || null;
-  }
-
-  const fallbackApiToken = String(row.accounts.apiToken || '').trim();
-  return fallbackApiToken || null;
-}
+// `resolveProbeModelName` / `resolveProbeTokenValue` come from `channelProbeContext.ts`,
+// shared with the candy-question probe. Keeping a second copy here meant a fix to one probe
+// silently left the other with the old rule.
 
 /**
  * A provider-directed cooldown has to be waited out, so it is skipped by recovery sweeps:

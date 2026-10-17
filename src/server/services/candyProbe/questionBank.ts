@@ -362,15 +362,9 @@ export function parseCandyAnswers(input: {
   return { mode: 'none', answers };
 }
 
-export type CandyProbeVerdict = 'pass' | 'fail' | 'inconclusive';
+export type CandyProbeVerdict = import('../../../shared/candyProbe.js').CandyProbeVerdict;
 
-export type CandyGradedQuestion = {
-  id: string;
-  prompt: string;
-  expected: string;
-  answer: string;
-  correct: boolean;
-};
+export type CandyGradedQuestion = import('../../../shared/candyProbe.js').CandyProbeQuestionResult;
 
 export type CandyProbeGrade = {
   verdict: CandyProbeVerdict;

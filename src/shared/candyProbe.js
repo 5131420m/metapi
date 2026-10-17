@@ -20,3 +20,13 @@ export const CANDY_PROBE_CLIENT_FAMILY = 'candy_probe';
  * `error_message` instead.
  */
 export const CANDY_PROBE_CLIENT_APP_NAME = '糖果题检测';
+
+/**
+ * Hard ceiling for one probe run.
+ *
+ * Shared because the web has to wait LONGER than the server, not shorter: the client used to
+ * give up at 45s while the server could still be running (its budget comes from settings and
+ * can reach this ceiling), so the UI reported a timeout for a probe that then finished and
+ * wrote a verdict. The client timeout is a backstop for a dead connection only.
+ */
+export const CANDY_PROBE_MAX_TIMEOUT_MS = 600_000;

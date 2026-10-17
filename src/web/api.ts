@@ -1,4 +1,5 @@
 import { clearAuthSession, getAuthToken } from "./authSession.js";
+import { CANDY_PROBE_MAX_TIMEOUT_MS } from "../shared/candyProbe.js";
 
 type BufferLike = {
   from(data: ArrayBuffer): { toString(encoding: "base64"): string };
@@ -975,7 +976,11 @@ export const api = {
     request(`/api/channels/${channelId}/candy-probe`, {
       method: "POST",
       body: JSON.stringify(options ?? {}),
-      timeoutMs: 45_000,
+      // Backstop only, and deliberately LONGER than the server's own ceiling: the server's
+      // budget comes from settings (up to CANDY_PROBE_MAX_TIMEOUT_MS) and it always resolves
+      // its own deadline. A shorter client timeout used to fire first, so the UI reported a
+      // timeout for a probe that then finished and wrote a verdict anyway.
+      timeoutMs: CANDY_PROBE_MAX_TIMEOUT_MS + 15_000,
     }),
   getChannelCandyProbe: (channelId: number) =>
     request(`/api/channels/${channelId}/candy-probe`),

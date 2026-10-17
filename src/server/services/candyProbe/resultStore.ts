@@ -15,29 +15,13 @@ import { db, schema } from '../../db/index.js';
 import { upsertSetting } from '../../db/upsertSetting.js';
 import type { CandyAnswerParseMode } from './questionBank.js';
 import type { CandyFingerprintId } from './fingerprints.js';
+import type {
+  CandyProbeConfigFingerprint,
+  CandyProbeQuestionResult,
+  CandyProbeVerdict,
+} from '../../../shared/candyProbe.js';
 
-export type CandyProbeVerdict = 'pass' | 'fail' | 'inconclusive';
-
-/**
- * What the verdict is about.
- *
- * A channel is configuration, not identity: swap its source model or its credential and the
- * old verdict describes a different upstream. Recording the inputs lets a snapshot be
- * discarded when they no longer match, instead of showing a stale badge that quietly lies.
- */
-export type CandyProbeConfigFingerprint = {
-  model: string;
-  accountId: number | null;
-  tokenId: number | null;
-};
-
-export type CandyProbeQuestionResult = {
-  id: string;
-  prompt: string;
-  expected: string;
-  answer: string;
-  correct: boolean;
-};
+export type { CandyProbeConfigFingerprint, CandyProbeQuestionResult, CandyProbeVerdict };
 
 export type CandyProbeResult = {
   channelId: number;

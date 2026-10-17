@@ -41,15 +41,14 @@ export type RouteChannelQuality = {
   lastUpdatedAtMs: number | null;
 };
 
-export type CandyProbeVerdict = 'pass' | 'fail' | 'inconclusive';
+// The verdict and per-question shapes are shared with the server: a new verdict value must
+// not be able to compile on one side and fall through the other.
+import type {
+  CandyProbeQuestionResult,
+  CandyProbeVerdict,
+} from '../../../shared/candyProbe.js';
 
-export type CandyProbeQuestionResult = {
-  id: string;
-  prompt: string;
-  expected: string;
-  answer: string;
-  correct: boolean;
-};
+export type { CandyProbeQuestionResult, CandyProbeVerdict };
 
 /**
  * Display-only degrade-check verdict. `fresh` is false once the verdict is older than the

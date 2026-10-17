@@ -21,9 +21,9 @@ import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { config } from '../config.js';
 import { resolveResponseTimeoutMs } from '../proxy-core/responseTimeoutPolicy.js';
-import { isUsableAccountToken } from './accountTokenService.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { buildOauthProviderHeaders } from './oauth/service.js';
+import { resolveProbeModelName, resolveProbeTokenValue } from './channelProbeContext.js';
 import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from './siteProxy.js';
 import { dispatchRuntimeRequest } from './runtimeDispatch.js';
 import { isLikelyConversationModel } from './runtimeModelProbe.js';
@@ -37,6 +37,7 @@ import {
 import {
   CANDY_PROBE_CLIENT_APP_NAME,
   CANDY_PROBE_CLIENT_FAMILY,
+  CANDY_PROBE_MAX_TIMEOUT_MS,
 } from '../../shared/candyProbe.js';
 import {
   buildUpstreamEndpointRequest,
@@ -55,7 +56,6 @@ import {
   startSurfaceProxyDebugTrace,
 } from './proxyDebugTraceRuntime.js';
 import type { ProxyDebugTraceSession } from './proxyDebugTraceStore.js';
-import { isExactTokenRouteModelPattern } from '../../shared/tokenRoutePatterns.js';
 import {
   buildCandyProbePrompt,
   DEFAULT_CANDY_DISCRIMINATIVE_COUNT,
@@ -89,7 +89,8 @@ export type { CandyProbeResult, CandyProbeSnapshot };
  */
 export const CANDY_PROBE_TIMEOUT_MS = 25_000;
 export const CANDY_PROBE_MIN_TIMEOUT_MS = 1_000;
-export const CANDY_PROBE_MAX_TIMEOUT_MS = 600_000;
+/** Re-exported from the shared module so the web's backstop cannot drift from the server. */
+export { CANDY_PROBE_MAX_TIMEOUT_MS } from '../../shared/candyProbe.js';
 
 /**
  * Floor applied to the SETTINGS-DERIVED budget only.
@@ -267,28 +268,9 @@ type CandyProbeChannelContext = {
   config: CandyProbeConfigFingerprint;
 };
 
-function resolveProbeModelName(row: CandyProbeChannelRow): string {
-  const sourceModel = String(row.route_channels.sourceModel || '').trim();
-  if (sourceModel) return sourceModel;
-  const routeModelPattern = String(row.token_routes.modelPattern || '').trim();
-  return isExactTokenRouteModelPattern(routeModelPattern) ? routeModelPattern : '';
-}
+// `resolveProbeModelName` / `resolveProbeTokenValue` are shared with the channel recovery
+// probe — see `channelProbeContext.ts`. They used to be copied verbatim into both services.
 
-function resolveProbeTokenValue(row: CandyProbeChannelRow): string | null {
-  if (typeof row.route_channels.tokenId === 'number' && row.route_channels.tokenId > 0) {
-    if (!row.account_tokens || !isUsableAccountToken(row.account_tokens)) return null;
-    const tokenValue = String(row.account_tokens.token || '').trim();
-    return tokenValue || null;
-  }
-
-  if (getOauthInfoFromAccount(row.accounts)) {
-    const accessToken = String(row.accounts.accessToken || '').trim();
-    return accessToken || null;
-  }
-
-  const fallbackApiToken = String(row.accounts.apiToken || '').trim();
-  return fallbackApiToken || null;
-}
 
 async function loadChannelProbeContext(channelId: number): Promise<CandyProbeChannelContext> {
   const row = await db.select()

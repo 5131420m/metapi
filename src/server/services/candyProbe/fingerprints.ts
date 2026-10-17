@@ -196,6 +196,22 @@ export const CANDY_FINGERPRINTS: Record<CandyFingerprintId, CandyFingerprint> = 
   generic_openai: genericOpenAiFingerprint,
 };
 
+/**
+ * The fingerprint ids, derived from the registry rather than restated.
+ *
+ * Three other places used to keep their own literal list (the API route's validation set,
+ * the result store's normalizer, the web labels). A new fingerprint therefore compiled
+ * everywhere and was rejected at the boundary by a set nobody remembered to update.
+ */
+export const CANDY_FINGERPRINT_IDS: readonly CandyFingerprintId[] = Object.keys(
+  CANDY_FINGERPRINTS,
+) as CandyFingerprintId[];
+
+export function isCandyFingerprintId(value: unknown): value is CandyFingerprintId {
+  return typeof value === 'string'
+    && (CANDY_FINGERPRINT_IDS as readonly string[]).includes(value);
+}
+
 export function getCandyFingerprint(id: CandyFingerprintId): CandyFingerprint {
   return CANDY_FINGERPRINTS[id];
 }

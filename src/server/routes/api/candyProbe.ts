@@ -14,13 +14,10 @@ import {
   getCandyProbeResultForChannel,
   runChannelCandyProbe,
 } from '../../services/candyProbeService.js';
-import type { CandyFingerprintId } from '../../services/candyProbe/fingerprints.js';
-
-const CANDY_PROBE_FINGERPRINT_IDS = new Set<CandyFingerprintId>([
-  'claude_code',
-  'codex',
-  'generic_openai',
-]);
+import {
+  isCandyFingerprintId,
+  type CandyFingerprintId,
+} from '../../services/candyProbe/fingerprints.js';
 
 const CANDY_PROBE_MIN_QUESTIONS = 1;
 const CANDY_PROBE_MAX_QUESTIONS = 6;
@@ -42,9 +39,7 @@ function parseFingerprint(raw: unknown): CandyFingerprintId | 'auto' | null {
   if (typeof raw !== 'string') return null;
   const normalized = raw.trim();
   if (!normalized || normalized === 'auto') return 'auto';
-  return CANDY_PROBE_FINGERPRINT_IDS.has(normalized as CandyFingerprintId)
-    ? normalized as CandyFingerprintId
-    : null;
+  return isCandyFingerprintId(normalized) ? normalized : null;
 }
 
 function parseQuestionCount(raw: unknown): number | undefined | null {
