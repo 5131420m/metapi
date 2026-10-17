@@ -267,6 +267,24 @@ describe('runChannelCandyProbe', () => {
     expect(result.reason).toContain('未返回可判分内容');
   });
 
+  it('does not hang when the upstream stalls mid-stream', async () => {
+    const { channel } = await seedChannel();
+    // Headers arrive, then the body never ends: the exact shape that used to hang the
+    // probe forever because the abort timer was cleared before the body read.
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      new ReadableStream<Uint8Array>({ start() { /* never enqueue, never close */ } }),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    const startedAt = Date.now();
+    const result = await service.runChannelCandyProbe({ channelId: channel.id, timeoutMs: 400 });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.verdict).toBe('inconclusive');
+    expect(result.reason).toContain('探测超时');
+    expect(elapsedMs).toBeLessThan(5_000);
+  });
+
   it('picks the Codex fingerprint for GPT models and the generic one for others', async () => {
     const { channel: gptChannel } = await seedChannel({ sourceModel: 'gpt-5.4' });
     dispatchRuntimeRequestMock.mockResolvedValue(new Response('', {

@@ -56,6 +56,8 @@ export type { CandyProbeResult, CandyProbeSnapshot };
 
 /** Per-run ceiling. The probe is one small completion; 25s is generous without stalling a click. */
 export const CANDY_PROBE_TIMEOUT_MS = 25_000;
+export const CANDY_PROBE_MIN_TIMEOUT_MS = 1_000;
+export const CANDY_PROBE_MAX_TIMEOUT_MS = 60_000;
 export const CANDY_PROBE_PASS_MIN_CORRECT = 2;
 
 export class CandyProbeRequestError extends Error {
@@ -152,6 +154,44 @@ function resolveFingerprintId(
   return resolveCandyFingerprintIdForModel(modelName);
 }
 
+/**
+ * Bound the whole probe execution — request dispatch, first-byte observation AND body
+ * read — to one deadline.
+ *
+ * `executeEndpointFlow` only resolves once the response is usable (it observes the first
+ * byte), so a relay that accepts the connection and then stalls can hang *inside* the
+ * flow; and even when the flow resolves, a stream that never ends would hang the body
+ * read. The earlier shape cleared the abort timer before the body read, so a mid-stream
+ * stall escaped the ceiling entirely. Racing the whole execution against the remaining
+ * budget closes both holes, and also works for dispatchers that ignore the abort signal.
+ */
+async function runProbeWithDeadline<T>(input: {
+  execute: () => Promise<T>;
+  deadlineAtMs: number;
+  timeoutMs: number;
+  abortController: AbortController;
+}): Promise<T> {
+  const execution = input.execute();
+  // If the deadline wins the race the execution may settle later; keep that from
+  // surfacing as an unhandled rejection.
+  execution.catch(() => undefined);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([
+      execution,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          input.abortController.abort(new Error('candy probe deadline'));
+          reject(new Error(`探测超时：上游未在 ${Math.round(input.timeoutMs / 1000)}s 内完成`));
+        }, Math.max(1, input.deadlineAtMs - Date.now()));
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function buildInconclusiveResult(input: {
   channelId: number;
   routeId: number | null;
@@ -185,8 +225,14 @@ export async function runChannelCandyProbe(input: {
   fingerprint?: CandyFingerprintId | 'auto';
   questionCount?: number;
   requestId?: string | null;
+  /** Override the probe ceiling (tests use a short one); clamped to a sane range. */
+  timeoutMs?: number;
 }): Promise<CandyProbeResult> {
   const channelId = Math.trunc(input.channelId);
+  const timeoutMs = Math.min(
+    CANDY_PROBE_MAX_TIMEOUT_MS,
+    Math.max(CANDY_PROBE_MIN_TIMEOUT_MS, Math.trunc(input.timeoutMs ?? CANDY_PROBE_TIMEOUT_MS)),
+  );
   if (!Number.isFinite(channelId) || channelId <= 0) {
     throw new CandyProbeRequestError('无效的通道 ID', 400);
   }
@@ -247,10 +293,11 @@ export async function runChannelCandyProbe(input: {
     const responsesBody = fingerprint.buildResponsesBody?.(fingerprintInput);
     const channelProxyUrl = resolveChannelProxyUrl(context.site, context.account.extraConfig);
 
+    const deadlineAtMs = startedAtMs + timeoutMs;
     const abortController = new AbortController();
     const abortTimer = setTimeout(() => {
-      abortController.abort(new Error(`candy probe timeout (${Math.round(CANDY_PROBE_TIMEOUT_MS / 1000)}s)`));
-    }, CANDY_PROBE_TIMEOUT_MS);
+      abortController.abort(new Error(`candy probe timeout (${Math.round(timeoutMs / 1000)}s)`));
+    }, timeoutMs);
     abortTimer.unref?.();
 
     const buildRequest = (endpoint: UpstreamEndpoint): BuiltEndpointRequest => {
@@ -303,17 +350,29 @@ export async function runChannelCandyProbe(input: {
 
     let successfulEndpoint: UpstreamEndpoint | null = null;
     let flowResult: Awaited<ReturnType<typeof executeEndpointFlow>>;
+    let rawText = '';
     try {
-      flowResult = await executeEndpointFlow({
-        siteUrl: context.site.url,
-        proxyUrl: channelProxyUrl,
-        endpointCandidates,
-        buildRequest,
-        dispatchRequest,
-        onAttemptSuccess: (ctx) => {
-          successfulEndpoint = ctx.request.endpoint;
+      const outcome = await runProbeWithDeadline({
+        deadlineAtMs,
+        timeoutMs,
+        abortController,
+        execute: async () => {
+          const flow = await executeEndpointFlow({
+            siteUrl: context.site.url,
+            proxyUrl: channelProxyUrl,
+            endpointCandidates,
+            buildRequest,
+            dispatchRequest,
+            onAttemptSuccess: (ctx) => {
+              successfulEndpoint = ctx.request.endpoint;
+            },
+          });
+          const text = flow.ok ? await readRuntimeResponseText(flow.upstream) : '';
+          return { flow, text };
         },
       });
+      flowResult = outcome.flow;
+      rawText = outcome.text;
     } finally {
       clearTimeout(abortTimer);
     }
@@ -335,7 +394,6 @@ export async function runChannelCandyProbe(input: {
       return recordCandyProbeResult(result);
     }
 
-    const rawText = await readRuntimeResponseText(flowResult.upstream);
     const contentType = typeof flowResult.upstream.headers?.get === 'function'
       ? flowResult.upstream.headers.get('content-type')
       : null;
