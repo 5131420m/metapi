@@ -401,4 +401,70 @@ describe('TokenRouter channel quality telemetry', () => {
     expect(perfect.reason).toContain('成功率=100.0%');
     expect(perfect.probability).toBeGreaterThan(mixed.probability);
   });
+
+  /**
+   * Float residue regression: the half-life decay (39 × 0.5^k) reaches exact 0 only at
+   * subnormal underflow (~22 days idle), so an idle channel's window keeps a ~1e-17-ish
+   * sample count. Without the epsilon snap every `sampleCount > 0` gate is penetrated and
+   * the badge leaks the prior 0.5 as a red "成功率0/0/50%" instead of the honest "—".
+   *
+   * Seeded through the real persist → hydrate path: record, flush, patch the persisted
+   * window timestamp backwards, reload, and read the snapshot.
+   */
+  async function patchPersistedChannelWindowAgeMs(channelId: number, ageMs: number) {
+    const row = await db.select().from(schema.settings).get();
+    expect(row).toBeTruthy();
+    const payload = JSON.parse(row!.value as string);
+    const channelState = payload.channelById?.[String(channelId)];
+    expect(channelState).toBeTruthy();
+    const nowMs = Date.now();
+    channelState.recentWindowUpdatedAtMs = nowMs - ageMs;
+    await db.update(schema.settings)
+      .set({ value: JSON.stringify(payload) })
+      .where(eq(schema.settings.key, row!.key)).run();
+    resetSiteRuntimeHealthState();
+  }
+
+  it('reports no recent samples for a long-idle channel instead of leaking the prior 0.5', async () => {
+    const { channel } = await createChannelFixture('gpt-cq-residue', 'cq-r');
+    const router = new TokenRouter();
+    for (let index = 0; index < 5; index += 1) {
+      await router.recordSuccess(channel.id, 4000, 0, 'gpt-cq-residue', undefined, {
+        firstByteLatencyMs: 300,
+        isStream: false,
+      });
+    }
+    await flushSiteRuntimeHealthPersistence();
+    // 48h idle = 96 half-lives: counts decay to ~1e-29 — pure float residue.
+    await patchPersistedChannelWindowAgeMs(channel.id, 48 * 60 * 60 * 1000);
+
+    const snapshots = await router.getChannelQualitySnapshots([channel.id]);
+    const quality = snapshots[String(channel.id)];
+    expect(quality).toBeTruthy();
+    expect(quality.recentSampleCount).toBe(0);
+    expect(quality.recentSuccessCount).toBe(0);
+    expect(quality.recentFailureCount).toBe(0);
+    // The null — not the prior 0.5 — is what makes the routes page render "—".
+    expect(quality.recentSuccessRate).toBeNull();
+  });
+
+  it('keeps decayed counts that are still above the residue epsilon visible', async () => {
+    const { channel } = await createChannelFixture('gpt-cq-residue-live', 'cq-rl');
+    const router = new TokenRouter();
+    for (let index = 0; index < 5; index += 1) {
+      await router.recordSuccess(channel.id, 4000, 0, 'gpt-cq-residue-live', undefined, {
+        firstByteLatencyMs: 300,
+        isStream: false,
+      });
+    }
+    await flushSiteRuntimeHealthPersistence();
+    // 2h idle = 4 half-lives: counts decay to 5 × 0.5^4 = 0.3125 — real (if stale) evidence.
+    await patchPersistedChannelWindowAgeMs(channel.id, 2 * 60 * 60 * 1000);
+
+    const snapshots = await router.getChannelQualitySnapshots([channel.id]);
+    const quality = snapshots[String(channel.id)];
+    expect(quality.recentSampleCount).toBeCloseTo(0.3125, 6);
+    // Prior-smoothed rate over the decayed count, still non-null above the epsilon.
+    expect(quality.recentSuccessRate).toBeCloseTo((0.3125 + 1) / (0.3125 + 2), 6);
+  });
 });

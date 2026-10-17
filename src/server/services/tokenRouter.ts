@@ -685,12 +685,26 @@ function decayRecentOutcomeCount(value: number, elapsedMs: number): number {
   return value * decayFactor;
 }
 
+/**
+ * A decayed sample count below this is not evidence — it is float residue left by the
+ * half-life math (`39 × 0.5^k` reaches exact 0 only at subnormal underflow, ~22 days idle).
+ * Every consumer gates on `sampleCount > 0`, so an un-snapped residue would leak the prior
+ * 0.5 through the channel success-rate badge as a red 50% on an idle channel instead of the
+ * honest "no samples" null.
+ */
+const RECENT_OUTCOME_SAMPLE_EPSILON = 1e-9;
+
+function normalizeRecentOutcomeCount(value: number): number {
+  const normalized = Math.max(0, value);
+  return normalized < RECENT_OUTCOME_SAMPLE_EPSILON ? 0 : normalized;
+}
+
 function buildRecentOutcomeSnapshot(
   successCount: number,
   failureCount: number,
 ): RecentOutcomeSnapshot {
-  const normalizedSuccessCount = Math.max(0, successCount);
-  const normalizedFailureCount = Math.max(0, failureCount);
+  const normalizedSuccessCount = normalizeRecentOutcomeCount(successCount);
+  const normalizedFailureCount = normalizeRecentOutcomeCount(failureCount);
   const sampleCount = normalizedSuccessCount + normalizedFailureCount;
   const successRate = (
     normalizedSuccessCount + SITE_RECENT_SUCCESS_PRIOR_SUCCESSES
