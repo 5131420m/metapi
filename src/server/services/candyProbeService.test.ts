@@ -44,6 +44,18 @@ vi.mock('./upstreamEndpointRuntime.js', async () => {
   };
 });
 
+/**
+ * Pin the battery to the static bank for this file.
+ *
+ * The subject here is the probe's orchestration (usage log, debug trace, deadline, single
+ * flight), not the question bank: a fresh generated battery per run would make every
+ * expectation depend on a random draw. The generated questions have their own tests, where
+ * their answers are checked against brute force.
+ */
+vi.mock('./candyProbe/generatedQuestions.js', () => ({
+  generateCandyQuestions: () => [],
+}));
+
 vi.mock('./runtimeDispatch.js', () => ({
   dispatchRuntimeRequest: (...args: unknown[]) => dispatchRuntimeRequestMock(...args),
 }));

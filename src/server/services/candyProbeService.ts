@@ -63,6 +63,7 @@ import {
   gradeCandyProbeRun,
   selectCandyQuestions,
 } from './candyProbe/questionBank.js';
+import { generateCandyQuestions } from './candyProbe/generatedQuestions.js';
 import {
   getCandyFingerprint,
   resolveCandyFingerprintIdForModel,
@@ -412,6 +413,8 @@ export function runChannelCandyProbe(input: {
   requestId?: string | null;
   /** Override the probe ceiling (tests use a short one); clamped to a sane range. */
   timeoutMs?: number;
+  /** Question-selection randomness; injectable so a test can pin the drawn battery. */
+  random?: () => number;
 }): Promise<CandyProbeResult> {
   const channelId = Math.trunc(input.channelId);
   if (!Number.isFinite(channelId) || channelId <= 0) {
@@ -423,6 +426,9 @@ export function runChannelCandyProbe(input: {
     input.fingerprint ?? 'auto',
     input.questionCount ?? DEFAULT_CANDY_QUESTION_COUNT,
     input.timeoutMs ?? '',
+    // An injected random source means the caller is pinning the battery, so two such runs
+    // are not interchangeable and must not share one result.
+    input.random ? 'seeded' : '',
   ].join('|');
   const existing = inFlightProbes.get(flightKey);
   if (existing) return existing;
@@ -441,6 +447,7 @@ async function executeChannelCandyProbe(input: {
   questionCount?: number;
   requestId?: string | null;
   timeoutMs?: number;
+  random?: () => number;
 }): Promise<CandyProbeResult> {
   const releaseSlot = await acquireProbeSlot();
   try {
@@ -456,6 +463,8 @@ async function runChannelCandyProbeUnbounded(input: {
   questionCount?: number;
   requestId?: string | null;
   timeoutMs?: number;
+  /** Question-selection randomness; injectable so a test can pin the drawn battery. */
+  random?: () => number;
 }): Promise<CandyProbeResult> {
   const channelId = Math.trunc(input.channelId);
   const timeoutMs = resolveCandyProbeTimeoutMs(input.timeoutMs);
@@ -467,9 +476,14 @@ async function runChannelCandyProbeUnbounded(input: {
   const fingerprintId = resolveFingerprintId(context.modelName, input.fingerprint);
   const fingerprint = getCandyFingerprint(fingerprintId);
 
+  const random = input.random ?? Math.random;
   const questions = selectCandyQuestions({
     count: input.questionCount ?? DEFAULT_CANDY_QUESTION_COUNT,
     discriminativeCount: DEFAULT_CANDY_DISCRIMINATIVE_COUNT,
+    random,
+    // Fresh questions per run: the static bank is public, so a relay that saw it once could
+    // special-case its answers. The generated ones are graded by computed answers.
+    extraQuestions: generateCandyQuestions(random),
   });
   if (questions.length <= 0) {
     throw new CandyProbeRequestError('糖果题库为空，无法探测', 500);

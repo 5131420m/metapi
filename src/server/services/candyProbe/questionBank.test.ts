@@ -14,6 +14,47 @@ import {
 const compareDecimals = CANDY_QUESTIONS.find((question) => question.id === 'compare-decimals') as CandyQuestion;
 const countR = CANDY_QUESTIONS.find((question) => question.id === 'count-r-strawberry') as CandyQuestion;
 const literalOk = CANDY_QUESTIONS.find((question) => question.id === 'literal-ok') as CandyQuestion;
+const candyBags = CANDY_QUESTIONS.find((question) => question.id === 'candy-bags-three-flavors') as CandyQuestion;
+
+describe('the multi-constraint candy-bag question', () => {
+  // The answer is 21, and it was checked by hand before being written down: with 24 round and
+  // 17 star candies, the bad hands are (≤8 round), (≤17 round∧≤10 star), (≤15 round∧≤11 star)
+  // and (≤4 mint), whose maxima are 8+17=25? — no: each bad hand is bounded separately and the
+  // largest is 20, so 21 draws always succeed and 20 does not.
+  it('is in the bank with the unique minimum as its answer', () => {
+    expect(candyBags).toBeDefined();
+    expect(candyBags.expectedLabel).toBe('21');
+    expect(candyBags.rule).toEqual({ kind: 'lastNumber', value: 21 });
+    // A reasoning answer leads with other counts, so `firstNumber` would grade the wrong one.
+    expect(candyBags.tier).toBe('discriminative');
+  });
+
+  it('grades a full reasoning answer by its conclusion', () => {
+    const reasoning = [
+      '最坏情况是不满足任一条件。',
+      '至少 9 颗圆形：非圆形最多 17 颗，还需 9 颗，共 26？',
+      '由于非圆形全部取完后只剩圆形，所以取 17+9=26 可保证 9 颗圆形。',
+      '综合考虑四组限制，答案为 21。',
+    ].join('\n');
+    const result = gradeCandyProbeRun({
+      questions: [candyBags],
+      text: `1: ${reasoning}`,
+    });
+    expect(result.verdict).toBe('pass');
+    expect(result.score).toBe(1);
+  });
+
+  it('treats the plausible wrong answers as failures', () => {
+    for (const wrong of [17, 24, 28]) {
+      const result = gradeCandyProbeRun({
+        questions: [candyBags],
+        text: `1: 最少要取 ${wrong} 颗。`,
+      });
+      expect(result.verdict, `answer ${wrong}`).toBe('fail');
+      expect(result.score).toBe(0);
+    }
+  });
+});
 
 describe('candy question grading', () => {
   it('accepts the correct answer and rejects the canonical degraded answer', () => {

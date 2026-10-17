@@ -126,10 +126,40 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     expectedLabel: '10',
     rule: { kind: 'firstNumber', value: 10 },
   },
+  {
+    // A genuine multi-constraint search, so it cannot be answered by pattern-matching the
+    // prompt: a model has to enumerate the bad hands and take the unique minimum. Weak or
+    // swapped models reliably answer a plausible-looking number instead (17, 24, 28).
+    id: 'candy-bags-three-flavors',
+    tier: 'discriminative',
+    prompt: [
+      '袋子里有糖果，共三种口味（草莓、柠檬、薄荷）、两种形状（圆形、五角星形）。',
+      '已知：圆形草莓 7 颗、圆形柠檬 9 颗、圆形薄荷 8 颗；',
+      '五角星形草莓 7 颗、五角星形柠檬 6 颗、五角星形薄荷 4 颗。',
+      '闭眼随机取，最少要取多少颗，才能保证一定拿到：至少 9 颗圆形、',
+      '且（至少 18 颗圆形 或 至少 11 颗五角星形）、',
+      '且（至少 16 颗圆形 或 至少 12 颗五角星形）、且至少 5 颗薄荷？',
+      '只回答这个数字。',
+    ].join(''),
+    expectedLabel: '21',
+    // The reasoning puts the conclusion last, and a bare `firstNumber` rule would grade the
+    // first count it mentions instead of the answer.
+    rule: { kind: 'lastNumber', value: 21 },
+    wrongAnswers: [17, 24, 28],
+  },
 ];
 
 export const DEFAULT_CANDY_QUESTION_COUNT = 3;
 export const DEFAULT_CANDY_DISCRIMINATIVE_COUNT = 2;
+
+/**
+ * Cap on how much continuation text one answer absorbs.
+ *
+ * Enough for a full reasoning trace, small enough that a model dumping its whole context
+ * cannot turn a wrong answer into a right one by burying the expected number somewhere far
+ * below the conclusion.
+ */
+const CANDY_ANSWER_CONTINUATION_MAX_CHARS = 2_000;
 
 function asTrimmedText(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
@@ -240,12 +270,14 @@ export function selectCandyQuestions(input: {
   random?: () => number;
   /** Restrict the draw to one tier (used by tests). */
   tier?: CandyQuestionTier;
+  /** Extra questions to draw from — the run's freshly generated ones. */
+  extraQuestions?: readonly CandyQuestion[];
 } = {}): CandyQuestion[] {
   const random = input.random ?? Math.random;
   const count = Math.max(1, Math.trunc(input.count ?? DEFAULT_CANDY_QUESTION_COUNT));
   const pool = input.tier
     ? CANDY_QUESTIONS.filter((question) => question.tier === input.tier)
-    : [...CANDY_QUESTIONS];
+    : [...CANDY_QUESTIONS, ...(input.extraQuestions ?? [])];
   if (pool.length <= 0) return [];
 
   const discriminative = pool.filter((question) => question.tier === 'discriminative');
@@ -335,14 +367,35 @@ export function parseCandyAnswers(input: {
   const lines = splitCandidateLines(input.text);
   const answers = input.questions.map(() => '');
 
+  // A reasoning answer routinely puts the label and the reasoning on one line and then spills
+  // onto the next few, e.g. `1: 最坏情况…` / `…` / `答案为 21。`. Grading only the labelled line
+  // would read that as an answerless line and report a working model as degraded, so
+  // continuation lines belong to the question they follow.
+  //
+  // Appending (rather than replacing) is what keeps `firstNumber` honest: an answer that opens
+  // with the wrong candidate still opens with it. For `lastNumber`, which exists for exactly
+  // this answer shape, the conclusion is now reachable.
   let numberedHits = 0;
+  let openQuestionIndex = -1;
   for (const line of lines) {
     const match = line.match(NUMBERED_LINE_PATTERN);
-    if (!match) continue;
+    if (!match) {
+      if (openQuestionIndex >= 0) {
+        const continuation = asTrimmedText(line);
+        if (continuation && (answers[openQuestionIndex] as string).length < CANDY_ANSWER_CONTINUATION_MAX_CHARS) {
+          answers[openQuestionIndex] = `${answers[openQuestionIndex]} ${continuation}`.trim();
+        }
+      }
+      continue;
+    }
     const questionIndex = Number(match[1]) - 1;
     if (questionIndex < 0 || questionIndex >= input.questions.length) continue;
-    if (answers[questionIndex]) continue;
+    if (answers[questionIndex]) {
+      openQuestionIndex = questionIndex;
+      continue;
+    }
     answers[questionIndex] = asTrimmedText(match[2]);
+    openQuestionIndex = questionIndex;
     numberedHits += 1;
   }
   if (numberedHits >= input.questions.length) {
