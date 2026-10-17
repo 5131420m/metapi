@@ -5,6 +5,7 @@ import { updateBalanceRefreshCron, updateCheckinCron, updateLogCleanupSettings }
 import { ensureDefaultSitesSeeded } from './defaultSiteSeedService.js';
 import { startProxyLogRetentionService } from './proxyLogRetentionService.js';
 import { invalidateSiteProxyCache } from './siteProxy.js';
+import { resetCandyProbeStore } from './candyProbe/resultStore.js';
 
 export const FACTORY_RESET_ADMIN_TOKEN = 'change-me-admin-token';
 
@@ -111,6 +112,11 @@ export async function performFactoryReset(deps: FactoryResetDependencies = {}): 
   const runSqliteMigrationsImpl = deps.runSqliteMigrations ?? runDefaultSqliteMigrations;
   const ensureDefaultSitesSeededImpl = deps.ensureDefaultSitesSeeded ?? ensureDefaultSitesSeeded;
   const preserved = captureInfrastructureState();
+
+  // Candy-probe verdicts live in memory and are persisted into `settings`. Clearing the
+  // table alone would leave the old verdicts in the Map, and the next write would put them
+  // back into the settings row of the freshly reset database.
+  resetCandyProbeStore();
 
   await clearAllBusinessData();
   resetRuntimeConfigToInitialState(preserved);

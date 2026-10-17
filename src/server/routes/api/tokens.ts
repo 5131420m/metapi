@@ -636,7 +636,25 @@ async function fetchChannelsForRouteRows(
   const qualityByChannelId = await tokenRouter.getChannelQualitySnapshots(qualityChannelIds);
   // Display-only candy-probe verdict (degrade check). Same bulk shape as `quality`, and
   // likewise never read by routing: P1 only surfaces the verdict.
-  const candyProbeByChannelId = getCandyProbeSnapshots(qualityChannelIds);
+  //
+  // The current channel configuration is passed alongside so a verdict recorded against a
+  // different source model / credential is dropped instead of shown: after such a change the
+  // honest answer to "is this channel degraded" is "unknown", not last week's badge.
+  const candyProbeConfigByChannelId: Record<number, {
+    model: string;
+    accountId: number | null;
+    tokenId: number | null;
+  }> = {};
+  for (const channels of channelsByActualRouteId.values()) {
+    for (const channel of channels) {
+      candyProbeConfigByChannelId[channel.id] = {
+        model: String(channel.sourceModel || channel.modelPattern || '').trim(),
+        accountId: Number.isFinite(channel.accountId) ? Number(channel.accountId) : null,
+        tokenId: Number.isFinite(channel.tokenId) ? Number(channel.tokenId) : null,
+      };
+    }
+  }
+  const candyProbeByChannelId = getCandyProbeSnapshots(qualityChannelIds, candyProbeConfigByChannelId);
   for (const channels of channelsByActualRouteId.values()) {
     for (const channel of channels) {
       channel.quality = qualityByChannelId[String(channel.id)] ?? null;

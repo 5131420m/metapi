@@ -75,6 +75,7 @@ import {
   getCandyProbeSnapshots,
   hydrateCandyProbeResultsFromSettings,
   recordCandyProbeResult,
+  type CandyProbeConfigFingerprint,
   type CandyProbeResult,
   type CandyProbeSnapshot,
 } from './candyProbe/resultStore.js';
@@ -262,6 +263,8 @@ type CandyProbeChannelContext = {
   tokenValue: string;
   account: typeof schema.accounts.$inferSelect;
   site: typeof schema.sites.$inferSelect;
+  /** What the verdict is measured against; a snapshot is dropped when this changes. */
+  config: CandyProbeConfigFingerprint;
 };
 
 function resolveProbeModelName(row: CandyProbeChannelRow): string {
@@ -320,6 +323,11 @@ async function loadChannelProbeContext(channelId: number): Promise<CandyProbeCha
     tokenValue,
     account: row.accounts,
     site: row.sites,
+    config: {
+      model: modelName,
+      accountId: row.accounts.id ?? null,
+      tokenId: row.route_channels.tokenId ?? null,
+    },
   };
 }
 
@@ -352,6 +360,7 @@ function buildInconclusiveResult(input: {
   latencyMs: number | null;
   reason: string;
   endpoint: string | null;
+  config: CandyProbeConfigFingerprint;
 }): CandyProbeResult {
   return {
     channelId: input.channelId,
@@ -368,6 +377,7 @@ function buildInconclusiveResult(input: {
     reason: input.reason,
     parseMode: 'none',
     questions: [],
+    config: input.config,
   };
 }
 
@@ -552,6 +562,7 @@ async function runChannelCandyProbeUnbounded(input: {
         latencyMs: Date.now() - startedAtMs,
         reason: '没有可用的上游端点候选',
         endpoint: null,
+        config: context.config,
       });
       return finish(result);
     }
@@ -714,6 +725,7 @@ async function runChannelCandyProbeUnbounded(input: {
         latencyMs,
         reason: `上游返回 ${flowResult.status || '错误'}${errorText ? `：${errorText.slice(0, 200)}` : ''}`,
         endpoint: successfulEndpoint,
+        config: context.config,
       });
       return finish(result, { httpStatus: flowResult.status ?? null });
     }
@@ -744,6 +756,7 @@ async function runChannelCandyProbeUnbounded(input: {
       reason: grade.reason ?? payload.errorMessage,
       parseMode: grade.parseMode,
       questions: grade.questions,
+      config: context.config,
     };
     return finish(result, {
       usage: payload.usage,
@@ -770,6 +783,7 @@ async function runChannelCandyProbeUnbounded(input: {
       latencyMs: Date.now() - startedAtMs,
       reason,
       endpoint: null,
+      config: context.config,
     });
     return finish(result);
   }

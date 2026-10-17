@@ -7,6 +7,7 @@ import { mergeAccountExtraConfig } from './accountExtraConfig.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { PLATFORM_ALIASES, detectPlatformByUrlHint } from '../../shared/platformIdentity.js';
 import { parseDownstreamErrorPolicyConfig } from './downstreamErrorPolicy.js';
+import { resetCandyProbeStore } from './candyProbe/resultStore.js';
 
 
 const BACKUP_VERSION = '2.1';
@@ -2063,6 +2064,11 @@ export async function importBackup(data: RawBackupData): Promise<BackupImportRes
     appliedSettings = [...appliedSettings, ...(await importPreferencesSection(preferencesSection))];
     preferencesImported = true;
   }
+
+  // The imported data replaces accounts/routes/channels, so every candy-probe verdict now
+  // describes a channel that may no longer exist. Drop the in-memory store: otherwise the
+  // next write persists those stale verdicts into the imported database's settings row.
+  resetCandyProbeStore();
 
   return {
     allImported: (!accountsRequested || accountsImported) && (!preferencesRequested || preferencesImported),
