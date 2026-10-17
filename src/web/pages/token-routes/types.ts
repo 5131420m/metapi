@@ -93,6 +93,14 @@ export type RouteChannel = {
   quality?: RouteChannelQuality | null;
   /** Display-only candy-question verdict; null before the first manual probe. */
   candyProbe?: CandyProbeSnapshot | null;
+  /**
+   * Whether a probe could succeed at all (false for a non-conversation model).
+   *
+   * Computed by the server with the same rule the probe enforces, so the UI never has to
+   * duplicate model-family knowledge — and never offers a button that can only come back
+   * rejected.
+   */
+  candyProbeApplicable?: boolean;
   account?: {
     username: string | null;
     accessToken?: string | null;

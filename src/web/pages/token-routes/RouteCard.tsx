@@ -554,7 +554,11 @@ function SortableChannelShell({
         onClearCooldown={readOnlyRoute ? undefined : () => onClearChannelCooldown(channel.id, routeId)}
         clearingCooldown={!!clearingCooldownByChannel[channel.id]}
         candyProbeTesting={!!candyProbeTestingByChannel?.[channel.id]}
-        onRunCandyProbe={readOnlyRoute || !onRunCandyProbe ? undefined : () => onRunCandyProbe(channel.id, routeId)}
+        onRunCandyProbe={
+          readOnlyRoute || !onRunCandyProbe || channel.candyProbeApplicable === false
+            ? undefined
+            : () => onRunCandyProbe(channel.id, routeId)
+        }
         onOpenCandyProbeDetail={onOpenCandyProbeDetail ? () => onOpenCandyProbeDetail(channel.id) : undefined}
       />
     </div>
@@ -692,6 +696,12 @@ function RouteCardInner({
     const loadedChannelCount = channels && channels.length > 0 ? channels.length : null;
     const channelTotal = progress?.total ?? loadedChannelCount ?? route.channelCount ?? 0;
     if (!running && channelTotal <= 0) return null;
+    // Every channel on this route is a non-conversation model: a sweep could only fire a
+    // request per channel and collect the same rejection each time.
+    if (!running && channels && channels.length > 0
+      && channels.every((channel) => channel.candyProbeApplicable === false)) {
+      return null;
+    }
     return (
       <button
         onClick={() => onRunCandyProbeAllChannels(route.id)}

@@ -1340,7 +1340,16 @@ export default function TokenRoutes() {
       return;
     }
 
-    setCandyProbeBatchByRoute((prev) => ({ ...prev, [routeId]: { done: 0, total: targets.length } }));
+    // A non-conversation model (an embedding, a reranker) can only come back rejected, so a
+    // sweep over it is one doomed request per channel. Counted as 跳过 rather than 失败.
+    const probeable = targets.filter((channel) => channel.candyProbeApplicable !== false);
+    const skipped = targets.length - probeable.length;
+    if (probeable.length <= 0) {
+      toast.info('该路由下没有可做糖果题检测的通道（非对话模型不适用）');
+      return;
+    }
+
+    setCandyProbeBatchByRoute((prev) => ({ ...prev, [routeId]: { done: 0, total: probeable.length } }));
     const tally = { pass: 0, fail: 0, inconclusive: 0, rejected: 0 };
 
     const runOne = async (channel: RouteChannel) => {
@@ -1365,7 +1374,7 @@ export default function TokenRoutes() {
       }
     };
 
-    const queue = [...targets];
+    const queue = [...probeable];
     const workerCount = Math.min(2, queue.length);
     await Promise.all(Array.from({ length: workerCount }, async () => {
       while (queue.length > 0) {
@@ -1381,7 +1390,15 @@ export default function TokenRoutes() {
       return next;
     });
 
-    const summary = `通过 ${tally.pass} · 疑似降智 ${tally.fail} · 不确定 ${tally.inconclusive}`;
+    // `rejected` is shown separately from the verdicts: a channel the probe could not even
+    // reach is not evidence about the model, and folding it into "不确定" would hide that.
+    const summary = [
+      `通过 ${tally.pass}`,
+      `疑似降智 ${tally.fail}`,
+      `不确定 ${tally.inconclusive}`,
+      ...(tally.rejected > 0 ? [`无法探测 ${tally.rejected}`] : []),
+      ...(skipped > 0 ? [`跳过 ${skipped}`] : []),
+    ].join(' · ');
     if (tally.fail > 0) toast.error(`批量检测完成：${summary}`);
     else toast.success(`批量检测完成：${summary}`);
 

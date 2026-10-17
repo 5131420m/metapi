@@ -24,6 +24,10 @@ import {
 import { clearChannelCooldown, clearRouteCooldown } from '../../services/routeCooldownService.js';
 import { getCandyProbeSnapshots } from '../../services/candyProbeService.js';
 import {
+  isChannelProbeApplicable,
+  resolveExactProbeModelName,
+} from '../../services/channelProbeContext.js';
+import {
   refreshAllRouteDecisionSnapshots,
   ROUTE_DECISION_REFRESH_DEDUPE_KEY,
   ROUTE_DECISION_REFRESH_TASK_TYPE,
@@ -647,8 +651,14 @@ async function fetchChannelsForRouteRows(
   }> = {};
   for (const channels of channelsByActualRouteId.values()) {
     for (const channel of channels) {
+      // The same name the probe itself would resolve, so the snapshot tells "the channel
+      // changed" and "the list labelled it" from one source.
+      const model = resolveExactProbeModelName({
+        sourceModel: channel.sourceModel,
+        modelPattern: channel.modelPattern,
+      });
       candyProbeConfigByChannelId[channel.id] = {
-        model: String(channel.sourceModel || channel.modelPattern || '').trim(),
+        model,
         accountId: Number.isFinite(channel.accountId) ? Number(channel.accountId) : null,
         tokenId: Number.isFinite(channel.tokenId) ? Number(channel.tokenId) : null,
       };
@@ -659,6 +669,12 @@ async function fetchChannelsForRouteRows(
     for (const channel of channels) {
       channel.quality = qualityByChannelId[String(channel.id)] ?? null;
       channel.candyProbe = candyProbeByChannelId[String(channel.id)] ?? null;
+      // Lets the UI hide a button that could only ever come back rejected, and lets the
+      // batch skip those channels instead of firing a doomed request per channel.
+      channel.candyProbeApplicable = isChannelProbeApplicable({
+        sourceModel: channel.sourceModel,
+        modelPattern: channel.modelPattern,
+      });
     }
   }
 
