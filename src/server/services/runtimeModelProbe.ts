@@ -8,6 +8,12 @@ import {
   type UpstreamEndpoint,
 } from './upstreamEndpointRuntime.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../proxy-core/orchestration/endpointFlow.js';
+import {
+  createProbeDeadline,
+  remainingTimeoutMs,
+  runWithDeadline,
+  withTimeout,
+} from './probeDeadline.js';
 import type { schema } from '../db/index.js';
 
 export type RuntimeModelProbeStatus = 'supported' | 'unsupported' | 'inconclusive' | 'skipped';
@@ -72,29 +78,6 @@ function buildProbeBody(modelName: string): Record<string, unknown> {
   };
 }
 
-async function withTimeout<T>(fn: () => Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  try {
-    return await Promise.race([
-      fn(),
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-function resolveRemainingTimeoutMs(deadlineAtMs: number, timeoutLabel: string): number {
-  const remainingMs = deadlineAtMs - Date.now();
-  if (remainingMs <= 0) {
-    throw new Error(timeoutLabel);
-  }
-  return remainingMs;
-}
-
 export async function probeRuntimeModel(input: {
   site: typeof schema.sites.$inferSelect;
   account: typeof schema.accounts.$inferSelect;
@@ -124,9 +107,10 @@ export async function probeRuntimeModel(input: {
     };
   }
 
-  const startedAt = Date.now();
-  const deadlineAtMs = startedAt + Math.max(1, input.timeoutMs);
+  const deadline = createProbeDeadline(input.timeoutMs);
+  const startedAt = deadline.startedAtMs;
   try {
+    const candidateTimeoutLabel = `runtime model probe candidate resolution timeout (${Math.round(input.timeoutMs / 1000)}s)`;
     const endpointCandidates = await withTimeout(
       () => resolveUpstreamEndpointCandidates(
         {
@@ -137,11 +121,8 @@ export async function probeRuntimeModel(input: {
         'openai',
         input.modelName,
       ),
-      resolveRemainingTimeoutMs(
-        deadlineAtMs,
-        `runtime model probe candidate resolution timeout (${Math.round(input.timeoutMs / 1000)}s)`,
-      ),
-      `runtime model probe candidate resolution timeout (${Math.round(input.timeoutMs / 1000)}s)`,
+      remainingTimeoutMs(deadline, candidateTimeoutLabel),
+      candidateTimeoutLabel,
     );
     if (endpointCandidates.length <= 0) {
       return {
@@ -157,15 +138,7 @@ export async function probeRuntimeModel(input: {
     });
     const openaiBody = buildProbeBody(input.modelName);
     const channelProxyUrl = resolveChannelProxyUrl(input.site, input.account.extraConfig);
-    const abortController = new AbortController();
-    const remainingExecutionTimeoutMs = resolveRemainingTimeoutMs(
-      deadlineAtMs,
-      `runtime model probe timeout (${Math.round(input.timeoutMs / 1000)}s)`,
-    );
-    const abortTimer = setTimeout(() => {
-      abortController.abort(new Error(`runtime model probe timeout (${Math.round(input.timeoutMs / 1000)}s)`));
-    }, remainingExecutionTimeoutMs);
-    abortTimer.unref?.();
+    const executionTimeoutLabel = `runtime model probe timeout (${Math.round(input.timeoutMs / 1000)}s)`;
 
     const buildRequest = (endpoint: UpstreamEndpoint): BuiltEndpointRequest => {
       const request = buildUpstreamEndpointRequest({
@@ -204,25 +177,26 @@ export async function probeRuntimeModel(input: {
             method: 'POST',
             headers: requestForFetch.headers,
             body: JSON.stringify(requestForFetch.body),
-            signal: abortController.signal,
+            signal: deadline.abortController.signal,
           },
           channelProxyUrl,
         ),
       })
     );
 
-    let result: Awaited<ReturnType<typeof executeEndpointFlow>>;
-    try {
-      result = await executeEndpointFlow({
+    // One timer bounds the whole execution and aborts the upstream request when it fires,
+    // instead of a separate abort timer racing a flow that was never bounded at all.
+    const result = await runWithDeadline({
+      deadline,
+      timeoutMessage: executionTimeoutLabel,
+      execute: () => executeEndpointFlow({
         siteUrl: input.site.url,
         proxyUrl: channelProxyUrl,
         endpointCandidates,
         buildRequest,
         dispatchRequest,
-      });
-    } finally {
-      clearTimeout(abortTimer);
-    }
+      }),
+    });
     const latencyMs = Date.now() - startedAt;
 
     if (result.ok) {

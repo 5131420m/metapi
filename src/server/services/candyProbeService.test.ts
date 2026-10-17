@@ -99,6 +99,65 @@ function sseChatText(text: string, model = 'bench-model'): string {
   return `${chunks.join('')}data: [DONE]\n\n`;
 }
 
+/**
+ * One fixture builder for every describe in this file.
+ *
+ * It lives at module scope because two describes need it, and a second copy immediately
+ * drifted: the copy forgot the NOT NULL `accounts.access_token` and every insert failed.
+ */
+async function seedProbeChannelFixture(
+  modules: { db: DbModule['db']; schema: DbModule['schema'] },
+  nextId: () => number,
+  input: {
+    sourceModel?: string | null;
+    modelPattern?: string;
+    platform?: string;
+    withToken?: boolean;
+    apiToken?: string;
+  } = {},
+) {
+  const { db, schema } = modules;
+  const seedId = nextId();
+  const site = await db.insert(schema.sites).values({
+    name: `candy-site-${seedId}`,
+    url: `https://candy-${seedId}.example.com`,
+    platform: input.platform ?? 'new-api',
+    status: 'active',
+  }).returning().get();
+  const account = await db.insert(schema.accounts).values({
+    siteId: site.id,
+    username: 'candy-user',
+    accessToken: '',
+    apiToken: input.apiToken ?? 'sk-candy',
+    status: 'active',
+  }).returning().get();
+  const token = input.withToken === false
+    ? null
+    : await db.insert(schema.accountTokens).values({
+      accountId: account.id,
+      name: 'candy-token',
+      token: 'token-candy',
+      enabled: true,
+      isDefault: false,
+    }).returning().get();
+  // `token_routes.model_pattern` is unique, so a per-seed suffix keeps fixtures independent
+  // without changing what the service resolves (sourceModel wins when present).
+  const route = await db.insert(schema.tokenRoutes).values({
+    modelPattern: input.modelPattern ?? `${input.sourceModel || 'claude-sonnet-4-5'}@${Math.random().toString(36).slice(2, 8)}`,
+    enabled: true,
+  }).returning().get();
+  const channel = await db.insert(schema.routeChannels).values({
+    routeId: route.id,
+    accountId: account.id,
+    tokenId: token?.id ?? null,
+    sourceModel: input.sourceModel === undefined ? 'claude-sonnet-4-5' : input.sourceModel,
+    priority: 0,
+    weight: 10,
+    enabled: true,
+  }).returning().get();
+  return { site, account, token, route, channel };
+}
+
 describe('runChannelCandyProbe', () => {
   let db: DbModule['db'];
   let schema: DbModule['schema'];
@@ -120,6 +179,7 @@ describe('runChannelCandyProbe', () => {
 
   beforeEach(async () => {
     store.resetCandyProbeStoreForTests();
+    service.resetCandyProbeConcurrencyForTests();
     resolveUpstreamEndpointCandidatesMock.mockReset().mockResolvedValue(['chat']);
     dispatchRuntimeRequestMock.mockReset();
     resolveChannelProxyUrlMock.mockReset().mockReturnValue(null);
@@ -159,45 +219,7 @@ describe('runChannelCandyProbe', () => {
     withToken?: boolean;
     apiToken?: string;
   } = {}) {
-    const seedId = ++seedCounter;
-    const site = await db.insert(schema.sites).values({
-      name: `candy-site-${seedId}`,
-      url: `https://candy-${seedId}.example.com`,
-      platform: input.platform ?? 'new-api',
-      status: 'active',
-    }).returning().get();
-    const account = await db.insert(schema.accounts).values({
-      siteId: site.id,
-      username: 'candy-user',
-      accessToken: '',
-      apiToken: input.apiToken ?? 'sk-candy',
-      status: 'active',
-    }).returning().get();
-    const token = input.withToken === false
-      ? null
-      : await db.insert(schema.accountTokens).values({
-        accountId: account.id,
-        name: 'candy-token',
-        token: 'token-candy',
-        enabled: true,
-        isDefault: false,
-      }).returning().get();
-    // `token_routes.model_pattern` is unique, so a per-seed suffix keeps fixtures independent
-    // without changing what the service resolves (sourceModel wins when present).
-    const route = await db.insert(schema.tokenRoutes).values({
-      modelPattern: input.modelPattern ?? `${input.sourceModel || 'claude-sonnet-4-5'}@${Math.random().toString(36).slice(2, 8)}`,
-      enabled: true,
-    }).returning().get();
-    const channel = await db.insert(schema.routeChannels).values({
-      routeId: route.id,
-      accountId: account.id,
-      tokenId: token?.id ?? null,
-      sourceModel: input.sourceModel === undefined ? 'claude-sonnet-4-5' : input.sourceModel,
-      priority: 0,
-      weight: 10,
-      enabled: true,
-    }).returning().get();
-    return { site, account, token, route, channel };
+    return seedProbeChannelFixture({ db, schema }, () => ++seedCounter, input);
   }
 
   it('records a pass when the model answers the battery correctly', async () => {
@@ -580,6 +602,140 @@ describe('runChannelCandyProbe', () => {
   });
 });
 
+describe('candy probe concurrency', () => {
+  let db: DbModule['db'];
+  let schema: DbModule['schema'];
+  let dataDir = '';
+  let seedCounter = 0;
+  let service: typeof import('./candyProbeService.js');
+  let store: typeof import('./candyProbe/resultStore.js');
+
+  beforeAll(async () => {
+    dataDir = mkdtempSync(join(tmpdir(), 'metapi-candy-concurrency-'));
+    process.env.DATA_DIR = dataDir;
+    await import('../db/migrate.js');
+    const dbModule = await import('../db/index.js');
+    db = dbModule.db;
+    schema = dbModule.schema;
+    service = await import('./candyProbeService.js');
+    store = await import('./candyProbe/resultStore.js');
+  });
+
+  beforeEach(async () => {
+    store.resetCandyProbeStoreForTests();
+    service.resetCandyProbeConcurrencyForTests();
+    resolveUpstreamEndpointCandidatesMock.mockReset().mockResolvedValue(['chat']);
+    dispatchRuntimeRequestMock.mockReset();
+    resolveChannelProxyUrlMock.mockReset().mockReturnValue(null);
+    withSiteRecordProxyRequestInitMock.mockReset().mockImplementation(async (_site: unknown, init: unknown) => init);
+    getOauthInfoFromAccountMock.mockReset().mockReturnValue(null);
+    buildOauthProviderHeadersMock.mockReset().mockReturnValue({});
+    insertProxyLogMock.mockReset().mockImplementation(async () => undefined);
+
+    await db.delete(schema.routeChannels).run();
+    await db.delete(schema.tokenRoutes).run();
+    await db.delete(schema.accountTokens).run();
+    await db.delete(schema.accounts).run();
+    await db.delete(schema.sites).run();
+    await db.delete(schema.settings).run();
+    await db.delete(schema.proxyLogs).run();
+  });
+
+  afterAll(() => {
+    store.resetCandyProbeStoreForTests();
+    service.resetCandyProbeConcurrencyForTests();
+    try {
+      rmSync(dataDir, { recursive: true, force: true });
+    } catch {
+      // Windows keeps the SQLite file handle open; a failed cleanup must not fail the run.
+    }
+  });
+
+  async function seedChannelFor(modelName: string) {
+    return seedProbeChannelFixture({ db, schema }, () => ++seedCounter, { sourceModel: modelName });
+  }
+
+  it('shares one upstream request between callers for the same channel and parameters', async () => {
+    const { channel } = await seedChannelFor('claude-sonnet-4-5');
+    let resolveUpstream: ((value: Response) => void) | null = null;
+    dispatchRuntimeRequestMock.mockImplementation(() => new Promise<Response>((resolve) => {
+      resolveUpstream = resolve;
+    }));
+
+    const first = service.runChannelCandyProbe({ channelId: channel.id });
+    const second = service.runChannelCandyProbe({ channelId: channel.id });
+
+    // Let both calls reach the single-flight map before the upstream is released.
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(dispatchRuntimeRequestMock).toHaveBeenCalledTimes(1);
+    expect(resolveUpstream).not.toBeNull();
+    resolveUpstream!(new Response(sseChatText('1: 9.9'), {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }));
+
+    const [a, b] = await Promise.all([first, second]);
+    expect(a).toBe(b);
+    expect(dispatchRuntimeRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not collapse two different fingerprints into one run', async () => {
+    const { channel } = await seedChannelFor('claude-sonnet-4-5');
+    dispatchRuntimeRequestMock.mockImplementation(async () => new Response(
+      sseChatText('1: 9.9'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    const [claude, codex] = await Promise.all([
+      service.runChannelCandyProbe({ channelId: channel.id, fingerprint: 'claude_code' }),
+      service.runChannelCandyProbe({ channelId: channel.id, fingerprint: 'codex' }),
+    ]);
+
+    expect(claude.fingerprint).toBe('claude_code');
+    expect(codex.fingerprint).toBe('codex');
+    expect(dispatchRuntimeRequestMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('caps how many probes hit upstream at once', async () => {
+    const channels = [];
+    for (let index = 0; index < service.CANDY_PROBE_MAX_CONCURRENT + 3; index += 1) {
+      const seeded = await seedChannelFor(`claude-sonnet-4-5-${index}`);
+      channels.push(seeded.channel);
+    }
+
+    let inFlight = 0;
+    let peak = 0;
+    const releases: Array<() => void> = [];
+    dispatchRuntimeRequestMock.mockImplementation(() => new Promise<Response>((resolve) => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      releases.push(() => {
+        inFlight -= 1;
+        resolve(new Response(sseChatText('1: 9.9'), {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream' },
+        }));
+      });
+    }));
+
+    const runs = channels.map((channel) => service.runChannelCandyProbe({ channelId: channel.id }));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(peak).toBeLessThanOrEqual(service.CANDY_PROBE_MAX_CONCURRENT);
+
+    // Drain: release whatever is running until every probe has finished.
+    const drain = (async () => {
+      while (releases.length > 0 || inFlight > 0) {
+        const release = releases.shift();
+        if (release) release();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    })();
+    await Promise.all([Promise.all(runs), drain]);
+    expect(peak).toBeLessThanOrEqual(service.CANDY_PROBE_MAX_CONCURRENT);
+    expect(dispatchRuntimeRequestMock).toHaveBeenCalledTimes(channels.length);
+  });
+});
+
 describe('candy probe timeout resolution', () => {
   let serviceModule: typeof import('./candyProbeService.js');
   let configModule: typeof import('../config.js');
@@ -593,18 +749,28 @@ describe('candy probe timeout resolution', () => {
     configModule.config.proxyFirstByteTimeoutSec = 0;
   });
 
-  it('follows the streaming budget from settings', () => {
+  it('raises a small streaming budget to the probe floor', () => {
+    // The setting is a first-byte budget; a probe waits for a whole completion, so a 7s
+    // first-byte timeout would cut reasoning models off mid-answer and read as "不确定".
     configModule.config.proxyFirstByteTimeoutSec = 7;
-    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(7_000);
+    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(serviceModule.CANDY_PROBE_TIMEOUT_FLOOR_MS);
   });
 
-  it('falls back to the built-in ceiling when the operator disabled the budget', () => {
+  it('honours a streaming budget above the floor', () => {
+    configModule.config.proxyFirstByteTimeoutSec = 90;
+    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(90_000);
+  });
+
+  it('falls back to the built-in ceiling when the operator disabled the budget, still floored', () => {
     configModule.config.proxyFirstByteTimeoutSec = 0;
-    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(serviceModule.CANDY_PROBE_TIMEOUT_MS);
+    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(
+      Math.max(serviceModule.CANDY_PROBE_TIMEOUT_MS, serviceModule.CANDY_PROBE_TIMEOUT_FLOOR_MS),
+    );
   });
 
-  it('lets an explicit override win over settings, inside the clamp', () => {
+  it('lets an explicit override win over settings, inside the clamp but without the floor', () => {
     configModule.config.proxyFirstByteTimeoutSec = 30;
+    // An explicit value is the caller's own decision (tests rely on short ones).
     expect(serviceModule.resolveCandyProbeTimeoutMs(400)).toBe(1_000);
     expect(serviceModule.resolveCandyProbeTimeoutMs(120_000)).toBe(120_000);
     expect(serviceModule.resolveCandyProbeTimeoutMs(10 * 60_000)).toBe(serviceModule.CANDY_PROBE_MAX_TIMEOUT_MS);

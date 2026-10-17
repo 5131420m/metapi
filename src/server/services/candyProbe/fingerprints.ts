@@ -33,6 +33,16 @@ import {
 
 export type CandyFingerprintId = 'claude_code' | 'codex' | 'generic_openai';
 
+/**
+ * Output cap for the probe's request bodies.
+ *
+ * The probe asks three one-line answers, so this is not a real limit — it is headroom. A
+ * reasoning model spends its thinking out of the same budget, and at 2048 a thinking model
+ * could burn all of it before emitting an answer, which the grader can only read as an
+ * empty completion and therefore as "不确定".
+ */
+export const CANDY_PROBE_MAX_OUTPUT_TOKENS = 8192;
+
 export type CandyFingerprintRequestInput = {
   model: string;
   prompt: string;
@@ -97,7 +107,10 @@ const claudeCodeFingerprint: CandyFingerprint = {
   buildClaudeBody({ model, prompt, scopeKey }) {
     return {
       model,
-      max_tokens: 2048,
+      // Reasoning models charge their thinking against this budget; at 2048 a thinking
+      // model could spend it all before writing a single answer line, which reads as an
+      // empty completion and then as "不确定".
+      max_tokens: CANDY_PROBE_MAX_OUTPUT_TOKENS,
       stream: true,
       system: [{ type: 'text', text: CLAUDE_CODE_SYSTEM_LINE }],
       metadata: { user_id: buildClaudeCodeUserId(scopeKey) },
@@ -138,7 +151,9 @@ const codexFingerprint: CandyFingerprint = {
       }],
       stream: true,
       store: false,
-      max_output_tokens: 2048,
+      // Same reasoning as the Claude body: the reasoning budget and the answer share this
+      // cap, so a tight one turns a working channel into an empty response.
+      max_output_tokens: CANDY_PROBE_MAX_OUTPUT_TOKENS,
       prompt_cache_key: uuidFromSeed(`metapi:candy:codex-cache:${scopeKey}`),
     };
   },

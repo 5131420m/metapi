@@ -29,6 +29,12 @@ import { dispatchRuntimeRequest } from './runtimeDispatch.js';
 import { isLikelyConversationModel } from './runtimeModelProbe.js';
 import { insertProxyLog } from './proxyLogStore.js';
 import {
+  createProbeDeadline,
+  remainingTimeoutMs,
+  runWithDeadline,
+  withTimeout,
+} from './probeDeadline.js';
+import {
   CANDY_PROBE_CLIENT_APP_NAME,
   CANDY_PROBE_CLIENT_FAMILY,
 } from '../../shared/candyProbe.js';
@@ -85,6 +91,19 @@ export const CANDY_PROBE_MIN_TIMEOUT_MS = 1_000;
 export const CANDY_PROBE_MAX_TIMEOUT_MS = 600_000;
 
 /**
+ * Floor applied to the SETTINGS-DERIVED budget only.
+ *
+ * The proxy's streaming setting is a first-byte / mid-stream-silence budget: it exists to
+ * catch a dead upstream, and the proxy satisfies it as soon as the first byte lands. A
+ * probe has to wait for a whole completion, which on a reasoning model is exactly where the
+ * time goes, so reusing that number as the total budget produced false "不确定" verdicts.
+ *
+ * Not applied to an explicit `timeoutMs` override: that is the caller's own decision (and
+ * the knob the tests use to keep a stalled-upstream case short).
+ */
+export const CANDY_PROBE_TIMEOUT_FLOOR_MS = 60_000;
+
+/**
  * Usage-log marker, so probe traffic is identifiable and filterable in 使用日志 (and
  * excludable from every aggregate — see `proxyLogQueries.ts`). Re-exported here because
  * callers of the probe already import this module.
@@ -99,7 +118,7 @@ function clampCandyProbeTimeoutMs(value: number): number {
 }
 
 /**
- * The probe's ceiling, taken from the same setting the proxy uses for a streaming request,
+ * The probe's budget, taken from the same setting the proxy uses for a streaming request,
  * so an operator tunes one knob rather than two.
  *
  * The probe always streams, so the streaming budget is the meaningful one. `0` means the
@@ -111,7 +130,13 @@ export function resolveCandyProbeTimeoutMs(override?: number | null): number {
     return clampCandyProbeTimeoutMs(override);
   }
   const fromSettings = resolveResponseTimeoutMs('stream', config);
-  return clampCandyProbeTimeoutMs(fromSettings > 0 ? fromSettings : CANDY_PROBE_TIMEOUT_MS);
+  const budget = fromSettings > 0 ? fromSettings : CANDY_PROBE_TIMEOUT_MS;
+  return clampCandyProbeTimeoutMs(Math.max(budget, CANDY_PROBE_TIMEOUT_FLOOR_MS));
+}
+
+/** One wording for the deadline, so the trace, the log note and the UI all agree. */
+export function candyProbeTimeoutMessage(timeoutMs: number): string {
+  return `探测超时：上游未在 ${Math.round(timeoutMs / 1000)}s 内完成`;
 }
 
 /**
@@ -307,42 +332,16 @@ function resolveFingerprintId(
 }
 
 /**
- * Bound the whole probe execution — request dispatch, first-byte observation AND body
- * read — to one deadline.
+ * The probe's execution is bounded by `runWithDeadline` (see `probeDeadline.ts`) — request
+ * dispatch, first-byte observation AND body read all sit inside it.
  *
  * `executeEndpointFlow` only resolves once the response is usable (it observes the first
- * byte), so a relay that accepts the connection and then stalls can hang *inside* the
- * flow; and even when the flow resolves, a stream that never ends would hang the body
- * read. The earlier shape cleared the abort timer before the body read, so a mid-stream
- * stall escaped the ceiling entirely. Racing the whole execution against the remaining
- * budget closes both holes, and also works for dispatchers that ignore the abort signal.
+ * byte), so a relay that accepts the connection and then stalls can hang *inside* the flow;
+ * and even when the flow resolves, a stream that never ends would hang the body read. An
+ * earlier shape cleared the abort timer before the body read, so a mid-stream stall escaped
+ * the ceiling entirely. Racing the whole execution against the remaining budget closes both
+ * holes, and also works for dispatchers that ignore the abort signal.
  */
-async function runProbeWithDeadline<T>(input: {
-  execute: () => Promise<T>;
-  deadlineAtMs: number;
-  timeoutMs: number;
-  abortController: AbortController;
-}): Promise<T> {
-  const execution = input.execute();
-  // If the deadline wins the race the execution may settle later; keep that from
-  // surfacing as an unhandled rejection.
-  execution.catch(() => undefined);
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  try {
-    return await Promise.race([
-      execution,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          input.abortController.abort(new Error('candy probe deadline'));
-          reject(new Error(`探测超时：上游未在 ${Math.round(input.timeoutMs / 1000)}s 内完成`));
-        }, Math.max(1, input.deadlineAtMs - Date.now()));
-        timer.unref?.();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 
 function buildInconclusiveResult(input: {
   channelId: number;
@@ -372,12 +371,98 @@ function buildInconclusiveResult(input: {
   };
 }
 
-export async function runChannelCandyProbe(input: {
+/**
+ * Runs in flight, keyed by what the verdict depends on.
+ *
+ * Every probe is a real upstream request, and the UI is not the only caller: the batch
+ * button fires one per channel, two browser tabs can both be open, and a scheduled sweep
+ * may overlap a click. Single-flight per (channel + parameters) means a double click costs
+ * one upstream request and both callers get the same answer. The parameters are part of the
+ * key on purpose — a Claude fingerprint and a Codex fingerprint are different tests and
+ * must not be answered with each other's result.
+ */
+const inFlightProbes = new Map<string, Promise<CandyProbeResult>>();
+
+/** Global ceiling: without it, N routes × 2 workers is an unbounded fan-out upstream. */
+export const CANDY_PROBE_MAX_CONCURRENT = 4;
+
+let activeProbes = 0;
+const probeSlotWaiters: Array<() => void> = [];
+
+async function acquireProbeSlot(): Promise<() => void> {
+  if (activeProbes >= CANDY_PROBE_MAX_CONCURRENT) {
+    await new Promise<void>((resolve) => {
+      probeSlotWaiters.push(resolve);
+    });
+  }
+  activeProbes += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeProbes = Math.max(0, activeProbes - 1);
+    const next = probeSlotWaiters.shift();
+    if (next) next();
+  };
+}
+
+/** Test seam: the semaphore is module state, so tests must be able to see it drain. */
+export function resetCandyProbeConcurrencyForTests(): void {
+  activeProbes = 0;
+  probeSlotWaiters.length = 0;
+  inFlightProbes.clear();
+}
+
+export function runChannelCandyProbe(input: {
   channelId: number;
   fingerprint?: CandyFingerprintId | 'auto';
   questionCount?: number;
   requestId?: string | null;
   /** Override the probe ceiling (tests use a short one); clamped to a sane range. */
+  timeoutMs?: number;
+}): Promise<CandyProbeResult> {
+  const channelId = Math.trunc(input.channelId);
+  if (!Number.isFinite(channelId) || channelId <= 0) {
+    return Promise.reject(new CandyProbeRequestError('无效的通道 ID', 400));
+  }
+
+  const flightKey = [
+    channelId,
+    input.fingerprint ?? 'auto',
+    input.questionCount ?? DEFAULT_CANDY_QUESTION_COUNT,
+    input.timeoutMs ?? '',
+  ].join('|');
+  const existing = inFlightProbes.get(flightKey);
+  if (existing) return existing;
+
+  const run = executeChannelCandyProbe(input)
+    .finally(() => {
+      inFlightProbes.delete(flightKey);
+    });
+  inFlightProbes.set(flightKey, run);
+  return run;
+}
+
+async function executeChannelCandyProbe(input: {
+  channelId: number;
+  fingerprint?: CandyFingerprintId | 'auto';
+  questionCount?: number;
+  requestId?: string | null;
+  timeoutMs?: number;
+}): Promise<CandyProbeResult> {
+  const releaseSlot = await acquireProbeSlot();
+  try {
+    return await runChannelCandyProbeUnbounded(input);
+  } finally {
+    releaseSlot();
+  }
+}
+
+async function runChannelCandyProbeUnbounded(input: {
+  channelId: number;
+  fingerprint?: CandyFingerprintId | 'auto';
+  questionCount?: number;
+  requestId?: string | null;
   timeoutMs?: number;
 }): Promise<CandyProbeResult> {
   const channelId = Math.trunc(input.channelId);
@@ -429,7 +514,11 @@ export async function runChannelCandyProbe(input: {
     return result;
   };
 
-  const startedAtMs = Date.now();
+  // One deadline for the whole run: candidate resolution and the upstream execution both
+  // budget against the same instant instead of each getting a fresh full timeout.
+  const deadline = createProbeDeadline(timeoutMs);
+  const startedAtMs = deadline.startedAtMs;
+  const timeoutMessage = candyProbeTimeoutMessage(timeoutMs);
   const oauth = getOauthInfoFromAccount(context.account);
   const fingerprintInput = {
     model: context.modelName,
@@ -438,13 +527,20 @@ export async function runChannelCandyProbe(input: {
   };
 
   try {
-    const endpointCandidates = await resolveUpstreamEndpointCandidates(
-      { site: context.site, account: context.account },
-      context.modelName,
-      fingerprint.downstreamFormat,
-      context.modelName,
-      {},
-      { oauthProvider: oauth?.provider },
+    // Candidate resolution can itself talk upstream (model discovery). Bounded by the SAME
+    // deadline as the rest of the run, so a slow discovery cannot push the probe past its
+    // budget — the execution phase then inherits whatever is left.
+    const endpointCandidates = await withTimeout(
+      () => resolveUpstreamEndpointCandidates(
+        { site: context.site, account: context.account },
+        context.modelName,
+        fingerprint.downstreamFormat,
+        context.modelName,
+        {},
+        { oauthProvider: oauth?.provider },
+      ),
+      remainingTimeoutMs(deadline, timeoutMessage),
+      timeoutMessage,
     );
     if (endpointCandidates.length <= 0) {
       const result = buildInconclusiveResult({
@@ -503,13 +599,6 @@ export async function runChannelCandyProbe(input: {
       },
     });
 
-    const deadlineAtMs = startedAtMs + timeoutMs;
-    const abortController = new AbortController();
-    const abortTimer = setTimeout(() => {
-      abortController.abort(new Error(`candy probe timeout (${Math.round(timeoutMs / 1000)}s)`));
-    }, timeoutMs);
-    abortTimer.unref?.();
-
     const buildRequest = (endpoint: UpstreamEndpoint): BuiltEndpointRequest => {
       const request = buildUpstreamEndpointRequest({
         endpoint,
@@ -552,7 +641,7 @@ export async function runChannelCandyProbe(input: {
           method: 'POST',
           headers: requestForFetch.headers,
           body: JSON.stringify(requestForFetch.body),
-          signal: abortController.signal,
+          signal: deadline.abortController.signal,
         },
         channelProxyUrl,
       ),
@@ -562,11 +651,10 @@ export async function runChannelCandyProbe(input: {
     let debugAttemptIndex = 0;
     let flowResult: Awaited<ReturnType<typeof executeEndpointFlow>>;
     let rawText = '';
-    try {
-      const outcome = await runProbeWithDeadline({
-        deadlineAtMs,
-        timeoutMs,
-        abortController,
+    {
+      const outcome = await runWithDeadline({
+        deadline,
+        timeoutMessage,
         execute: async () => {
           const flow = await executeEndpointFlow({
             siteUrl: context.site.url,
@@ -611,8 +699,6 @@ export async function runChannelCandyProbe(input: {
       });
       flowResult = outcome.flow;
       rawText = outcome.text;
-    } finally {
-      clearTimeout(abortTimer);
     }
 
     const latencyMs = Date.now() - startedAtMs;
