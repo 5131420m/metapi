@@ -42,6 +42,7 @@ import type {
   MissingTokenRouteSiteActionItem,
   MissingTokenGroupRouteSiteActionItem,
   GroupRouteItem,
+  CandyProbeResult,
 } from './token-routes/types.js';
 import {
   ROUTE_RENDER_CHUNK,
@@ -64,6 +65,7 @@ import RouteFilterBar, { type EnabledFilter } from './token-routes/RouteFilterBa
 import ManualRoutePanel from './token-routes/ManualRoutePanel.js';
 import RouteCard from './token-routes/RouteCard.js';
 import AddChannelModal from './token-routes/AddChannelModal.js';
+import CandyProbeDetailModal from './token-routes/candyProbe/CandyProbeDetailModal.js';
 
 const EMPTY_ROUTE_CANDIDATE_VIEW: RouteCandidateView = {
   routeCandidates: [],
@@ -213,6 +215,13 @@ export default function TokenRoutes() {
   const [updatingRoutingStrategyByRoute, setUpdatingRoutingStrategyByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByRoute, setClearingCooldownByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByChannel, setClearingCooldownByChannel] = useState<Record<number, boolean>>({});
+  const [candyProbeTestingByChannel, setCandyProbeTestingByChannel] = useState<Record<number, boolean>>({});
+  const [candyProbeDetail, setCandyProbeDetail] = useState<{
+    channelId: number;
+    label: string;
+    result: CandyProbeResult | null;
+  } | null>(null);
+  const [candyProbeDetailLoading, setCandyProbeDetailLoading] = useState(false);
 
   const [decisionByRoute, setDecisionByRoute] = useState<Record<number, RouteDecision | null>>({});
   const [loadingDecision, setLoadingDecision] = useState(false);
@@ -1279,6 +1288,62 @@ export default function TokenRoutes() {
     }
   };
 
+  const handleRunCandyProbe = async (channelId: number, routeId: number) => {
+    if (candyProbeTestingByChannel[channelId]) return;
+    setCandyProbeTestingByChannel((prev) => ({ ...prev, [channelId]: true }));
+    try {
+      const response = await api.runChannelCandyProbe(channelId);
+      const result = response?.result as CandyProbeResult | null | undefined;
+      if (result?.verdict === 'pass') {
+        toast.success(`糖果题通过：答对 ${result.score}/${result.total}（${result.fingerprint} 指纹）`);
+      } else if (result?.verdict === 'fail') {
+        toast.error(`疑似降智：只答对 ${result.score}/${result.total}（${result.fingerprint} 指纹）`);
+      } else {
+        toast.info(`检测不确定：${result?.reason || '未能判分'}`);
+      }
+
+      try {
+        await loadChannels(routeId, true);
+      } catch {
+        toast.info('检测已完成，但通道列表刷新失败');
+      }
+    } catch (e: any) {
+      toast.error(e.message || '糖果题检测失败');
+    } finally {
+      setCandyProbeTestingByChannel((prev) => ({ ...prev, [channelId]: false }));
+    }
+  };
+
+  const findChannelById = (channelId: number) => {
+    for (const channels of Object.values(channelsByRouteId)) {
+      const found = channels.find((channel) => channel.id === channelId);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const handleOpenCandyProbeDetail = async (channelId: number) => {
+    const channel = findChannelById(channelId);
+    const label = channel
+      ? `${channel.sourceModel || '未知模型'} @ ${channel.site?.name || '未知站点'} #${channelId}`
+      : `通道 #${channelId}`;
+    setCandyProbeDetail({ channelId, label, result: null });
+    setCandyProbeDetailLoading(true);
+    try {
+      const response = await api.getChannelCandyProbe(channelId);
+      setCandyProbeDetail((current) => (
+        current && current.channelId === channelId
+          ? { ...current, result: (response?.result as CandyProbeResult | null) ?? null }
+          : current
+      ));
+    } catch (e: any) {
+      toast.error(e.message || '读取糖果题检测结果失败');
+      setCandyProbeDetail(null);
+    } finally {
+      setCandyProbeDetailLoading(false);
+    }
+  };
+
   const handleClearRouteCooldown = async (routeId: number) => {
     if (clearingCooldownByRoute[routeId]) return;
     setClearingCooldownByRoute((prev) => ({ ...prev, [routeId]: true }));
@@ -1553,6 +1618,19 @@ export default function TokenRoutes() {
   handleClearRouteCooldownRef.current = handleClearRouteCooldown;
   const stableClearRouteCooldown = useCallback(
     (routeId: number) => handleClearRouteCooldownRef.current(routeId),
+    [],
+  );
+  // Stable identities keep the memoized RouteCard from re-rendering on every toast/state tick.
+  const handleRunCandyProbeRef = useRef(handleRunCandyProbe);
+  handleRunCandyProbeRef.current = handleRunCandyProbe;
+  const stableRunCandyProbe = useCallback(
+    (channelId: number, routeId: number) => handleRunCandyProbeRef.current(channelId, routeId),
+    [],
+  );
+  const handleOpenCandyProbeDetailRef = useRef(handleOpenCandyProbeDetail);
+  handleOpenCandyProbeDetailRef.current = handleOpenCandyProbeDetail;
+  const stableOpenCandyProbeDetail = useCallback(
+    (channelId: number) => handleOpenCandyProbeDetailRef.current(channelId),
     [],
   );
 
@@ -1920,6 +1998,9 @@ export default function TokenRoutes() {
                     onSiteBlockModel={stableSiteBlockModel}
                     clearingCooldownByChannel={clearingCooldownByChannel}
                     onClearChannelCooldown={stableClearChannelCooldown}
+                    candyProbeTestingByChannel={candyProbeTestingByChannel}
+                    onRunCandyProbe={stableRunCandyProbe}
+                    onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
                     expandedSourceGroupMap={expandedSourceGroupMap}
                     onToggleSourceGroup={stableToggleSourceGroup}
                   />
@@ -1962,6 +2043,9 @@ export default function TokenRoutes() {
               onSiteBlockModel={stableSiteBlockModel}
                     clearingCooldownByChannel={clearingCooldownByChannel}
                     onClearChannelCooldown={stableClearChannelCooldown}
+                    candyProbeTestingByChannel={candyProbeTestingByChannel}
+                    onRunCandyProbe={stableRunCandyProbe}
+                    onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
               expandedSourceGroupMap={expandedSourceGroupMap}
               onToggleSourceGroup={stableToggleSourceGroup}
             />
@@ -2003,6 +2087,9 @@ export default function TokenRoutes() {
                   onSiteBlockModel={stableSiteBlockModel}
                     clearingCooldownByChannel={clearingCooldownByChannel}
                     onClearChannelCooldown={stableClearChannelCooldown}
+                    candyProbeTestingByChannel={candyProbeTestingByChannel}
+                    onRunCandyProbe={stableRunCandyProbe}
+                    onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
                   expandedSourceGroupMap={expandedSourceGroupMap}
                   onToggleSourceGroup={stableToggleSourceGroup}
                 />
@@ -2098,6 +2185,17 @@ export default function TokenRoutes() {
           existingChannelAccountIds={new Set((channelsByRouteId[addChannelModalRoute.id] || []).map((c) => c.accountId))}
         />
       )}
+
+      <CandyProbeDetailModal
+        open={!!candyProbeDetail}
+        onClose={() => {
+          setCandyProbeDetail(null);
+          setCandyProbeDetailLoading(false);
+        }}
+        result={candyProbeDetail?.result ?? null}
+        loading={candyProbeDetailLoading}
+        channelLabel={candyProbeDetail?.label ?? null}
+      />
     </div>
   );
 }

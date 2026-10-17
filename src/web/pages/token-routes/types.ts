@@ -41,6 +41,42 @@ export type RouteChannelQuality = {
   lastUpdatedAtMs: number | null;
 };
 
+export type CandyProbeVerdict = 'pass' | 'fail' | 'inconclusive';
+
+export type CandyProbeQuestionResult = {
+  id: string;
+  prompt: string;
+  expected: string;
+  answer: string;
+  correct: boolean;
+};
+
+/**
+ * Display-only degrade-check verdict. `fresh` is false once the verdict is older than the
+ * freshness TTL; the list payload omits `questions` (fetched on demand for the detail panel).
+ */
+export type CandyProbeSnapshot = {
+  channelId: number;
+  routeId: number | null;
+  model: string;
+  fingerprint: string;
+  verdict: CandyProbeVerdict;
+  score: number;
+  total: number;
+  endpoint: string | null;
+  actualModel: string | null;
+  latencyMs: number | null;
+  checkedAt: string;
+  reason: string | null;
+  parseMode: string;
+  fresh: boolean;
+  expiresAt: string;
+};
+
+export type CandyProbeResult = Omit<CandyProbeSnapshot, 'fresh' | 'expiresAt'> & {
+  questions: CandyProbeQuestionResult[];
+};
+
 export type RouteChannel = {
   id: number;
   routeId?: number;
@@ -56,6 +92,8 @@ export type RouteChannel = {
   cooldownUntil?: string | null;
   /** Display-only recent quality measured on this channel; null before first traffic. */
   quality?: RouteChannelQuality | null;
+  /** Display-only candy-question verdict; null before the first manual probe. */
+  candyProbe?: CandyProbeSnapshot | null;
   account?: {
     username: string | null;
     accessToken?: string | null;
@@ -179,6 +217,10 @@ export type SortableChannelRowProps = {
   onSiteBlockModel?: () => void;
   clearingCooldown?: boolean;
   onClearCooldown?: () => void;
+  /** A candy-question probe is currently running for this channel. */
+  candyProbeTesting?: boolean;
+  onRunCandyProbe?: () => void;
+  onOpenCandyProbeDetail?: () => void;
 };
 
 export type GroupRouteItem = {

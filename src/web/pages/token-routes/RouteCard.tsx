@@ -99,6 +99,11 @@ type RouteCardProps = {
   // Per-channel cooldown release
   onClearChannelCooldown: (channelId: number, routeId: number) => void;
   clearingCooldownByChannel: Record<number, boolean>;
+  // Per-channel candy-question (degrade) probe. Optional so existing call sites and tests
+  // that only care about routing/priority keep working unchanged.
+  candyProbeTestingByChannel?: Record<number, boolean>;
+  onRunCandyProbe?: (channelId: number, routeId: number) => void;
+  onOpenCandyProbeDetail?: (channelId: number) => void;
   // Source group expansion
   expandedSourceGroupMap: Record<string, boolean>;
   onToggleSourceGroup: (groupKey: string) => void;
@@ -379,6 +384,9 @@ type SortableChannelShellProps = {
   onSiteBlockModel: (channelId: number, routeId: number) => void;
   onClearChannelCooldown: (channelId: number, routeId: number) => void;
   clearingCooldownByChannel: Record<number, boolean>;
+  candyProbeTestingByChannel?: Record<number, boolean>;
+  onRunCandyProbe?: (channelId: number, routeId: number) => void;
+  onOpenCandyProbeDetail?: (channelId: number) => void;
   railLabel: string;
   mobileRailLabel: string;
   railNodeStyle: CSSProperties;
@@ -411,6 +419,9 @@ function SortableChannelShell({
   onSiteBlockModel,
   onClearChannelCooldown,
   clearingCooldownByChannel,
+  candyProbeTestingByChannel,
+  onRunCandyProbe,
+  onOpenCandyProbeDetail,
   railLabel,
   mobileRailLabel,
   railNodeStyle,
@@ -537,6 +548,9 @@ function SortableChannelShell({
         onSiteBlockModel={channelManagementDisabled ? undefined : () => onSiteBlockModel(channel.id, routeId)}
         onClearCooldown={readOnlyRoute ? undefined : () => onClearChannelCooldown(channel.id, routeId)}
         clearingCooldown={!!clearingCooldownByChannel[channel.id]}
+        candyProbeTesting={!!candyProbeTestingByChannel?.[channel.id]}
+        onRunCandyProbe={readOnlyRoute || !onRunCandyProbe ? undefined : () => onRunCandyProbe(channel.id, routeId)}
+        onOpenCandyProbeDetail={onOpenCandyProbeDetail ? () => onOpenCandyProbeDetail(channel.id) : undefined}
       />
     </div>
   );
@@ -577,6 +591,9 @@ function RouteCardInner({
   onSiteBlockModel,
   onClearChannelCooldown,
   clearingCooldownByChannel,
+  candyProbeTestingByChannel,
+  onRunCandyProbe,
+  onOpenCandyProbeDetail,
   expandedSourceGroupMap,
   onToggleSourceGroup,
 }: RouteCardProps) {
@@ -1225,6 +1242,9 @@ function RouteCardInner({
                             onSiteBlockModel={onSiteBlockModel}
                             onClearChannelCooldown={onClearChannelCooldown}
                             clearingCooldownByChannel={clearingCooldownByChannel}
+                            candyProbeTestingByChannel={candyProbeTestingByChannel}
+                            onRunCandyProbe={onRunCandyProbe}
+                            onOpenCandyProbeDetail={onOpenCandyProbeDetail}
                             railLabel={railSection ? `P${bucketIndex} · ${railSection.channelCount}` : railLabel}
                             mobileRailLabel={mobileRailLabel}
                             railNodeStyle={railNodeStyle}
@@ -1312,6 +1332,9 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.onSiteBlockModel !== next.onSiteBlockModel
     || prev.onClearChannelCooldown !== next.onClearChannelCooldown
     || prev.clearingCooldownByChannel !== next.clearingCooldownByChannel
+    || prev.candyProbeTestingByChannel !== next.candyProbeTestingByChannel
+    || prev.onRunCandyProbe !== next.onRunCandyProbe
+    || prev.onOpenCandyProbeDetail !== next.onOpenCandyProbeDetail
     || prev.onToggleSourceGroup !== next.onToggleSourceGroup
     || prev.clearingCooldown !== next.clearingCooldown
     || prev.updatingRoutingStrategy !== next.updatingRoutingStrategy

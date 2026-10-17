@@ -966,6 +966,19 @@ export const api = {
     request(`/api/routes/${id}/cooldown/clear`, { method: "POST" }),
   clearChannelCooldown: (channelId: number) =>
     request(`/api/channels/${channelId}/cooldown/clear`, { method: "POST" }),
+  // Candy-question degrade probe (display-only). The probe waits on a real upstream
+  // completion, so it gets a wider timeout than an ordinary admin call.
+  runChannelCandyProbe: (
+    channelId: number,
+    options?: { fingerprint?: string; questionCount?: number },
+  ) =>
+    request(`/api/channels/${channelId}/candy-probe`, {
+      method: "POST",
+      body: JSON.stringify(options ?? {}),
+      timeoutMs: 45_000,
+    }),
+  getChannelCandyProbe: (channelId: number) =>
+    request(`/api/channels/${channelId}/candy-probe`),
   batchUpdateRoutes: (data: { ids: number[]; action: "enable" | "disable" }) =>
     request("/api/routes/batch", {
       method: "POST",

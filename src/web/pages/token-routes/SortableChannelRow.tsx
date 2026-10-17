@@ -9,6 +9,12 @@ import {
 } from './tokenBindingPresentation.js';
 import { getChannelDecisionState, getPriorityTagStyle, getProbabilityColor } from './utils.js';
 import {
+  buildCandyProbeBadgeLabel,
+  formatCandyProbeCheckedAt,
+  formatCandyProbeFingerprint,
+  resolveCandyProbeTone,
+} from './candyProbe/presentation.js';
+import {
   firstByteTone,
   qualityToneBgColor,
   qualityToneColor,
@@ -184,13 +190,78 @@ function buildChannelQualityBadges(channel: RouteChannel, suppressTooltips: bool
   return badges.map((badge) => <Fragment key={badge.key}>{badge.node}</Fragment>);
 }
 
-function ChannelQualityStrip({ channel, suppressTooltips, style }: {
+/**
+ * The candy-question (degrade check) marker.
+ *
+ * Always rendered so "never tested" is visible as a state rather than as absence — a
+ * channel without a verdict is not the same as a channel that passed. Display-only: the
+ * badge never reflects routing state, because no routing rule reads the verdict yet.
+ */
+function buildCandyProbeBadge(
+  channel: RouteChannel,
+  suppressTooltips: boolean,
+  onOpenDetail?: () => void,
+) {
+  const probe = channel.candyProbe ?? null;
+
+  if (!probe) {
+    return (
+      <span
+        className="badge badge-muted"
+        style={{ fontSize: 10 }}
+        data-tooltip={suppressTooltips ? undefined : '尚未做过糖果题测试'}
+      >
+        🍬 未测
+      </span>
+    );
+  }
+
+  const tone = resolveCandyProbeTone(probe.verdict);
+  const label = buildCandyProbeBadgeLabel(probe);
+  const tooltipParts = [
+    `${formatCandyProbeFingerprint(probe.fingerprint)} 指纹`,
+    `模型 ${probe.model}`,
+    probe.actualModel ? `实际 ${probe.actualModel}` : null,
+    probe.endpoint ? `端点 ${probe.endpoint}` : null,
+    `检测于 ${formatCandyProbeCheckedAt(probe.checkedAt)}`,
+    probe.fresh ? null : '已过期',
+    probe.reason,
+    onOpenDetail ? '点击查看每题明细' : null,
+  ].filter(Boolean);
+
+  return (
+    <button
+      type="button"
+      className="badge"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpenDetail?.();
+      }}
+      data-tooltip={suppressTooltips ? undefined : tooltipParts.join(' · ')}
+      style={{
+        fontSize: 10,
+        fontFamily: 'inherit',
+        border: 'none',
+        color: qualityToneColor(tone),
+        background: qualityToneBgColor(tone),
+        opacity: probe.fresh ? 1 : 0.6,
+        cursor: onOpenDetail ? 'pointer' : 'default',
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function ChannelQualityStrip({ channel, suppressTooltips, style, onOpenCandyProbeDetail }: {
   channel: RouteChannel;
   suppressTooltips: boolean;
   style?: CSSProperties;
+  onOpenCandyProbeDetail?: () => void;
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', ...style }}>
+      {buildCandyProbeBadge(channel, suppressTooltips, onOpenCandyProbeDetail)}
       {buildChannelQualityBadges(channel, suppressTooltips)}
     </div>
   );
@@ -221,6 +292,9 @@ export function SortableChannelRow({
   onSiteBlockModel,
   clearingCooldown = false,
   onClearCooldown,
+  candyProbeTesting = false,
+  onRunCandyProbe,
+  onOpenCandyProbeDetail,
 }: SortableChannelRowProps) {
   const resolvedPriority = displayPriority ?? channel.priority ?? 0;
   const managementLocked = readOnly || channelManagementDisabled;
@@ -337,7 +411,7 @@ export function SortableChannelRow({
                 {channel.site?.name || 'unknown'}
               </span>
 
-              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} />
+              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} />
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
@@ -506,6 +580,16 @@ export function SortableChannelRow({
                     {channel.enabled === false ? '启用' : '禁用'}
                   </button>
 
+                  {onRunCandyProbe ? (
+                    <button
+                      onClick={onRunCandyProbe}
+                      disabled={candyProbeTesting}
+                      className="btn btn-link btn-link-info"
+                    >
+                      {candyProbeTesting ? '测试中...' : '🍬 测智商'}
+                    </button>
+                  ) : null}
+
                   {onClearCooldown ? (
                     <button
                       onClick={onClearCooldown}
@@ -651,7 +735,7 @@ export function SortableChannelRow({
           </>
         ) : null}
 
-        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} />
+        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} />
 
         {routeUnitMemberSummaryText ? (
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, width: '100%', flexWrap: 'wrap' }}>
@@ -747,6 +831,17 @@ export function SortableChannelRow({
           </button>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+            {onRunCandyProbe ? (
+              <button
+                onClick={onRunCandyProbe}
+                disabled={candyProbeTesting}
+                className="btn btn-link btn-link-info"
+                data-tooltip={suppressTooltips ? undefined : '用糖果题探测该通道是否降智（只记录结果，不改变路由）'}
+              >
+                {candyProbeTesting ? '测试中...' : '🍬 测智商'}
+              </button>
+            ) : null}
+
             {onClearCooldown ? (
               <button
                 onClick={onClearCooldown}
