@@ -92,6 +92,9 @@ const PROXY_LOG_CLIENT_FAMILY_LABELS: Record<string, string> = {
   claude_code: "Claude Code",
   gemini_cli: "Gemini CLI",
   generic: "通用",
+  // metapi's own candy-question probe: visible here so a click in 路由 leaves an audit
+  // trail, without ever counting as downstream client traffic.
+  candy_probe: "糖果题检测",
 };
 const EMPTY_SUMMARY: ProxyLogsSummary = {
   totalCount: 0,

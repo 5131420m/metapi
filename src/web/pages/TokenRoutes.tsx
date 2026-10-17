@@ -43,6 +43,7 @@ import type {
   MissingTokenGroupRouteSiteActionItem,
   GroupRouteItem,
   CandyProbeResult,
+  RouteChannel,
 } from './token-routes/types.js';
 import {
   ROUTE_RENDER_CHUNK,
@@ -216,6 +217,7 @@ export default function TokenRoutes() {
   const [clearingCooldownByRoute, setClearingCooldownByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByChannel, setClearingCooldownByChannel] = useState<Record<number, boolean>>({});
   const [candyProbeTestingByChannel, setCandyProbeTestingByChannel] = useState<Record<number, boolean>>({});
+  const [candyProbeBatchByRoute, setCandyProbeBatchByRoute] = useState<Record<number, { done: number; total: number }>>({});
   const [candyProbeDetail, setCandyProbeDetail] = useState<{
     channelId: number;
     label: string;
@@ -1314,6 +1316,82 @@ export default function TokenRoutes() {
     }
   };
 
+  /**
+   * Route-wide sweep: probe every channel in the route with a small concurrency.
+   *
+   * Deliberately client-driven rather than one long server batch call: each channel's own
+   * endpoint is already the unit of truth, so badges fill in as the sweep advances and one
+   * slow/stalled channel cannot hold the rest hostage. Concurrency stays low because every
+   * probe is a real upstream completion.
+   */
+  const handleRunCandyProbeAllChannels = async (routeId: number) => {
+    if (candyProbeBatchByRoute[routeId]) return;
+
+    let targets: RouteChannel[] = [];
+    try {
+      const loaded = await loadChannels(routeId, true);
+      targets = Array.isArray(loaded) ? loaded : [];
+    } catch {
+      toast.error('读取通道列表失败，无法批量检测');
+      return;
+    }
+    if (targets.length <= 0) {
+      toast.info('该路由下没有通道');
+      return;
+    }
+
+    setCandyProbeBatchByRoute((prev) => ({ ...prev, [routeId]: { done: 0, total: targets.length } }));
+    const tally = { pass: 0, fail: 0, inconclusive: 0, rejected: 0 };
+
+    const runOne = async (channel: RouteChannel) => {
+      setCandyProbeTestingByChannel((prev) => ({ ...prev, [channel.id]: true }));
+      try {
+        const response = await api.runChannelCandyProbe(channel.id);
+        const result = response?.result as CandyProbeResult | null | undefined;
+        if (result?.verdict === 'pass') tally.pass += 1;
+        else if (result?.verdict === 'fail') tally.fail += 1;
+        else tally.inconclusive += 1;
+      } catch {
+        // A channel that cannot be probed at all (non-conversation model, no credential)
+        // counts as rejected rather than as a degraded verdict.
+        tally.rejected += 1;
+      } finally {
+        setCandyProbeTestingByChannel((prev) => ({ ...prev, [channel.id]: false }));
+        setCandyProbeBatchByRoute((prev) => {
+          const current = prev[routeId];
+          if (!current) return prev;
+          return { ...prev, [routeId]: { done: current.done + 1, total: current.total } };
+        });
+      }
+    };
+
+    const queue = [...targets];
+    const workerCount = Math.min(2, queue.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const next = queue.shift();
+        if (!next) break;
+        await runOne(next);
+      }
+    }));
+
+    setCandyProbeBatchByRoute((prev) => {
+      const next = { ...prev };
+      delete next[routeId];
+      return next;
+    });
+
+    const summary = `通过 ${tally.pass} · 疑似降智 ${tally.fail} · 不确定 ${tally.inconclusive}`;
+    if (tally.fail > 0) toast.error(`批量检测完成：${summary}`);
+    else toast.success(`批量检测完成：${summary}`);
+
+    try {
+      await loadChannels(routeId, true);
+    } catch {
+      toast.info('检测已完成，但通道列表刷新失败');
+    }
+  };
+
   const findChannelById = (channelId: number) => {
     for (const channels of Object.values(channelsByRouteId)) {
       const found = channels.find((channel) => channel.id === channelId);
@@ -1631,6 +1709,14 @@ export default function TokenRoutes() {
   handleOpenCandyProbeDetailRef.current = handleOpenCandyProbeDetail;
   const stableOpenCandyProbeDetail = useCallback(
     (channelId: number) => handleOpenCandyProbeDetailRef.current(channelId),
+    [],
+  );
+  const handleRunCandyProbeAllChannelsRef = useRef(handleRunCandyProbeAllChannels);
+  handleRunCandyProbeAllChannelsRef.current = handleRunCandyProbeAllChannels;
+  const stableRunCandyProbeAllChannels = useCallback(
+    (routeId: number) => {
+      void handleRunCandyProbeAllChannelsRef.current(routeId);
+    },
     [],
   );
 
@@ -2001,6 +2087,8 @@ export default function TokenRoutes() {
                     candyProbeTestingByChannel={candyProbeTestingByChannel}
                     onRunCandyProbe={stableRunCandyProbe}
                     onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
+                    candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
+                    onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
                     expandedSourceGroupMap={expandedSourceGroupMap}
                     onToggleSourceGroup={stableToggleSourceGroup}
                   />
@@ -2046,6 +2134,8 @@ export default function TokenRoutes() {
                     candyProbeTestingByChannel={candyProbeTestingByChannel}
                     onRunCandyProbe={stableRunCandyProbe}
                     onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
+                    candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
+                    onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
               expandedSourceGroupMap={expandedSourceGroupMap}
               onToggleSourceGroup={stableToggleSourceGroup}
             />
@@ -2090,6 +2180,8 @@ export default function TokenRoutes() {
                     candyProbeTestingByChannel={candyProbeTestingByChannel}
                     onRunCandyProbe={stableRunCandyProbe}
                     onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
+                    candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
+                    onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
                   expandedSourceGroupMap={expandedSourceGroupMap}
                   onToggleSourceGroup={stableToggleSourceGroup}
                 />

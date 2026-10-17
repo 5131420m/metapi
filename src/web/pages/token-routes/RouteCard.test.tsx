@@ -1098,3 +1098,91 @@ describe('RouteCard', () => {
     expect(modelPatternReadCount).toBe(initialReadCount);
   });
 });
+
+describe('RouteCard candy-probe batch action', () => {
+  function renderCard(overrides: {
+    onRunCandyProbeAllChannels?: (routeId: number) => void;
+    candyProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
+    channelCount?: number;
+    channels?: RouteChannel[];
+  } = {}) {
+    const route = buildRoute({ channelCount: overrides.channelCount ?? 2, enabledChannelCount: 2 });
+    return create(
+      <RouteCard
+        route={route}
+        brand={null}
+        expanded
+        onToggleExpand={vi.fn()}
+        onEdit={vi.fn()}
+        onDelete={vi.fn()}
+        onToggleEnabled={vi.fn()}
+        onClearCooldown={vi.fn()}
+        clearingCooldown={false}
+        onClearChannelCooldown={vi.fn()}
+        clearingCooldownByChannel={{}}
+        onRoutingStrategyChange={vi.fn()}
+        updatingRoutingStrategy={false}
+        channels={overrides.channels ?? []}
+        loadingChannels={false}
+        routeDecision={null}
+        loadingDecision={false}
+        candidateView={{ routeCandidates: [], accountOptions: [], tokenOptionsByAccountId: {} }}
+        channelTokenDraft={{}}
+        updatingChannel={{}}
+        savingPriority={false}
+        onTokenDraftChange={vi.fn()}
+        onSaveToken={vi.fn()}
+        onDeleteChannel={vi.fn()}
+        onToggleChannelEnabled={vi.fn()}
+        onChannelDragEnd={vi.fn()}
+        missingTokenSiteItems={[]}
+        missingTokenGroupItems={[]}
+        onCreateTokenForMissing={vi.fn()}
+        onAddChannel={vi.fn()}
+        onSiteBlockModel={vi.fn()}
+        expandedSourceGroupMap={{}}
+        onToggleSourceGroup={vi.fn()}
+        onRunCandyProbeAllChannels={overrides.onRunCandyProbeAllChannels}
+        candyProbeBatchProgressByRoute={overrides.candyProbeBatchProgressByRoute}
+      />,
+    );
+  }
+
+  function findButton(root: ReturnType<typeof renderCard>, label: string) {
+    return root.root.findAll((node) => (
+      typeof node.type === 'string'
+      && node.type === 'button'
+      && collectText(node).includes(label)
+    ))[0];
+  }
+
+  it('renders the sweep button next to the other route actions', () => {
+    const root = renderCard({ onRunCandyProbeAllChannels: vi.fn() });
+    expect(findButton(root, '一键测智商')).toBeTruthy();
+    // It sits beside the existing route-level actions, not in the channel rows.
+    expect(findButton(root, '清除冷却')).toBeTruthy();
+  });
+
+  it('runs the sweep for its own route id', () => {
+    const onRun = vi.fn();
+    const root = renderCard({ onRunCandyProbeAllChannels: onRun });
+    findButton(root, '一键测智商')?.props.onClick();
+    expect(onRun).toHaveBeenCalledWith(42);
+  });
+
+  it('shows progress and blocks a second run while sweeping', () => {
+    const root = renderCard({
+      onRunCandyProbeAllChannels: vi.fn(),
+      candyProbeBatchProgressByRoute: { 42: { done: 1, total: 3 } },
+    });
+    const button = findButton(root, '测智商中');
+    expect(button).toBeTruthy();
+    expect(collectText(button)).toContain('1/3');
+    expect(button?.props.disabled).toBe(true);
+  });
+
+  it('stays hidden when no sweep handler is wired', () => {
+    const root = renderCard({});
+    expect(findButton(root, '一键测智商')).toBeFalsy();
+  });
+});

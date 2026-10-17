@@ -10,17 +10,24 @@
  * - it does not auto-exclude anything. A verdict is recorded for display only, so the
  *   feature cannot shrink availability or change proxy behaviour.
  *
+ * It DOES write one usage-log row per run, tagged `candy_probe`, so an operator can audit
+ * when a channel was tested and what came back. That row carries no cost and never feeds
+ * channel health; it is an audit trail, not proxy traffic.
+ *
  * The exclusion policy is a separate, later slice that reads these verdicts.
  */
 
 import { eq } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
+import { config } from '../config.js';
+import { resolveResponseTimeoutMs } from '../proxy-core/responseTimeoutPolicy.js';
 import { isUsableAccountToken } from './accountTokenService.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { buildOauthProviderHeaders } from './oauth/service.js';
 import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from './siteProxy.js';
 import { dispatchRuntimeRequest } from './runtimeDispatch.js';
 import { isLikelyConversationModel } from './runtimeModelProbe.js';
+import { insertProxyLog } from './proxyLogStore.js';
 import {
   buildUpstreamEndpointRequest,
   resolveUpstreamEndpointCandidates,
@@ -54,11 +61,109 @@ import {
 export { getCandyProbeResultForChannel, getCandyProbeSnapshots, hydrateCandyProbeResultsFromSettings };
 export type { CandyProbeResult, CandyProbeSnapshot };
 
-/** Per-run ceiling. The probe is one small completion; 25s is generous without stalling a click. */
+/**
+ * Per-run fallback ceiling. Normally the probe rides the streaming budget from settings
+ * ("首字超时 / 流中途静默超时"); this value applies only when the operator disabled it (0).
+ */
 export const CANDY_PROBE_TIMEOUT_MS = 25_000;
 export const CANDY_PROBE_MIN_TIMEOUT_MS = 1_000;
-export const CANDY_PROBE_MAX_TIMEOUT_MS = 60_000;
+export const CANDY_PROBE_MAX_TIMEOUT_MS = 600_000;
 export const CANDY_PROBE_PASS_MIN_CORRECT = 2;
+
+/** Usage-log marker, so probe traffic is identifiable and filterable in 使用日志. */
+export const CANDY_PROBE_CLIENT_FAMILY = 'candy_probe';
+
+function clampCandyProbeTimeoutMs(value: number): number {
+  return Math.min(
+    CANDY_PROBE_MAX_TIMEOUT_MS,
+    Math.max(CANDY_PROBE_MIN_TIMEOUT_MS, Math.trunc(value)),
+  );
+}
+
+/**
+ * The probe's ceiling, taken from the same setting the proxy uses for a streaming request,
+ * so an operator tunes one knob rather than two.
+ *
+ * The probe always streams, so the streaming budget is the meaningful one. `0` means the
+ * operator removed the wait limit; a probe still needs a ceiling, so the fallback applies
+ * there instead of "wait forever".
+ */
+export function resolveCandyProbeTimeoutMs(override?: number | null): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override > 0) {
+    return clampCandyProbeTimeoutMs(override);
+  }
+  const fromSettings = resolveResponseTimeoutMs('stream', config);
+  return clampCandyProbeTimeoutMs(fromSettings > 0 ? fromSettings : CANDY_PROBE_TIMEOUT_MS);
+}
+
+/** Normalise the several usage shapes upstreams return into proxy-log token columns. */
+function normalizeCandyProbeUsage(usage: Record<string, unknown> | null | undefined): {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+} {
+  const readNumber = (...keys: string[]): number | null => {
+    for (const key of keys) {
+      const value = usage?.[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+    }
+    return null;
+  };
+  const promptTokens = readNumber('input_tokens', 'prompt_tokens', 'promptTokenCount');
+  const completionTokens = readNumber('output_tokens', 'completion_tokens', 'candidatesTokenCount');
+  const totalTokens = readNumber('total_tokens', 'totalTokenCount')
+    ?? (promptTokens != null || completionTokens != null
+      ? (promptTokens ?? 0) + (completionTokens ?? 0)
+      : null);
+  return { promptTokens, completionTokens, totalTokens };
+}
+
+export function buildCandyProbeLogLabel(result: Pick<CandyProbeResult, 'verdict' | 'score' | 'total'>): string {
+  if (result.verdict === 'pass') return `糖果题 · 通过 ${result.score}/${result.total}`;
+  if (result.verdict === 'fail') return `糖果题 · 疑似降智 ${result.score}/${result.total}`;
+  return '糖果题 · 不确定';
+}
+
+/**
+ * Mirror one probe into the usage log.
+ *
+ * Failures here must never fail the probe: the verdict is the product, the log row is the
+ * audit trail. Cost is pinned to 0 because a probe is metapi's own traffic, not a billable
+ * downstream request.
+ */
+async function recordCandyProbeUsageLog(input: {
+  result: CandyProbeResult;
+  accountId: number | null;
+  httpStatus: number | null;
+  usage: Record<string, unknown> | null;
+}): Promise<void> {
+  const { result } = input;
+  try {
+    const tokens = normalizeCandyProbeUsage(input.usage);
+    await insertProxyLog({
+      routeId: result.routeId ?? null,
+      channelId: result.channelId,
+      accountId: input.accountId,
+      modelRequested: result.model,
+      modelActual: result.actualModel,
+      status: result.verdict === 'inconclusive' ? 'failed' : 'success',
+      httpStatus: input.httpStatus,
+      isStream: true,
+      latencyMs: result.latencyMs,
+      promptTokens: tokens.promptTokens,
+      completionTokens: tokens.completionTokens,
+      totalTokens: tokens.totalTokens,
+      estimatedCost: 0,
+      clientFamily: CANDY_PROBE_CLIENT_FAMILY,
+      clientAppName: buildCandyProbeLogLabel(result),
+      clientConfidence: 'high',
+      errorMessage: result.verdict === 'pass' ? null : result.reason,
+      retryCount: 0,
+    });
+  } catch {
+    // Audit-only: swallow so a logging hiccup cannot turn a good verdict into an error.
+  }
+}
 
 export class CandyProbeRequestError extends Error {
   readonly statusCode: number;
@@ -229,10 +334,7 @@ export async function runChannelCandyProbe(input: {
   timeoutMs?: number;
 }): Promise<CandyProbeResult> {
   const channelId = Math.trunc(input.channelId);
-  const timeoutMs = Math.min(
-    CANDY_PROBE_MAX_TIMEOUT_MS,
-    Math.max(CANDY_PROBE_MIN_TIMEOUT_MS, Math.trunc(input.timeoutMs ?? CANDY_PROBE_TIMEOUT_MS)),
-  );
+  const timeoutMs = resolveCandyProbeTimeoutMs(input.timeoutMs);
   if (!Number.isFinite(channelId) || channelId <= 0) {
     throw new CandyProbeRequestError('无效的通道 ID', 400);
   }
@@ -248,6 +350,21 @@ export async function runChannelCandyProbe(input: {
   if (questions.length <= 0) {
     throw new CandyProbeRequestError('糖果题库为空，无法探测', 500);
   }
+
+  /** Store the verdict, then mirror it into the usage log (best effort). */
+  const finish = async (
+    result: CandyProbeResult,
+    audit: { usage?: Record<string, unknown> | null; httpStatus?: number | null } = {},
+  ): Promise<CandyProbeResult> => {
+    recordCandyProbeResult(result);
+    await recordCandyProbeUsageLog({
+      result,
+      accountId: context.account.id ?? null,
+      httpStatus: audit.httpStatus ?? null,
+      usage: audit.usage ?? null,
+    });
+    return result;
+  };
 
   const startedAtMs = Date.now();
   const oauth = getOauthInfoFromAccount(context.account);
@@ -277,7 +394,7 @@ export async function runChannelCandyProbe(input: {
         reason: '没有可用的上游端点候选',
         endpoint: null,
       });
-      return recordCandyProbeResult(result);
+      return finish(result);
     }
 
     const oauthProviderHeaders = buildOauthProviderHeaders({
@@ -391,7 +508,7 @@ export async function runChannelCandyProbe(input: {
         reason: `上游返回 ${flowResult.status || '错误'}${errorText ? `：${errorText.slice(0, 200)}` : ''}`,
         endpoint: successfulEndpoint,
       });
-      return recordCandyProbeResult(result);
+      return finish(result, { httpStatus: flowResult.status ?? null });
     }
 
     const contentType = typeof flowResult.upstream.headers?.get === 'function'
@@ -422,7 +539,7 @@ export async function runChannelCandyProbe(input: {
       parseMode: grade.parseMode,
       questions: grade.questions,
     };
-    return recordCandyProbeResult(result);
+    return finish(result, { usage: payload.usage, httpStatus: flowResult.upstream.status ?? 200 });
   } catch (error) {
     const reason = error instanceof Error ? error.message : '探测失败';
     const result = buildInconclusiveResult({
@@ -435,6 +552,6 @@ export async function runChannelCandyProbe(input: {
       reason,
       endpoint: null,
     });
-    return recordCandyProbeResult(result);
+    return finish(result);
   }
 }

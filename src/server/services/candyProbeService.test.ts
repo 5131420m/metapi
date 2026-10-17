@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -13,6 +13,7 @@ const {
   withSiteRecordProxyRequestInitMock,
   getOauthInfoFromAccountMock,
   buildOauthProviderHeadersMock,
+  insertProxyLogMock,
 } = vi.hoisted(() => ({
   resolveUpstreamEndpointCandidatesMock: vi.fn(),
   dispatchRuntimeRequestMock: vi.fn(),
@@ -20,7 +21,20 @@ const {
   withSiteRecordProxyRequestInitMock: vi.fn(),
   getOauthInfoFromAccountMock: vi.fn(),
   buildOauthProviderHeadersMock: vi.fn(),
+  insertProxyLogMock: vi.fn(),
 }));
+
+/** Delegating spy: defaults to the real writer so the audit rows are really persisted. */
+let realInsertProxyLog: typeof import('./proxyLogStore.js')['insertProxyLog'];
+
+vi.mock('./proxyLogStore.js', async () => {
+  const actual = await vi.importActual<typeof import('./proxyLogStore.js')>('./proxyLogStore.js');
+  realInsertProxyLog = actual.insertProxyLog;
+  return {
+    ...actual,
+    insertProxyLog: (...args: Parameters<typeof actual.insertProxyLog>) => insertProxyLogMock(...args),
+  };
+});
 
 vi.mock('./upstreamEndpointRuntime.js', async () => {
   const actual = await vi.importActual<typeof import('./upstreamEndpointRuntime.js')>('./upstreamEndpointRuntime.js');
@@ -112,6 +126,9 @@ describe('runChannelCandyProbe', () => {
     withSiteRecordProxyRequestInitMock.mockReset().mockImplementation(async (_site: unknown, init: unknown) => init);
     getOauthInfoFromAccountMock.mockReset().mockReturnValue(null);
     buildOauthProviderHeadersMock.mockReset().mockReturnValue({});
+    insertProxyLogMock.mockReset().mockImplementation(
+      (input: Parameters<typeof realInsertProxyLog>[0]) => realInsertProxyLog(input),
+    );
 
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.tokenRoutes).run();
@@ -119,6 +136,7 @@ describe('runChannelCandyProbe', () => {
     await db.delete(schema.accounts).run();
     await db.delete(schema.sites).run();
     await db.delete(schema.settings).run();
+    await db.delete(schema.proxyLogs).run();
   });
 
   afterAll(() => {
@@ -383,5 +401,114 @@ describe('runChannelCandyProbe', () => {
     });
     // The list payload stays lean: per-question detail is fetched on demand.
     expect(snapshots[String(channel.id)]).not.toHaveProperty('questions');
+  });
+
+  it('writes one usage-log row per run, tagged as a candy probe and costing nothing', async () => {
+    const { channel, account } = await seedChannel();
+    dispatchRuntimeRequestMock.mockImplementation(async (input: { request: { body: Record<string, any> } }) => (
+      new Response(sseChatText(buildAnswerText(readPromptFromBody(input.request.body), 'correct')), {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    const logs = await db.select().from(schema.proxyLogs).all();
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      channelId: channel.id,
+      accountId: account.id,
+      routeId: channel.routeId,
+      status: 'success',
+      clientFamily: service.CANDY_PROBE_CLIENT_FAMILY,
+      estimatedCost: 0,
+      errorMessage: null,
+    });
+    expect(logs[0].clientAppName).toContain('糖果题');
+    expect(logs[0].clientAppName).toContain('通过');
+  });
+
+  it('logs a degraded verdict as a successful request carrying the reason', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      sseChatText('1: 0\n2: 0\n3: 0'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    const log = (await db.select().from(schema.proxyLogs).all())[0];
+    // The probe request itself succeeded; the verdict is the payload, not the HTTP outcome.
+    expect(log.status).toBe('success');
+    expect(log.clientAppName).toContain('疑似降智');
+    expect(log.errorMessage).toContain('低于通过阈值');
+  });
+
+  it('logs an unreachable channel as a failed probe row', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      JSON.stringify({ error: { message: 'boom' } }),
+      { status: 502, headers: { 'content-type': 'application/json' } },
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    const log = (await db.select().from(schema.proxyLogs).all())[0];
+    expect(log.status).toBe('failed');
+    expect(log.httpStatus).toBe(502);
+    expect(log.clientAppName).toContain('不确定');
+  });
+
+  it('never lets a usage-log failure break the verdict', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      sseChatText('1: 0\n2: 0\n3: 0'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+    // The audit trail is best-effort: a broken log writer must not cost the verdict.
+    insertProxyLogMock.mockRejectedValue(new Error('logging is down'));
+
+    const result = await service.runChannelCandyProbe({ channelId: channel.id });
+
+    expect(result.verdict).toBe('fail');
+    expect(service.getCandyProbeResultForChannel(channel.id)?.verdict).toBe('fail');
+  });
+});
+
+describe('candy probe timeout resolution', () => {
+  let serviceModule: typeof import('./candyProbeService.js');
+  let configModule: typeof import('../config.js');
+
+  beforeAll(async () => {
+    serviceModule = await import('./candyProbeService.js');
+    configModule = await import('../config.js');
+  });
+
+  afterEach(() => {
+    configModule.config.proxyFirstByteTimeoutSec = 0;
+  });
+
+  it('follows the streaming budget from settings', () => {
+    configModule.config.proxyFirstByteTimeoutSec = 7;
+    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(7_000);
+  });
+
+  it('falls back to the built-in ceiling when the operator disabled the budget', () => {
+    configModule.config.proxyFirstByteTimeoutSec = 0;
+    expect(serviceModule.resolveCandyProbeTimeoutMs()).toBe(serviceModule.CANDY_PROBE_TIMEOUT_MS);
+  });
+
+  it('lets an explicit override win over settings, inside the clamp', () => {
+    configModule.config.proxyFirstByteTimeoutSec = 30;
+    expect(serviceModule.resolveCandyProbeTimeoutMs(400)).toBe(1_000);
+    expect(serviceModule.resolveCandyProbeTimeoutMs(120_000)).toBe(120_000);
+    expect(serviceModule.resolveCandyProbeTimeoutMs(10 * 60_000)).toBe(serviceModule.CANDY_PROBE_MAX_TIMEOUT_MS);
+  });
+
+  it('labels each verdict for the usage log', () => {
+    expect(serviceModule.buildCandyProbeLogLabel({ verdict: 'pass', score: 3, total: 3 })).toBe('糖果题 · 通过 3/3');
+    expect(serviceModule.buildCandyProbeLogLabel({ verdict: 'fail', score: 1, total: 3 })).toBe('糖果题 · 疑似降智 1/3');
+    expect(serviceModule.buildCandyProbeLogLabel({ verdict: 'inconclusive', score: 0, total: 3 })).toBe('糖果题 · 不确定');
   });
 });
