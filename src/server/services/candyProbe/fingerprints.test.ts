@@ -87,6 +87,9 @@ describe('candy fingerprints', () => {
       model: 'deepseek-v3',
       messages: [{ role: 'user', content: 'Q' }],
       stream: true,
+      // Without this a streaming chat upstream reports no usage at all, so the probe's
+      // usage-log row would show no tokens even though the run consumed some.
+      stream_options: { include_usage: true },
     });
     expect(profile.buildClaudeBody).toBeUndefined();
   });

@@ -163,10 +163,14 @@ const genericOpenAiFingerprint: CandyFingerprint = {
   buildOpenAiBody({ model, prompt }) {
     // No token cap and no temperature: the widest relay compatibility, and a rejected
     // parameter would otherwise surface as an inconclusive probe rather than a verdict.
+    // `stream_options.include_usage` IS requested: without it a streaming chat upstream
+    // reports no usage at all, so the probe's usage-log row would show no tokens even
+    // though the run really consumed some.
     return {
       model,
       messages: [{ role: 'user', content: prompt }],
       stream: true,
+      stream_options: { include_usage: true },
     };
   },
 };

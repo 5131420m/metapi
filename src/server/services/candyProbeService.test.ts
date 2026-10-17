@@ -137,6 +137,8 @@ describe('runChannelCandyProbe', () => {
     await db.delete(schema.sites).run();
     await db.delete(schema.settings).run();
     await db.delete(schema.proxyLogs).run();
+    await db.delete(schema.proxyDebugAttempts).run();
+    await db.delete(schema.proxyDebugTraces).run();
   });
 
   afterAll(() => {
@@ -458,6 +460,106 @@ describe('runChannelCandyProbe', () => {
     expect(log.status).toBe('failed');
     expect(log.httpStatus).toBe(502);
     expect(log.clientAppName).toContain('不确定');
+  });
+
+  it('stamps the usage-log row with a timestamp', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      sseChatText('1: 0\n2: 0\n3: 0'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    const log = (await db.select().from(schema.proxyLogs).all())[0];
+    // An explicit NULL used to suppress the column default, which made the row invisible to
+    // every time-ordered view and to the retention sweep.
+    expect(log.createdAt).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+  });
+
+  it('records both token sides when the upstream reports usage', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      [
+        `data: ${JSON.stringify({ model: 'm', choices: [{ delta: { content: '1: 0\\n2: 0\\n3: 0' } }] })}`,
+        '',
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 } })}`,
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    const log = (await db.select().from(schema.proxyLogs).all())[0];
+    expect(log.promptTokens).toBe(12);
+    expect(log.completionTokens).toBe(5);
+    expect(log.totalTokens).toBe(17);
+  });
+
+  it('leaves unknown token counts blank instead of fabricating a total', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      [
+        `data: ${JSON.stringify({ model: 'm', choices: [{ delta: { content: '1: 0\\n2: 0\\n3: 0' } }] })}`,
+        '',
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { output_tokens: 5 } })}`,
+        '',
+      ].join('\n'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    const log = (await db.select().from(schema.proxyLogs).all())[0];
+    // `total = 0 + output` would have claimed 5 total tokens while the prompt was invisible.
+    expect(log.completionTokens).toBe(5);
+    expect(log.promptTokens).toBeNull();
+    expect(log.totalTokens).toBeNull();
+  });
+
+  it('writes a debug trace tagged as a candy probe when capture is enabled', async () => {
+    const { channel } = await seedChannel();
+    const configModule = await import('../config.js');
+    const previousEnabled = configModule.config.proxyDebugTraceEnabled;
+    configModule.config.proxyDebugTraceEnabled = true;
+    try {
+      dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+        sseChatText('1: 0\n2: 0\n3: 0'),
+        { status: 200, headers: { 'content-type': 'text/event-stream' } },
+      ));
+      await service.runChannelCandyProbe({ channelId: channel.id });
+    } finally {
+      configModule.config.proxyDebugTraceEnabled = previousEnabled;
+    }
+
+    const traces = await db.select().from(schema.proxyDebugTraces).all();
+    expect(traces).toHaveLength(1);
+    expect(traces[0]).toMatchObject({
+      clientKind: service.CANDY_PROBE_CLIENT_FAMILY,
+      selectedChannelId: channel.id,
+      requestedModel: 'claude-sonnet-4-5',
+      finalStatus: 'success',
+    });
+
+    const attempts = await db.select().from(schema.proxyDebugAttempts).all();
+    expect(attempts.length).toBeGreaterThan(0);
+    expect(attempts[0].traceId).toBe(traces[0].id);
+    expect(attempts[0].endpoint).toBe('chat');
+  });
+
+  it('writes no debug trace while capture is disabled', async () => {
+    const { channel } = await seedChannel();
+    dispatchRuntimeRequestMock.mockResolvedValue(new Response(
+      sseChatText('1: 0\n2: 0\n3: 0'),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    await service.runChannelCandyProbe({ channelId: channel.id });
+
+    expect(await db.select().from(schema.proxyDebugTraces).all()).toHaveLength(0);
   });
 
   it('never lets a usage-log failure break the verdict', async () => {

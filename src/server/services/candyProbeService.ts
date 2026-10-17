@@ -35,6 +35,16 @@ import {
 } from './upstreamEndpointRuntime.js';
 import { executeEndpointFlow, type BuiltEndpointRequest } from '../proxy-core/orchestration/endpointFlow.js';
 import { readRuntimeResponseText } from '../proxy-core/executors/types.js';
+import {
+  buildSurfaceProxyDebugResponseHeaders,
+  captureSurfaceProxyDebugSuccessResponseBody,
+  safeFinalizeSurfaceProxyDebugTrace,
+  safeInsertSurfaceProxyDebugAttempt,
+  safeUpdateSurfaceProxyDebugCandidates,
+  safeUpdateSurfaceProxyDebugSelection,
+  startSurfaceProxyDebugTrace,
+} from './proxyDebugTraceRuntime.js';
+import type { ProxyDebugTraceSession } from './proxyDebugTraceStore.js';
 import { isExactTokenRouteModelPattern } from '../../shared/tokenRoutePatterns.js';
 import {
   buildCandyProbePrompt,
@@ -46,6 +56,7 @@ import {
 import {
   getCandyFingerprint,
   resolveCandyFingerprintIdForModel,
+  type CandyFingerprint,
   type CandyFingerprintId,
 } from './candyProbe/fingerprints.js';
 import { extractCandyProbeAnswerPayload } from './candyProbe/responseParsing.js';
@@ -96,7 +107,14 @@ export function resolveCandyProbeTimeoutMs(override?: number | null): number {
   return clampCandyProbeTimeoutMs(fromSettings > 0 ? fromSettings : CANDY_PROBE_TIMEOUT_MS);
 }
 
-/** Normalise the several usage shapes upstreams return into proxy-log token columns. */
+/**
+ * Normalise the several usage shapes upstreams return into proxy-log token columns.
+ *
+ * Deliberately does not invent numbers. A streaming chat upstream that was not asked for
+ * usage reports nothing, and a partial sum is worse than a blank: `total = 0 + output`
+ * would claim a total that excludes the prompt entirely. Derivation happens only in
+ * directions that are exact — the missing side from a real total.
+ */
 function normalizeCandyProbeUsage(usage: Record<string, unknown> | null | undefined): {
   promptTokens: number | null;
   completionTokens: number | null;
@@ -109,12 +127,15 @@ function normalizeCandyProbeUsage(usage: Record<string, unknown> | null | undefi
     }
     return null;
   };
-  const promptTokens = readNumber('input_tokens', 'prompt_tokens', 'promptTokenCount');
-  const completionTokens = readNumber('output_tokens', 'completion_tokens', 'candidatesTokenCount');
-  const totalTokens = readNumber('total_tokens', 'totalTokenCount')
-    ?? (promptTokens != null || completionTokens != null
-      ? (promptTokens ?? 0) + (completionTokens ?? 0)
-      : null);
+  let promptTokens = readNumber('input_tokens', 'prompt_tokens', 'promptTokenCount');
+  let completionTokens = readNumber('output_tokens', 'completion_tokens', 'candidatesTokenCount');
+  const totalTokens = readNumber('total_tokens', 'totalTokenCount');
+
+  if (totalTokens != null) {
+    if (promptTokens == null && completionTokens != null) promptTokens = Math.max(0, totalTokens - completionTokens);
+    if (completionTokens == null && promptTokens != null) completionTokens = Math.max(0, totalTokens - promptTokens);
+  }
+
   return { promptTokens, completionTokens, totalTokens };
 }
 
@@ -122,6 +143,13 @@ export function buildCandyProbeLogLabel(result: Pick<CandyProbeResult, 'verdict'
   if (result.verdict === 'pass') return `糖果题 · 通过 ${result.score}/${result.total}`;
   if (result.verdict === 'fail') return `糖果题 · 疑似降智 ${result.score}/${result.total}`;
   return '糖果题 · 不确定';
+}
+
+/** The downstream path the probe's fingerprint impersonates, for the debug trace. */
+function resolveFingerprintDownstreamPath(downstreamFormat: CandyFingerprint['downstreamFormat']): string {
+  if (downstreamFormat === 'claude') return '/v1/messages';
+  if (downstreamFormat === 'responses') return '/v1/responses';
+  return '/v1/chat/completions';
 }
 
 /**
@@ -351,10 +379,17 @@ export async function runChannelCandyProbe(input: {
     throw new CandyProbeRequestError('糖果题库为空，无法探测', 500);
   }
 
-  /** Store the verdict, then mirror it into the usage log (best effort). */
+  /** Store the verdict, mirror it into the usage log, and close the debug trace. */
+  let debugTrace: ProxyDebugTraceSession | null = null;
+  let successfulUpstreamPath: string | null = null;
   const finish = async (
     result: CandyProbeResult,
-    audit: { usage?: Record<string, unknown> | null; httpStatus?: number | null } = {},
+    audit: {
+      usage?: Record<string, unknown> | null;
+      httpStatus?: number | null;
+      responseHeaders?: Record<string, unknown> | null;
+      responseBody?: unknown;
+    } = {},
   ): Promise<CandyProbeResult> => {
     recordCandyProbeResult(result);
     await recordCandyProbeUsageLog({
@@ -362,6 +397,15 @@ export async function runChannelCandyProbe(input: {
       accountId: context.account.id ?? null,
       httpStatus: audit.httpStatus ?? null,
       usage: audit.usage ?? null,
+    });
+    await safeFinalizeSurfaceProxyDebugTrace(debugTrace, {
+      // The probe request can succeed while the verdict is bad; the trace records the
+      // request outcome, exactly like the proxy surfaces do.
+      finalStatus: result.verdict === 'inconclusive' ? 'failed' : 'success',
+      finalHttpStatus: audit.httpStatus ?? null,
+      finalUpstreamPath: result.endpoint ? successfulUpstreamPath : null,
+      finalResponseHeaders: audit.responseHeaders ?? null,
+      finalResponseBody: audit.responseBody ?? null,
     });
     return result;
   };
@@ -409,6 +453,36 @@ export async function runChannelCandyProbe(input: {
     const claudeBody = fingerprint.buildClaudeBody?.(fingerprintInput);
     const responsesBody = fingerprint.buildResponsesBody?.(fingerprintInput);
     const channelProxyUrl = resolveChannelProxyUrl(context.site, context.account.extraConfig);
+
+    // Debug traces are written by the proxy surfaces; a probe that bypassed them would be
+    // invisible in 调试抓取, which is precisely where an operator looks when a probe
+    // misbehaves. Tagged `candy_probe` so it is distinguishable from real traffic, and
+    // subject to the same enable/target filters as everything else.
+    debugTrace = await startSurfaceProxyDebugTrace({
+      downstreamPath: resolveFingerprintDownstreamPath(fingerprint.downstreamFormat),
+      clientKind: CANDY_PROBE_CLIENT_FAMILY,
+      sessionId: null,
+      traceHint: `candy-probe:${channelId}`,
+      requestedModel: context.modelName,
+      downstreamApiKeyId: null,
+      requestHeaders: providerHeaders,
+      requestBody: claudeBody ?? responsesBody ?? openaiBody,
+    });
+    await safeUpdateSurfaceProxyDebugSelection(debugTrace, {
+      selectedChannelId: channelId,
+      selectedRouteId: context.routeId,
+      selectedAccountId: context.account.id ?? null,
+      selectedSiteId: context.site.id,
+      selectedSitePlatform: context.site.platform,
+    });
+    await safeUpdateSurfaceProxyDebugCandidates(debugTrace, {
+      endpointCandidates,
+      decisionSummary: {
+        source: CANDY_PROBE_CLIENT_FAMILY,
+        fingerprint: fingerprintId,
+        questionCount: questions.length,
+      },
+    });
 
     const deadlineAtMs = startedAtMs + timeoutMs;
     const abortController = new AbortController();
@@ -466,6 +540,7 @@ export async function runChannelCandyProbe(input: {
     });
 
     let successfulEndpoint: UpstreamEndpoint | null = null;
+    let debugAttemptIndex = 0;
     let flowResult: Awaited<ReturnType<typeof executeEndpointFlow>>;
     let rawText = '';
     try {
@@ -480,8 +555,35 @@ export async function runChannelCandyProbe(input: {
             endpointCandidates,
             buildRequest,
             dispatchRequest,
-            onAttemptSuccess: (ctx) => {
+            onAttemptSuccess: async (ctx) => {
               successfulEndpoint = ctx.request.endpoint;
+              successfulUpstreamPath = ctx.request.path;
+              await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
+                attemptIndex: debugAttemptIndex++,
+                endpoint: ctx.request.endpoint,
+                requestPath: ctx.request.path,
+                targetUrl: ctx.targetUrl,
+                runtimeExecutor: ctx.request.runtime?.executor ?? null,
+                requestHeaders: ctx.request.headers,
+                requestBody: ctx.request.body,
+                responseStatus: ctx.response.status ?? null,
+                responseHeaders: buildSurfaceProxyDebugResponseHeaders(ctx.response),
+                // Streamed bodies are assembled below and handed to finalize instead.
+                responseBody: await captureSurfaceProxyDebugSuccessResponseBody(debugTrace, ctx),
+              });
+            },
+            onAttemptFailure: async (ctx) => {
+              await safeInsertSurfaceProxyDebugAttempt(debugTrace, {
+                attemptIndex: debugAttemptIndex++,
+                endpoint: ctx.request.endpoint,
+                requestPath: ctx.request.path,
+                targetUrl: ctx.targetUrl,
+                runtimeExecutor: ctx.request.runtime?.executor ?? null,
+                requestHeaders: ctx.request.headers,
+                requestBody: ctx.request.body,
+                responseStatus: ctx.response?.status ?? null,
+                rawErrorText: ctx.errText || null,
+              });
             },
           });
           const text = flow.ok ? await readRuntimeResponseText(flow.upstream) : '';
@@ -539,7 +641,20 @@ export async function runChannelCandyProbe(input: {
       parseMode: grade.parseMode,
       questions: grade.questions,
     };
-    return finish(result, { usage: payload.usage, httpStatus: flowResult.upstream.status ?? 200 });
+    return finish(result, {
+      usage: payload.usage,
+      httpStatus: flowResult.upstream.status ?? 200,
+      responseHeaders: buildSurfaceProxyDebugResponseHeaders(flowResult.upstream),
+      // A streamed body is assembled here rather than in the debug capture hook, so hand
+      // the parsed payload over; the trace store applies the capture settings itself.
+      responseBody: {
+        verdict: result.verdict,
+        score: result.score,
+        total: result.total,
+        reason: result.reason,
+        text: payload.text,
+      },
+    });
   } catch (error) {
     const reason = error instanceof Error ? error.message : '探测失败';
     const result = buildInconclusiveResult({

@@ -6,6 +6,7 @@ import {
   hasProxyLogDownstreamApiKeyIdColumn,
   hasProxyLogStreamTimingColumns,
 } from '../db/index.js';
+import { formatUtcSqlDateTime } from './localTimeService.js';
 
 export type ProxyLogInsertInput = {
   routeId?: number | null;
@@ -272,7 +273,10 @@ export async function insertProxyLog(input: ProxyLogInsertInput): Promise<void> 
     estimatedCost: input.estimatedCost ?? 0,
     errorMessage: input.errorMessage ?? null,
     retryCount: input.retryCount ?? 0,
-    createdAt: input.createdAt ?? null,
+    // The column has a SQL default, but writing an explicit `null` SUPPRESSES it. A caller
+    // that does not care about the timestamp must still get one, or the row is invisible to
+    // every time-ordered view and to the retention sweep.
+    createdAt: input.createdAt ?? formatUtcSqlDateTime(new Date()),
   };
   const serializedBillingDetails = input.billingDetails == null
     ? null
