@@ -2,11 +2,17 @@ import { describe, expect, it } from 'vitest';
 import {
   buildClaudeCodeUserId,
   CANDY_FINGERPRINTS,
+  CANDY_FINGERPRINT_IDS,
   getCandyFingerprint,
+  isCandyFingerprintId,
   resolveCandyFingerprintIdForModel,
 } from './fingerprints.js';
 import { detectCliProfile } from '../../proxy-core/cliProfiles/registry.js';
-import { CLAUDE_DEFAULT_USER_AGENT, CODEX_DEFAULT_USER_AGENT } from '../../proxy-core/providers/headerUtils.js';
+import {
+  CLAUDE_DEFAULT_USER_AGENT,
+  CODEX_CLIENT_VERSION,
+  CODEX_DEFAULT_USER_AGENT,
+} from '../../proxy-core/providers/headerUtils.js';
 
 describe('candy fingerprint selection by model family', () => {
   it('routes Claude models to the Claude Code profile', () => {
@@ -79,7 +85,7 @@ describe('candy fingerprints', () => {
     expect(body.input[0].content[0].text).toBe('Q');
   });
 
-  it('uses the OpenAI SDK profile for unmatched families, with no token cap', () => {
+  it('uses the Codex CLI-disguised chat profile for unmatched families, with no token cap', () => {
     const profile = getCandyFingerprint('generic_openai');
     expect(profile.downstreamFormat).toBe('openai');
     const body = profile.buildOpenAiBody({ model: 'deepseek-v3', prompt: 'Q', scopeKey: '4:9' }) as Record<string, any>;
@@ -92,6 +98,27 @@ describe('candy fingerprints', () => {
       stream_options: { include_usage: true },
     });
     expect(profile.buildClaudeBody).toBeUndefined();
+  });
+
+  it('disguises the chat profile as Codex CLI, without contradictory SDK markers', () => {
+    const profile = getCandyFingerprint('generic_openai');
+    const headers = profile.buildProviderHeaders({ model: 'deepseek-v3', prompt: 'Q', scopeKey: '4:9' });
+
+    expect(headers['User-Agent']).toBe(CODEX_DEFAULT_USER_AGENT);
+    expect(headers.Originator).toBe('codex_cli_rs');
+    expect(headers.Version).toBe(CODEX_CLIENT_VERSION);
+    // `X-Stainless-*` are Node SDK markers; next to a Rust CLI user agent they describe a
+    // client that cannot exist, which is exactly what a relay fingerprints.
+    expect(Object.keys(headers).filter((key) => key.startsWith('X-Stainless'))).toEqual([]);
+  });
+
+  it('derives the fingerprint id set from the registry', () => {
+    expect([...CANDY_FINGERPRINT_IDS].sort()).toEqual(Object.keys(CANDY_FINGERPRINTS).sort());
+    for (const id of CANDY_FINGERPRINT_IDS) {
+      expect(isCandyFingerprintId(id)).toBe(true);
+    }
+    expect(isCandyFingerprintId('claude')).toBe(false);
+    expect(isCandyFingerprintId(undefined)).toBe(false);
   });
 
   it('always streams, because both CLI clients always stream', () => {

@@ -66,9 +66,6 @@ export type CandyFingerprint = {
 /** The identity line Claude Code puts first in its system prompt. */
 const CLAUDE_CODE_SYSTEM_LINE = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/** Generic OpenAI SDK-ish identity for models that have no dedicated CLI client. */
-const GENERIC_SDK_USER_AGENT = 'OpenAI/JS 4.104.0';
-
 /**
  * Claude Code's `metadata.user_id` shape:
  * `user_<64 hex>_account__session_<uuid>`.
@@ -161,18 +158,24 @@ const codexFingerprint: CandyFingerprint = {
 
 const genericOpenAiFingerprint: CandyFingerprint = {
   id: 'generic_openai',
-  label: 'OpenAI SDK',
+  label: 'Codex CLI（OpenAI 兼容）',
   downstreamFormat: 'openai',
   stream: true,
-  buildProviderHeaders() {
+  buildProviderHeaders({ scopeKey }) {
+    // CLIProxyAPI's openai provider is disguised as Codex CLI too, so "other models" wear
+    // the same identity as the codex fingerprint and differ only in the protocol family
+    // (chat vs responses) they speak.
+    //
+    // The X-Stainless-* set is deliberately gone: those are Node SDK markers, and pairing
+    // them with a `codex_cli_rs` (Rust CLI) user agent is a self-contradicting identity —
+    // exactly the kind of detail a relay can fingerprint.
+    const sessionId = uuidFromSeed(`metapi:candy:codex-session:${scopeKey}`);
     return {
-      'User-Agent': GENERIC_SDK_USER_AGENT,
-      'X-Stainless-Lang': 'js',
-      'X-Stainless-Package-Version': '4.104.0',
-      'X-Stainless-Os': 'MacOS',
-      'X-Stainless-Arch': 'arm64',
-      'X-Stainless-Runtime': 'node',
-      'X-Stainless-Runtime-Version': 'v22.14.0',
+      'User-Agent': CODEX_DEFAULT_USER_AGENT,
+      Originator: 'codex_cli_rs',
+      Version: CODEX_CLIENT_VERSION,
+      Session_id: sessionId,
+      Conversation_id: sessionId,
     };
   },
   buildOpenAiBody({ model, prompt }) {

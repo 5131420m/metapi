@@ -29,7 +29,7 @@ describe('candy probe presentation', () => {
   it('translates known fingerprints and passes unknown ones through', () => {
     expect(formatCandyProbeFingerprint('claude_code')).toBe('Claude Code');
     expect(formatCandyProbeFingerprint('codex')).toBe('Codex CLI');
-    expect(formatCandyProbeFingerprint('generic_openai')).toBe('OpenAI SDK');
+    expect(formatCandyProbeFingerprint('generic_openai')).toBe('Codex CLI（OpenAI 兼容）');
     expect(formatCandyProbeFingerprint('custom_profile')).toBe('custom_profile');
   });
 

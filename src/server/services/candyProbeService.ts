@@ -561,6 +561,12 @@ async function runChannelCandyProbeUnbounded(input: {
     const claudeBody = fingerprint.buildClaudeBody?.(fingerprintInput);
     const responsesBody = fingerprint.buildResponsesBody?.(fingerprintInput);
     const channelProxyUrl = resolveChannelProxyUrl(context.site, context.account.extraConfig);
+    // Wearing the codex identity means synthesizing its session/turn metadata; any other
+    // fingerprint leaves the site's own Codex-identity setting in charge.
+    const siteCodexIdentityMode = context.site.codexIdentityMode as 'off' | 'synthesize' | undefined;
+    const probeCodexIdentityMode: 'off' | 'synthesize' | undefined = fingerprint.id === 'codex'
+      ? 'synthesize'
+      : siteCodexIdentityMode;
 
     // Debug traces are written by the proxy surfaces; a probe that bypassed them would be
     // invisible in 调试抓取, which is precisely where an operator looks when a probe
@@ -589,6 +595,8 @@ async function runChannelCandyProbeUnbounded(input: {
         source: CANDY_PROBE_CLIENT_FAMILY,
         fingerprint: fingerprintId,
         questionCount: questions.length,
+        // Recorded so a trace shows whether the probe looked like the CLI it claims to be.
+        codexIdentityMode: probeCodexIdentityMode ?? 'off',
       },
     });
 
@@ -608,7 +616,11 @@ async function runChannelCandyProbeUnbounded(input: {
         providerHeaders,
         claudeOriginalBody: claudeBody,
         responsesOriginalBody: responsesBody,
-        codexIdentityMode: context.site.codexIdentityMode as 'off' | 'synthesize' | undefined,
+        // The probe stands in for a real client, so it must look like one: when it wears the
+        // Codex identity it also asks metapi to synthesize the Codex session/turn metadata,
+        // exactly as the proxy does for a codex client (the site-level "Codex 身份" mode is
+        // what a real request would get). Any other fingerprint follows the site setting.
+        codexIdentityMode: probeCodexIdentityMode,
         codexIdentityScopeKey: `site:${context.site.id}`,
         codexIdentityTurnKey: input.requestId ?? undefined,
       });

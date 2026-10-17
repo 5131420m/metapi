@@ -9,7 +9,9 @@ import type { CandyProbeSnapshot, CandyProbeVerdict } from '../types.js';
 export const CANDY_PROBE_FINGERPRINT_LABELS: Record<string, string> = {
   claude_code: 'Claude Code',
   codex: 'Codex CLI',
-  generic_openai: 'OpenAI SDK',
+  // All three wear a real client's identity (CLIProxyAPI's "请求伪装"): unmatched models are
+  // disguised as Codex CLI too, and differ only in the protocol family they speak.
+  generic_openai: 'Codex CLI（OpenAI 兼容）',
 };
 
 export function formatCandyProbeFingerprint(fingerprint: string): string {
