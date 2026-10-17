@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   StreamIdleTimeoutError,
   buildStreamIdleTimeoutMessage,
+  didStreamIdleTimeoutTrip,
   withStreamIdleTimeout,
 } from './streamIdleTimeout.js';
 
@@ -168,6 +169,30 @@ describe('withStreamIdleTimeout', () => {
 
       await vi.advanceTimersByTimeAsync(10_000);
       expect(control.cancelled).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a trip through didStreamIdleTimeoutTrip, and only for a reader that tripped', async () => {
+    vi.useFakeTimers();
+    try {
+      const healthy = createControlledReader();
+      const healthyReader = withStreamIdleTimeout(healthy.reader, { idleTimeoutMs: 1_000 });
+      const healthyRead = settle(healthyReader.read());
+      healthy.deliverDone();
+      await healthyRead;
+      expect(didStreamIdleTimeoutTrip(healthyReader)).toBe(false);
+
+      const stalled = createControlledReader();
+      const stalledReader = withStreamIdleTimeout(stalled.reader, { idleTimeoutMs: 1_000 });
+      const stalledRead = settle(stalledReader.read());
+      await vi.advanceTimersByTimeAsync(1_000);
+      await stalledRead;
+      expect(didStreamIdleTimeoutTrip(stalledReader)).toBe(true);
+      // The unwrapped reader and non-readers are never reported as tripped.
+      expect(didStreamIdleTimeoutTrip(stalled.reader)).toBe(false);
+      expect(didStreamIdleTimeoutTrip(null)).toBe(false);
     } finally {
       vi.useRealTimers();
     }

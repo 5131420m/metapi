@@ -45,7 +45,9 @@ import { insertProxyLog } from '../../services/proxyLogStore.js';
 import { summarizeConversationFileInputsInOpenAiBody } from '../capabilities/conversationFileCapabilities.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { fetchWithObservedFirstByte, getObservedResponseMeta } from '../firstByteTimeout.js';
-import { resolveResponseTimeoutKind, resolveResponseTimeoutMs } from '../responseTimeoutPolicy.js';
+import { resolveResponseTimeoutKind, resolveResponseTimeoutMs, resolveStreamIdleTimeoutMs } from '../responseTimeoutPolicy.js';
+import { didStreamIdleTimeoutTrip, withStreamIdleTimeout } from '../streamIdleTimeout.js';
+import { sanitizePostcommitFailureMessage } from '../../services/downstreamErrorPolicy.js';
 import { getProxyMaxChannelRetries } from '../../services/proxyChannelRetry.js';
 import { shouldAbortSameSiteEndpointFallback } from '../../services/proxyRetryPolicy.js';
 import {
@@ -658,10 +660,11 @@ export async function geminiProxyRoute(app: FastifyInstance) {
       const isInternalGemini = isInternalGeminiPlatform(selected.site.platform);
       const isDirectGeminiFamily = isDirectGeminiFamilyPlatform(selected.site.platform);
       const startTime = Date.now();
-      const firstByteTimeoutMs = resolveResponseTimeoutMs(
-        resolveResponseTimeoutKind({ isStream: isStreamAction, body: normalizedBody }),
-        config,
-      );
+      const responseTimeoutKind = resolveResponseTimeoutKind({ isStream: isStreamAction, body: normalizedBody });
+      const firstByteTimeoutMs = resolveResponseTimeoutMs(responseTimeoutKind, config);
+      // Mid-stream silence budget: shares the first-byte knob, exactly as on the chat and
+      // responses surfaces (see `resolveStreamIdleTimeoutMs`).
+      const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(responseTimeoutKind, config);
       let upstreamPath = '';
 
       try {
@@ -950,8 +953,15 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               return reply.code(502).send(JSON.parse(lastText));
             }
             const aggregateState = geminiGenerateContentTransformer.stream.createAggregateState();
+            // A silent upstream must fail the read instead of holding the downstream open.
+            const watchedReader = withStreamIdleTimeout(reader, { idleTimeoutMs: streamIdleTimeoutMs });
             const streamResult = await pipeGeminiSseStream({
-              reader,
+              reader: watchedReader,
+              publicFailureMessage: (message) => sanitizePostcommitFailureMessage({
+                message,
+                downstreamApiKeyId,
+                policy: config.downstreamErrorPolicy,
+              }),
               commit: () => {
                 reply.hijack();
                 reply.raw.statusCode = upstream.status;
@@ -973,9 +983,17 @@ export async function geminiProxyRoute(app: FastifyInstance) {
                 : { stream: true, usage: parsedUsage };
               if (streamResult.status === 'failed') {
                 const errorMessage = streamResult.errorMessage || 'Gemini upstream stream failed';
+                // Same vocabulary as sharedSurface.handleStreamFailure: our own idle budget
+                // expiring follows the timeout policy; a break after output began is confirmed
+                // channel damage; anything before the commit is an ordinary failure.
+                const failureKind = didStreamIdleTimeoutTrip(watchedReader)
+                  ? 'stream-idle-timeout' as const
+                  : (streamResult.committed ? 'stream-interrupted' as const : null);
                 await tokenRouter.recordFailure?.(selected.channel.id, {
                   status: 502,
                   errorText: errorMessage,
+                  modelName: actualModel,
+                  ...(failureKind ? { failureKind } : {}),
                 });
                 await logProxy(
                   selected, requestedModel, 'failed', 502, latency, errorMessage, retryCount,
@@ -1090,7 +1108,13 @@ export async function geminiProxyRoute(app: FastifyInstance) {
               });
               return;
             } finally {
-              reply.raw.end();
+              // Only end a response this attempt actually committed (hijacked). An uncommitted
+              // failure may `continue` to another channel, and ending the raw response here would
+              // leave that retry writing to a closed socket ("Cannot set headers after they are
+              // sent"), or would close the reply before the pre-commit error JSON is sent.
+              if (streamResult.committed && !reply.raw.writableEnded) {
+                reply.raw.end();
+              }
             }
           }
 

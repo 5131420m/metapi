@@ -46,3 +46,37 @@ export function registerAccountAuthFailure(accountId: number, nowMs = Date.now()
 export function resetAccountAuthFailureStreak(accountId: number): void {
   authFailureStreaks.delete(accountId);
 }
+
+/**
+ * How long one background auth suspicion stays "already reported" for an account.
+ *
+ * Background probes (balance refresh, check-in) only suspect — they never move the account to
+ * `expired`, so the account stays in the active set and the next scheduled pass (hourly by
+ * default) hits the same error again. Without a window every pass would append another event
+ * row and another notification for a fact a human has already been told about.
+ */
+const AUTH_SUSPICION_REPORT_WINDOW_MS = 6 * 60 * 60 * 1000;
+
+const lastAuthSuspicionReportAtMs = new Map<number, number>();
+
+/**
+ * Whether a background auth suspicion for this account should be reported now. Returns true
+ * at most once per window and records the report when it does.
+ *
+ * Deliberately NOT cleared by proxy successes: a proxy request usually runs on the API key while
+ * the background probe uses the session credential, so a working key says nothing about the
+ * probe's credential — clearing on success would re-alert on every pass for exactly the accounts
+ * that have both.
+ */
+export function claimAccountAuthSuspicionReport(accountId: number, nowMs = Date.now()): boolean {
+  const lastAtMs = lastAuthSuspicionReportAtMs.get(accountId);
+  if (lastAtMs !== undefined && nowMs - lastAtMs >= 0 && nowMs - lastAtMs < AUTH_SUSPICION_REPORT_WINDOW_MS) {
+    return false;
+  }
+  lastAuthSuspicionReportAtMs.set(accountId, nowMs);
+  return true;
+}
+
+export function __resetAccountAuthSuspicionReportsForTests(): void {
+  lastAuthSuspicionReportAtMs.clear();
+}

@@ -503,7 +503,9 @@ export async function recordSurfaceSuccess(input: {
     input.latencyMs,
     estimatedCost,
     input.modelName,
-    undefined,
+    // The account that actually served: for an OAuth route unit this is the dispatched member,
+    // not the channel's anchor account (a no-op for ordinary channels, where they coincide).
+    input.selected.account.id,
     {
       firstByteLatencyMs: input.firstByteLatencyMs ?? null,
       completionTokens: resolvedUsage.completionTokens,
@@ -794,8 +796,11 @@ export function createSurfaceFailureToolkit(input: {
      * channel-health path escalates immediately (see `isStreamInterruptedFailure`). A
      * transformer-side `processing` fault must not carry it: that failure is our own defect
      * and says nothing about the channel, so it is recorded as an ordinary failure.
+     *
+     * `stream-idle-timeout` marks our own mid-stream wait budget expiring; the channel-health
+     * path books it under the timeout policy instead (see `isExemptTimeoutFailure`).
      */
-    failureKind?: 'stream-interrupted' | null;
+    failureKind?: 'stream-interrupted' | 'stream-idle-timeout' | null;
   }) => {
     const errorMessage = args.errorMessage || 'stream processing failed';
     if (args.failureSource === 'processing') {
@@ -840,7 +845,7 @@ export function createSurfaceFailureToolkit(input: {
       modelName: args.modelName,
       ...(args.failureKind ? { failureKind: args.failureKind } : {}),
     };
-    await tokenRouter.recordFailure(args.selected.channel.id, failureContext);
+    await tokenRouter.recordFailure(args.selected.channel.id, failureContext, args.selected.account.id);
     await log({
       selected: args.selected,
       modelRequested: args.requestedModel,
@@ -948,7 +953,7 @@ export function createSurfaceFailureToolkit(input: {
         errorText: rawErrText,
         modelName: args.modelName,
         failureKind: args.failureKind,
-      });
+      }, args.selected.account.id);
       await log({
         selected: args.selected,
         modelRequested: args.requestedModel,
@@ -1040,7 +1045,7 @@ export function createSurfaceFailureToolkit(input: {
         status: args.failure.status,
         errorText: args.failure.reason,
         modelName: args.modelName,
-      });
+      }, args.selected.account.id);
       await log({
         selected: args.selected,
         modelRequested: args.requestedModel,
@@ -1126,6 +1131,12 @@ export function createSurfaceFailureToolkit(input: {
       attemptedChannelCount?: number;
       maxChannelAttempts?: number;
       eligibleChannelCount?: number;
+      /**
+       * The stream failed because OUR mid-stream idle budget expired (the reader wrapper from
+       * `withStreamIdleTimeout` tripped), not because the upstream broke the link. Passed by the
+       * surface, which holds the wrapper; the error text alone cannot tell the two apart.
+       */
+      idleTimedOut?: boolean;
     }): Promise<SurfaceFailureOutcome> {
       // The caller's summary wins over the payload's own message: for a reader failure it is
       // the transport error text, which is exactly what the retry predicates match on.
@@ -1160,10 +1171,14 @@ export function createSurfaceFailureToolkit(input: {
         attemptedChannelCount: args.attemptedChannelCount,
         maxChannelAttempts: args.maxChannelAttempts,
         eligibleChannelCount: args.eligibleChannelCount,
-        // Only a committed upstream stream break is the channel's own link failing: a
-        // pre-commit break has a failover path (below) and needs no escalation, and a
-        // processing fault is our own defect.
-        failureKind: phase === 'postcommit' && upstreamFailure ? 'stream-interrupted' : null,
+        // An idle trip is our own wait budget expiring, in either phase: it follows the
+        // timeout policy (exempt by default), never the stream-break escalation. Only a
+        // committed upstream break is the channel's own link failing: a pre-commit break has
+        // a failover path (below) and needs no escalation, and a processing fault is our own
+        // defect.
+        failureKind: upstreamFailure && args.idleTimedOut
+          ? 'stream-idle-timeout'
+          : (phase === 'postcommit' && upstreamFailure ? 'stream-interrupted' : null),
       });
 
       if (phase === 'precommit' && upstreamFailure && args.retryAllowed !== false) {
@@ -1246,7 +1261,7 @@ export function createSurfaceFailureToolkit(input: {
       await tokenRouter.recordFailure(args.selected.channel.id, {
         errorText: args.errorMessage,
         modelName: args.modelName,
-      });
+      }, args.selected.account.id);
       await log({
         selected: args.selected,
         modelRequested: args.requestedModel,

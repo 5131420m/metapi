@@ -36,6 +36,7 @@ import {
   type RouteDecisionCandidate,
   type RouteMode,
 } from '../../shared/tokenRouteContract.js';
+import { ROUTING_SPEED_TARGET_TPS } from '../../shared/routingQualityContract.js';
 
 interface RouteMatch {
   route: RouteRow;
@@ -87,8 +88,15 @@ export type SiteRuntimeFailureContext = {
    * the proxy cannot recover from, because the bytes are on the wire. That is confirmed
    * channel damage rather than one unlucky request, so it escalates a cooldown immediately
    * instead of waiting for the ordinary failure streak (see `isStreamInterruptedFailure`).
+   *
+   * `stream-idle-timeout` is the mid-stream half of the first-byte budget: the upstream went
+   * quiet for longer than the shared wait limit (`resolveStreamIdleTimeoutMs`). It is our own
+   * budget expiring, not proof the link broke — a reasoning model can legitimately pause — so
+   * it follows the same timeout policy as `first-byte-timeout` (exempt unless the operator
+   * opted into `timeoutCountsAsChannelFailure`, and then an ordinary failure), and never the
+   * immediate stream-break escalation.
    */
-  failureKind?: 'first-byte-timeout' | 'stream-interrupted' | null;
+  failureKind?: 'first-byte-timeout' | 'stream-idle-timeout' | 'stream-interrupted' | null;
 };
 
 type SiteRuntimeHealthState = {
@@ -259,9 +267,10 @@ const SITE_RUNTIME_TPS_EMA_ALPHA = 0.3;
 /**
  * Throughput a site must sustain (tokens/sec) to score a full 1.0 on the weighted
  * speed component. Sites faster than this saturate: beyond the target, extra speed
- * stops buying probability, mirroring the stable-first tolerance philosophy.
+ * stops buying probability, mirroring the stable-first tolerance philosophy. Shared with
+ * the routes-page speed badge so the two cannot disagree about "full speed".
  */
-const SITE_RUNTIME_SPEED_TARGET_TPS = 30;
+const SITE_RUNTIME_SPEED_TARGET_TPS = ROUTING_SPEED_TARGET_TPS;
 /** Upper bound for a single observed tokens/sec sample, so one bogus usage payload cannot poison the EMA. */
 const SITE_RUNTIME_SPEED_MAX_TPS = 500;
 /** Minimum stream generation window (latency minus first byte) before a tokens/sec sample is trusted. */
@@ -802,7 +811,8 @@ function resolveStreamTimingQualityMetrics(
  */
 function isExemptTimeoutFailure(context: SiteRuntimeFailureContext = {}): boolean {
   if (config.timeoutCountsAsChannelFailure) return false;
-  return context.failureKind === 'first-byte-timeout';
+  return context.failureKind === 'first-byte-timeout'
+    || context.failureKind === 'stream-idle-timeout';
 }
 
 /**
@@ -3108,11 +3118,17 @@ export class TokenRouter {
       .get();
     if (!row) return;
     recordChannelQualitySuccess(channelId, quality);
-    // A success between two auth failures proves the credential still works, so the
-    // 401s are not consecutive — clear the expiry-confirmation streak.
-    resetAccountAuthFailureStreak(row.accounts.id);
     const ch = row.route_channels;
     const account = row.accounts;
+    // A success between two auth failures proves the credential still works, so the 401s
+    // are not consecutive — clear the expiry-confirmation streak of the account that ACTUALLY
+    // served. For an OAuth route unit that is a member account, not the channel's anchor
+    // `accountId`; the failure side (reportTokenExpired) is keyed on the dispatched member,
+    // so resetting the anchor here would never clear the streak that is counting.
+    const servingAccountId = Number.isFinite(actualAccountId) && (actualAccountId ?? 0) > 0
+      ? Math.trunc(actualAccountId!)
+      : account.id;
+    resetAccountAuthFailureStreak(servingAccountId);
     const nowIso = new Date().toISOString();
     const nextSuccessCount = (ch.successCount ?? 0) + 1;
     const nextTotalLatencyMs = (ch.totalLatencyMs ?? 0) + latencyMs;

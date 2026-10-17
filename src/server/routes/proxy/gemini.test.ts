@@ -2422,4 +2422,95 @@ describe('gemini native proxy routes', () => {
     }));
     expect(recordSuccessMock).toHaveBeenCalledWith(12, expect.any(Number), 0, 'gemini-2.5-flash');
   });
+
+  it('fails over when a Gemini stream stalls before anything was written', async () => {
+    const previousFirstByte = config.proxyFirstByteTimeoutSec;
+    // The idle budget shares the first-byte knob, so 1s makes the stall reachable in a test.
+    config.proxyFirstByteTimeoutSec = 1;
+    selectNextChannelMock.mockReturnValue({
+      channel: { id: 12, routeId: 22 },
+      site: { id: 45, name: 'gemini-site-2', url: 'https://generativelanguage.googleapis.com', platform: 'gemini' },
+      account: { id: 34, username: 'demo-user-2' },
+      tokenName: 'fallback',
+      tokenValue: 'gemini-key-2',
+      actualModel: 'gemini-2.5-flash',
+    });
+    try {
+      const encoder = new TextEncoder();
+      // The first chunk arrives (so the first-byte budget is satisfied) but is an incomplete SSE
+      // event, so nothing is forwarded and the response stays uncommitted â€?then the upstream
+      // goes silent. Before the watchdog this hung the downstream request forever.
+      const stalledBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"responseId":"resp-stall"'));
+        },
+      });
+      const healthyBody = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(encoder.encode('data: {"responseId":"resp-ok","candidates":[{"content":{"role":"model","parts":[{"text":"served after the stall"}]},"finishReason":"STOP"}]}\r\n\r\n'));
+          controller.close();
+        },
+      });
+      fetchMock
+        .mockResolvedValueOnce(new Response(stalledBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }))
+        .mockResolvedValueOnce(new Response(healthyBody, {
+          status: 200,
+          headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+        }));
+
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+        headers: { 'x-goog-api-key': 'sk-managed-gemini' },
+        payload: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toContain('served after the stall');
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // Our own budget expiring: booked under the timeout policy, not as a stream break.
+      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+        failureKind: 'stream-idle-timeout',
+      }));
+    } finally {
+      config.proxyFirstByteTimeoutSec = previousFirstByte;
+    }
+  }, 15_000);
+
+  it('answers in-band with the stable code and books a stream break when a committed Gemini stream drops', async () => {
+    const encoder = new TextEncoder();
+    let pulls = 0;
+    const brokenBody = new ReadableStream<Uint8Array>({
+      // Deliver one complete event (which commits the response), then break on the next read.
+      pull(controller) {
+        pulls += 1;
+        if (pulls === 1) {
+          controller.enqueue(encoder.encode('data: {"responseId":"resp-partial","candidates":[{"content":{"role":"model","parts":[{"text":"partial answer"}]}}]}\r\n\r\n'));
+          return;
+        }
+        controller.error(new Error('socket hang up'));
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(brokenBody, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream; charset=utf-8' },
+    }));
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse',
+      headers: { 'x-goog-api-key': 'sk-managed-gemini' },
+      payload: { contents: [{ role: 'user', parts: [{ text: 'hello' }] }] },
+    });
+
+    expect(response.body).toContain('partial answer');
+    expect(response.body).toContain('metapi_stream_interrupted');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
+      failureKind: 'stream-interrupted',
+    }));
+  });
 });

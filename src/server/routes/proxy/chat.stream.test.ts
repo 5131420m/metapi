@@ -484,7 +484,7 @@ describe('chat proxy stream behavior', () => {
     }
   }, 15_000);
 
-  it('answers in-band and cools the channel when a committed chat stream stalls', async () => {
+  it('answers in-band and books an idle timeout (not a stream break) when a committed chat stream stalls', async () => {
     const previousAttempts = (config as any).proxyMaxChannelAttempts;
     const previousFirstByte = config.proxyFirstByteTimeoutSec;
     (config as any).proxyMaxChannelAttempts = 3;
@@ -530,10 +530,17 @@ describe('chat proxy stream behavior', () => {
       expect(response.body).toContain('[DONE]');
       // One attempt only: nothing to fail over to once bytes are on the wire…
       expect(fetchMock).toHaveBeenCalledTimes(1);
-      // …and the channel is booked as a mid-answer stream break, not as an ordinary failure.
+      // …and the silence is booked as our own wait budget expiring, under the timeout policy —
+      // NOT as a mid-answer link break, which would escalate a cooldown even with
+      // `timeoutCountsAsChannelFailure` off.
       expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
-        failureKind: 'stream-interrupted',
-      }));
+        failureKind: 'stream-idle-timeout',
+      }), expect.anything());
+      // Inspect the context argument directly: an arity-sensitive `not.toHaveBeenCalledWith`
+      // would pass vacuously now that the serving account id is passed as a third argument.
+      expect(recordFailureMock.mock.calls.some(([, context]) => (
+        (context as { failureKind?: string } | undefined)?.failureKind === 'stream-interrupted'
+      ))).toBe(false);
     } finally {
       (config as any).proxyMaxChannelAttempts = previousAttempts;
       config.proxyFirstByteTimeoutSec = previousFirstByte;
@@ -2280,7 +2287,7 @@ describe('chat proxy stream behavior', () => {
     });
     expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
       errorText: 'claude quota exhausted',
-    }));
+    }), expect.anything());
     expect(recordSuccessMock).not.toHaveBeenCalled();
   });
 

@@ -4,10 +4,12 @@
  * means the same colour everywhere.
  *
  * The first-byte cut-offs (<1s good, 1-3s warning, >=3s bad) were first introduced on
- * the proxy-log badges and are kept verbatim. The throughput tier boundary of 30 tps
- * matches the router's speed target (`SITE_RUNTIME_SPEED_TARGET_TPS`): at or above it
- * a channel is considered "full speed", so extra throughput stops buying a better tone.
+ * the proxy-log badges and are kept verbatim. The throughput "full speed" boundary is the
+ * router's own speed target (`ROUTING_SPEED_TARGET_TPS`, shared with the scorer): at or
+ * above it extra throughput stops buying a better tone, as it stops buying probability.
  */
+
+import { ROUTING_SPEED_TARGET_TPS } from '../../../shared/routingQualityContract.js';
 
 export type QualityTone = 'primary' | 'warning' | 'danger';
 
@@ -19,7 +21,7 @@ export function firstByteTone(ms: number): QualityTone {
 
 export function tokensPerSecondTone(tps: number): QualityTone {
   if (tps < 10) return 'danger';
-  if (tps < 30) return 'warning';
+  if (tps < ROUTING_SPEED_TARGET_TPS) return 'warning';
   return 'primary';
 }
 

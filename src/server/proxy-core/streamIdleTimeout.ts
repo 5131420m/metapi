@@ -41,6 +41,20 @@ export class StreamIdleTimeoutError extends Error {
   }
 }
 
+/**
+ * Wrapped readers whose idle budget tripped. Keyed on the wrapper the caller holds, so a surface
+ * can ask after `streamSession.run()` whether the failure it is about to book was our own budget
+ * expiring rather than the upstream breaking the link — the two must be booked differently (see
+ * `stream-idle-timeout` in tokenRouter), and the transformer's flattened error text cannot tell
+ * them apart reliably.
+ */
+const trippedReaders = new WeakSet<object>();
+
+/** True when `reader` is a `withStreamIdleTimeout` wrapper whose idle budget tripped. */
+export function didStreamIdleTimeoutTrip(reader: unknown): boolean {
+  return !!reader && typeof reader === 'object' && trippedReaders.has(reader);
+}
+
 export function buildStreamIdleTimeoutMessage(idleTimeoutMs: number): string {
   const seconds = Math.max(1, Math.round(idleTimeoutMs / 1000));
   return `upstream stream idle timeout (${seconds}s without data)`;
@@ -82,6 +96,7 @@ export function withStreamIdleTimeout<T extends IdleWatchableReader | null | und
 
   const trip = () => {
     timedOut = true;
+    trippedReaders.add(wrapped);
     clearTimer();
     try {
       options.onTimeout?.();
@@ -94,7 +109,7 @@ export function withStreamIdleTimeout<T extends IdleWatchableReader | null | und
       .catch(() => {});
   };
 
-  return {
+  const wrapped = {
     async read() {
       // The stream is already dead; every later read fails the same way rather than hanging.
       if (timedOut) throw new StreamIdleTimeoutError(message, idleTimeoutMs);
@@ -121,5 +136,6 @@ export function withStreamIdleTimeout<T extends IdleWatchableReader | null | und
       clearTimer();
       reader.releaseLock();
     },
-  } as T;
+  };
+  return wrapped as unknown as T;
 }

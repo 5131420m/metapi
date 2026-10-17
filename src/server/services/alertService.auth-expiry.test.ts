@@ -20,8 +20,11 @@ describe('alertService auth-expiry guardrails', () => {
   let schema: DbModule['schema'];
   let reportTokenExpired: AlertServiceModule['reportTokenExpired'];
   let noteAccountAuthFailureSuspected: AlertServiceModule['noteAccountAuthFailureSuspected'];
+  let flushModelImpactAlerts: AlertServiceModule['__flushModelImpactAlertsForTests'];
   let registerAccountAuthFailure: StreakModule['registerAccountAuthFailure'];
   let resetAccountAuthFailureStreak: StreakModule['resetAccountAuthFailureStreak'];
+  let claimAccountAuthSuspicionReport: StreakModule['claimAccountAuthSuspicionReport'];
+  let resetSuspicionReports: StreakModule['__resetAccountAuthSuspicionReportsForTests'];
   let invalidateTokenRouterCache: TokenRouterModule['invalidateTokenRouterCache'];
   let dataDir = '';
   let idSeed = 0;
@@ -44,14 +47,18 @@ describe('alertService auth-expiry guardrails', () => {
     schema = dbModule.schema;
     reportTokenExpired = alertServiceModule.reportTokenExpired;
     noteAccountAuthFailureSuspected = alertServiceModule.noteAccountAuthFailureSuspected;
+    flushModelImpactAlerts = alertServiceModule.__flushModelImpactAlertsForTests;
     registerAccountAuthFailure = streakModule.registerAccountAuthFailure;
     resetAccountAuthFailureStreak = streakModule.resetAccountAuthFailureStreak;
+    claimAccountAuthSuspicionReport = streakModule.claimAccountAuthSuspicionReport;
+    resetSuspicionReports = streakModule.__resetAccountAuthSuspicionReportsForTests;
     invalidateTokenRouterCache = tokenRouterModule.invalidateTokenRouterCache;
   });
 
   beforeEach(async () => {
     idSeed = 0;
     sendNotificationMock.mockReset();
+    resetSuspicionReports();
     // Fixtures insert routes directly; the router's route cache must not serve a
     // stale snapshot to the model-impact check.
     invalidateTokenRouterCache();
@@ -117,6 +124,8 @@ describe('alertService auth-expiry guardrails', () => {
 
     await reportTokenExpired({ accountId: account.id, username: account.username, siteName: site.name, detail: 'HTTP 401' });
     await reportTokenExpired({ accountId: account.id, username: account.username, siteName: site.name, detail: 'HTTP 401' });
+    // The model-impact scan is detached from the caller; wait for it before asserting.
+    await flushModelImpactAlerts();
 
     expect(await fetchAccountStatus(account.id)).toBe('expired');
     const events = await fetchEvents();
@@ -171,7 +180,10 @@ describe('alertService auth-expiry guardrails', () => {
 
     expect(await fetchAccountStatus(account.id)).toBe('active');
     const events = await fetchEvents();
-    expect(events.filter((event) => event.title === '后台任务凭据疑似失效').length).toBe(2);
+    // The account stays active and keeps being probed, so the repeat inside the report window
+    // must not append a second row (it would otherwise recur on every scheduled pass).
+    expect(events.filter((event) => event.title === '后台任务凭据疑似失效').length).toBe(1);
+    expect(sendNotificationMock).toHaveBeenCalledTimes(1);
     expect(events.some((event) => event.title === 'Token 已失效')).toBe(false);
     expect(sendNotificationMock).toHaveBeenCalledWith(
       '后台任务凭据疑似失效',
@@ -198,6 +210,8 @@ describe('alertService auth-expiry guardrails', () => {
 
     await reportTokenExpired({ accountId: account.id, username: account.username, siteName: site.name, detail: 'HTTP 401' });
     await reportTokenExpired({ accountId: account.id, username: account.username, siteName: site.name, detail: 'HTTP 401' });
+    // The model-impact scan is detached from the caller; wait for it before asserting.
+    await flushModelImpactAlerts();
 
     expect(await fetchAccountStatus(account.id)).toBe('expired');
     const events = await fetchEvents();
@@ -237,10 +251,22 @@ describe('alertService auth-expiry guardrails', () => {
 
     await reportTokenExpired({ accountId: account.id, username: account.username, siteName: site.name, detail: 'HTTP 401' });
     await reportTokenExpired({ accountId: account.id, username: account.username, siteName: site.name, detail: 'HTTP 401' });
+    // The model-impact scan is detached from the caller; wait for it before asserting.
+    await flushModelImpactAlerts();
 
     expect(await fetchAccountStatus(account.id)).toBe('expired');
     const events = await fetchEvents();
     expect(events.some((event) => event.title === '模型因凭据失效不再可用')).toBe(false);
+  });
+
+  it('suspicion window: reports once per account per window, independently per account', () => {
+    const t0 = 1_700_000_000_000;
+    expect(claimAccountAuthSuspicionReport(424242, t0)).toBe(true);
+    expect(claimAccountAuthSuspicionReport(424242, t0 + 60 * 60 * 1000)).toBe(false);
+    // Another account is not throttled by the first.
+    expect(claimAccountAuthSuspicionReport(434343, t0 + 60 * 60 * 1000)).toBe(true);
+    // After the window the same account is reported again.
+    expect(claimAccountAuthSuspicionReport(424242, t0 + 6 * 60 * 60 * 1000)).toBe(true);
   });
 
   it('streak module: a strike older than the stale window no longer counts', () => {

@@ -4,7 +4,11 @@ import { sendNotification } from './notifyService.js';
 import { setAccountRuntimeHealth } from './accountHealthService.js';
 import { appendSessionTokenRebindHint } from './alertRules.js';
 import { formatUtcSqlDateTime } from './localTimeService.js';
-import { registerAccountAuthFailure, resetAccountAuthFailureStreak } from './accountAuthFailureStreak.js';
+import {
+  claimAccountAuthSuspicionReport,
+  registerAccountAuthFailure,
+  resetAccountAuthFailureStreak,
+} from './accountAuthFailureStreak.js';
 
 /**
  * Routes whose channels are all backed (directly or through an OAuth route unit) by
@@ -114,23 +118,40 @@ export async function reportTokenExpired(params: {
     'error',
   );
 
-  // Name the silent blast radius: routes that just lost their last eligible
-  // channel because every surviving channel depended on this account.
-  const deadModels = await resolveModelsLosingLastCredential(params.accountId);
-  if (deadModels.length > 0) {
-    const modelList = deadModels.join('、');
-    const message = `模型 ${modelList} 的可用通道全部来自账号 ${accountLabel} @ ${siteLabel}，该账号凭据失效后模型不再进入路由`;
-    await db.insert(schema.events).values({
-      type: 'route',
-      title: '模型因凭据失效不再可用',
-      message,
-      level: 'error',
-      relatedId: params.accountId,
-      relatedType: 'route',
-      createdAt: formatUtcSqlDateTime(new Date()),
-    }).run();
-    await sendNotification('模型因凭据失效不再可用', message, 'error');
-  }
+  // Name the silent blast radius: routes that just lost their last eligible channel because
+  // every surviving channel depended on this account. This runs one route-wide decision per
+  // affected route, and several proxy routes await reportTokenExpired inline, so it is
+  // detached from the caller: the request that confirmed the expiry must not wait on it.
+  const pending = alertModelsLosingLastCredential(params.accountId, accountLabel, siteLabel)
+    .catch((error) => {
+      console.warn('[alert] failed to resolve models losing their last credential', error);
+    });
+  pendingModelImpactAlerts.add(pending);
+  void pending.finally(() => pendingModelImpactAlerts.delete(pending));
+}
+
+const pendingModelImpactAlerts = new Set<Promise<void>>();
+
+/** Test hook: wait for detached model-impact alerts to settle. */
+export async function __flushModelImpactAlertsForTests(): Promise<void> {
+  await Promise.all(Array.from(pendingModelImpactAlerts));
+}
+
+async function alertModelsLosingLastCredential(accountId: number, accountLabel: string, siteLabel: string) {
+  const deadModels = await resolveModelsLosingLastCredential(accountId);
+  if (deadModels.length === 0) return;
+  const modelList = deadModels.join('、');
+  const message = `模型 ${modelList} 的可用通道全部来自账号 ${accountLabel} @ ${siteLabel}，该账号凭据失效后模型不再进入路由`;
+  await db.insert(schema.events).values({
+    type: 'route',
+    title: '模型因凭据失效不再可用',
+    message,
+    level: 'error',
+    relatedId: accountId,
+    relatedType: 'route',
+    createdAt: formatUtcSqlDateTime(new Date()),
+  }).run();
+  await sendNotification('模型因凭据失效不再可用', message, 'error');
 }
 
 /**
@@ -146,6 +167,9 @@ export async function noteAccountAuthFailureSuspected(params: {
   siteName?: string | null;
   detail?: string;
 }) {
+  // The account stays active, so the next scheduled probe hits the same error again: report
+  // once per window instead of appending an event row on every pass.
+  if (!claimAccountAuthSuspicionReport(params.accountId)) return;
   const accountLabel = params.username || `ID:${params.accountId}`;
   const siteLabel = params.siteName || 'unknown-site';
   const detailText = params.detail ? appendSessionTokenRebindHint(params.detail) : '';

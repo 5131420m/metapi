@@ -184,6 +184,49 @@ describe('tokenRouter timeout failure accounting', () => {
     expect(refreshed?.cooldownUntil).toBeTruthy();
   });
 
+  it('treats a mid-stream idle timeout like a first-byte timeout, not a stream break', async () => {
+    // The idle budget shares the first-byte knob, so it must share its policy too: with the
+    // toggle off it is exempt, and it never takes the immediate stream-interrupted escalation.
+    const seeded = await seedChannel('gpt-idle-timeout');
+    const router = new TokenRouter();
+
+    await router.recordFailure(seeded.channel.id, {
+      status: 502,
+      errorText: 'upstream stream idle timeout (10s without data)',
+      modelName: 'gpt-idle-timeout',
+      failureKind: 'stream-idle-timeout',
+    });
+
+    const refreshed = await readChannel(seeded.channel.id);
+    expect(refreshed).toMatchObject({
+      failCount: 0,
+      consecutiveFailCount: 0,
+      cooldownLevel: 0,
+      cooldownUntil: null,
+      cooldownSource: null,
+    });
+    expect(refreshed?.lastFailAt).toBeTruthy();
+  });
+
+  it('charges an idle timeout as an ordinary failure when the strict toggle is on', async () => {
+    const seeded = await seedChannel('gpt-idle-timeout-strict');
+    const router = new TokenRouter();
+    config.timeoutCountsAsChannelFailure = true;
+
+    await router.recordFailure(seeded.channel.id, {
+      status: 502,
+      errorText: 'upstream stream idle timeout (10s without data)',
+      modelName: 'gpt-idle-timeout-strict',
+      failureKind: 'stream-idle-timeout',
+    });
+
+    const refreshed = await readChannel(seeded.channel.id);
+    expect(refreshed?.failCount).toBe(1);
+    // Ordinary backoff, not the stream-break ladder.
+    expect(refreshed?.cooldownSource).toBe('metapi_backoff');
+    expect(refreshed?.cooldownLevel).toBe(0);
+  });
+
   it('does not open the model-level breaker after a timeout streak', async () => {
     // The site-level exemption already existed; the model-level state used to take the
     // maximum transient penalty for the same abort, which contradicted it.

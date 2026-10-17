@@ -536,6 +536,8 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
 
   private async fetchModelsByToken(baseUrl: string, token: string, contextSourceScope?: string): Promise<string[]> {
     const authToken = this.normalizeTokenKeyForCompare(token);
+    // Deliberately an UNMARKED empty list (no pull ran): model refresh counts it as a failed pull
+    // rather than as "the upstream reported zero models". See modelListEvidence.ts.
     if (!authToken) return [];
 
     // Candidate endpoints are probed in turn and most of them legitimately 404.
@@ -568,6 +570,8 @@ export class Sub2ApiAdapter extends BasePlatformAdapter {
     }
 
     if (!sawConfirmedEmpty && firstFailure) throw firstFailure;
+    // No endpoint answered with a list and none failed either (e.g. no candidate endpoints):
+    // unmarked, so it counts toward the failure streak instead of clearing models at once.
     return sawConfirmedEmpty ? confirmedEmptyModelList() : [];
   }
 

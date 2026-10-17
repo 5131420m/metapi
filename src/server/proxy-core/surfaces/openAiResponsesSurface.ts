@@ -49,7 +49,7 @@ import {
 } from '../../transformers/gemini/generate-content/cliBridge.js';
 import { isCodexResponsesSurface } from '../cliProfiles/codexProfile.js';
 import { getObservedResponseMeta } from '../firstByteTimeout.js';
-import { withStreamIdleTimeout } from '../streamIdleTimeout.js';
+import { didStreamIdleTimeoutTrip, withStreamIdleTimeout } from '../streamIdleTimeout.js';
 import { resolveResponseTimeoutKind, resolveResponseTimeoutMs, resolveStreamIdleTimeoutMs } from '../responseTimeoutPolicy.js';
 import { getRuntimeResponseReader, readRuntimeResponseText } from '../executors/types.js';
 import { runCodexHttpSessionTask } from '../runtime/codexHttpSessionQueue.js';
@@ -1308,10 +1308,8 @@ export async function handleOpenAiResponsesSurfaceRequest(
           // A channel that stops sending while holding the connection open must fail the read
           // rather than hang the downstream request: the failure then travels the ordinary
           // reader-error path (failover before a commit, in-band terminal frame after one).
-          const streamResult = await streamSession.run(
-            withStreamIdleTimeout(reader, { idleTimeoutMs: streamIdleTimeoutMs }),
-            streamResponse,
-          );
+          const watchedReader = withStreamIdleTimeout(reader, { idleTimeoutMs: streamIdleTimeoutMs });
+          const streamResult = await streamSession.run(watchedReader, streamResponse);
           rawText += decoder.decode();
 
           const latency = Date.now() - startTime;
@@ -1338,6 +1336,7 @@ export async function handleOpenAiResponsesSurfaceRequest(
                 firstByteLatencyMs,
                 phase: isResponseCommitted() ? 'postcommit' : 'precommit',
                 retryAllowed: canRetryChannelSelection(retryCount, forcedChannelId, maxRetries),
+                idleTimedOut: didStreamIdleTimeoutTrip(watchedReader),
               });
             await finalizeDebugFailure(streamFailureStatus, {
               error: {

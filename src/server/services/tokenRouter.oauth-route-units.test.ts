@@ -198,6 +198,70 @@ describe('TokenRouter oauth route units', () => {
     expect(third?.account.id).toBe(accountB.id);
   });
 
+  it('resets the auth-failure streak of the member that served, not the channel anchor account', async () => {
+    const { registerAccountAuthFailure, resetAccountAuthFailureStreak } = await import('./accountAuthFailureStreak.js');
+    const site = await db.insert(schema.sites).values({
+      name: 'ChatGPT Codex OAuth',
+      url: 'https://chatgpt.com/backend-api/codex',
+      platform: 'codex',
+      status: 'active',
+    }).returning().get();
+    const insertAccount = (key: string) => db.insert(schema.accounts).values({
+      siteId: site.id,
+      username: `${key}@example.com`,
+      accessToken: `oauth-access-${key}`,
+      apiToken: null,
+      status: 'active',
+      oauthProvider: 'codex',
+      oauthAccountKey: `chatgpt-${key}`,
+      extraConfig: JSON.stringify({
+        credentialMode: 'session',
+        oauth: { provider: 'codex', accountId: `chatgpt-${key}`, email: `${key}@example.com` },
+      }),
+    }).returning().get();
+    const anchor = await insertAccount('streak-anchor');
+    const member = await insertAccount('streak-member');
+    const route = await db.insert(schema.tokenRoutes).values({
+      modelPattern: 'gpt-5.4',
+      routingStrategy: 'weighted',
+      enabled: true,
+    }).returning().get();
+    const routeUnit = await db.insert(schema.oauthRouteUnits).values({
+      siteId: site.id,
+      provider: 'codex',
+      name: 'Codex Streak Pool',
+      strategy: 'round_robin',
+      enabled: true,
+    }).returning().get();
+    await db.insert(schema.oauthRouteUnitMembers).values([
+      { unitId: routeUnit.id, accountId: anchor.id, sortOrder: 0 },
+      { unitId: routeUnit.id, accountId: member.id, sortOrder: 1 },
+    ]).run();
+    const channel = await db.insert(schema.routeChannels).values({
+      routeId: route.id,
+      accountId: anchor.id,
+      tokenId: null,
+      oauthRouteUnitId: routeUnit.id,
+      priority: 0,
+      weight: 10,
+      enabled: true,
+      manualOverride: false,
+    }).returning().get();
+
+    resetAccountAuthFailureStreak(anchor.id);
+    resetAccountAuthFailureStreak(member.id);
+    const t0 = Date.now();
+    // The member takes one 401 (keyed on the dispatched member, as reportTokenExpired is)…
+    expect(registerAccountAuthFailure(member.id, t0)).toBe(false);
+    // …then serves a successful request through the unit channel.
+    const router = new TokenRouter();
+    await router.recordSuccess(channel.id, 200, 0, 'gpt-5.4', member.id);
+    // The success must have cleared the MEMBER's streak, so the next 401 is a fresh first strike
+    // rather than a confirmation that would expire a working credential.
+    expect(registerAccountAuthFailure(member.id, t0 + 1_000)).toBe(false);
+    resetAccountAuthFailureStreak(member.id);
+  });
+
   it('keeps unrelated stable-first cache entries when pooled member state updates', async () => {
     const site = await db.insert(schema.sites).values({
       name: 'ChatGPT Codex OAuth',

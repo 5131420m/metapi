@@ -1416,7 +1416,7 @@ describe('responses proxy codex oauth refresh', () => {
     });
     expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
       errorText: 'quota exhausted upstream',
-    }));
+    }), expect.anything());
     expect(recordSuccessMock).not.toHaveBeenCalled();
   });
 

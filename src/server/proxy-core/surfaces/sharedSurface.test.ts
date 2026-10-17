@@ -498,7 +498,7 @@ describe('selectSurfaceChannelForAttempt', () => {
       status: 429,
       errorText: '{"error":"quota exceeded"}',
       modelName: 'upstream-model',
-    });
+    }, 33);
     expect(recordOauthQuotaResetHintMock).toHaveBeenCalledWith({
       accountId: 33,
       statusCode: 429,
@@ -1044,7 +1044,7 @@ describe('selectSurfaceChannelForAttempt', () => {
       status: 500,
       errorText: 'upstream failure',
       modelName: 'upstream-model',
-    });
+    }, 33);
     expect(reportProxyAllFailedMock).toHaveBeenCalledWith({
       model: 'gpt-5.2',
       reason: 'upstream failure',
@@ -1093,7 +1093,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     expect(recordFailureMock).toHaveBeenCalledWith(11, {
       errorText: 'socket hang up',
       modelName: 'upstream-model',
-    });
+    }, 33);
     expect(reportProxyAllFailedMock).toHaveBeenCalledWith({
       model: 'gpt-5.2',
       reason: 'socket hang up',
@@ -1131,7 +1131,7 @@ describe('selectSurfaceChannelForAttempt', () => {
     expect(recordFailureMock).toHaveBeenCalledWith(11, {
       errorText: 'stream exploded',
       modelName: 'upstream-model',
-    });
+    }, 33);
   });
 
   it('does not penalize the upstream channel for local stream processing failures', async () => {
@@ -1424,7 +1424,7 @@ describe('selectSurfaceChannelForAttempt', () => {
         usageSource: 'self-log',
       },
     });
-    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0.42, 'upstream-model', undefined, {
+    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0.42, 'upstream-model', 33, {
       completionTokens: 8,
       firstByteLatencyMs: null,
       isStream: null,
@@ -1611,7 +1611,7 @@ describe('selectSurfaceChannelForAttempt', () => {
       '[proxy/chat] failed to record success metrics',
       expect.any(Error),
     );
-    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0, 'upstream-model', undefined, {
+    expect(recordSuccessMock).toHaveBeenCalledWith(11, 250, 0, 'upstream-model', 33, {
       completionTokens: 5,
       firstByteLatencyMs: null,
       isStream: null,
@@ -1872,7 +1872,7 @@ describe('indeterminate 4xx channel retry', () => {
     await withPolicy(enabledPolicy, async (toolkit) => {
       await fail(toolkit, { status: 422, retryCount: 0, type: 'relay_acct' });
       // Operational bookkeeping must not depend on the public representation decision.
-      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 422 }));
+      expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({ status: 422 }), 33);
       expect(insertProxyLogMock).toHaveBeenCalled();
     });
   });
@@ -1923,6 +1923,7 @@ describe('stream failure retry', () => {
     retryAllowed?: boolean;
     status?: number;
     errorMessage?: string;
+    idleTimedOut?: boolean;
   }) {
     return toolkit.handleStreamFailure({
       selected,
@@ -1938,6 +1939,7 @@ describe('stream failure retry', () => {
       phase: args.phase ?? 'precommit',
       failureSource: args.failureSource,
       retryAllowed: args.retryAllowed,
+      idleTimedOut: args.idleTimedOut,
     });
   }
 
@@ -1995,7 +1997,24 @@ describe('stream failure retry', () => {
     expect(recordFailureMock).toHaveBeenCalledWith(11, expect.objectContaining({
       modelName: 'upstream-model',
       failureKind: 'stream-interrupted',
-    }));
+    }), 33);
+  });
+
+  it('books an idle-budget trip as stream-idle-timeout in either phase, never as a stream break', async () => {
+    const toolkit = await buildToolkit();
+
+    await streamFailure(toolkit, { retryCount: 1, phase: 'postcommit', idleTimedOut: true });
+    expect(recordFailureMock).toHaveBeenLastCalledWith(11, expect.objectContaining({
+      failureKind: 'stream-idle-timeout',
+    }), 33);
+
+    await streamFailure(toolkit, { retryCount: 1, phase: 'precommit', idleTimedOut: true });
+    expect(recordFailureMock).toHaveBeenLastCalledWith(11, expect.objectContaining({
+      failureKind: 'stream-idle-timeout',
+    }), 33);
+    expect(recordFailureMock).not.toHaveBeenCalledWith(11, expect.objectContaining({
+      failureKind: 'stream-interrupted',
+    }), 33);
   });
 
   it('does not blame the channel for a pre-commit or processing failure', async () => {
@@ -2007,7 +2026,7 @@ describe('stream failure retry', () => {
     await streamFailure(toolkit, { retryCount: 1, phase: 'precommit' });
     expect(recordFailureMock).toHaveBeenCalledWith(11, expect.not.objectContaining({
       failureKind: expect.anything(),
-    }));
+    }), 33);
   });
 
   /**

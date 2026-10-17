@@ -2362,6 +2362,20 @@ export default function Settings() {
                 </div>
               ))}
               </div>
+              {(() => {
+                // The six value-score components are summed as-is (no server-side normalization),
+                // so a single large weight silently drowns the others. Presets sum to 1; say so.
+                const w = runtime.routingWeights;
+                const componentSum = w.costWeight + w.balanceWeight + w.usageWeight
+                  + w.firstByteWeight + w.speedWeight + w.successWeight;
+                const offTarget = Math.abs(componentSum - 1) > 1e-6;
+                return (
+                  <div style={{ fontSize: 12, marginTop: 8, color: offTarget ? 'var(--color-warning)' : 'var(--color-text-muted)' }}>
+                    价值分分量（成本/余额/频次/首字/速度/成功率）合计 {componentSum.toFixed(2)}
+                    {offTarget ? '：预设按合计 1 设计，偏离时各分量的实际占比为「权重 ÷ 合计」，单项过大会吞掉其他分量' : ''}
+                  </div>
+                );
+              })()}
             </div>
           </div>
 
@@ -2407,7 +2421,7 @@ export default function Settings() {
 
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
-              首字超时（流式请求，无首包 / 首 token）
+              首字超时 / 流中途静默超时（流式请求）
             </div>
             <input
               type="number"
@@ -2427,7 +2441,10 @@ export default function Settings() {
               style={inputStyle}
             />
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7, marginTop: 6 }}>
-              `0` 表示关闭。仅作用于流式请求：只有在指定时间内完全没有任何首包 / 首 token 返回时才切换，已经开始输出的请求不会被这项超时打断。
+              `0` 表示关闭（两项一起关闭）。仅作用于流式请求，同一个时长同时约束两件事：等待首包 / 首 token 的时间，以及开始输出后两段数据之间的最长静默。
+              尚未向客户端输出时超时会换通道重试；已经开始输出后超时则以固定的中断错误收尾（无法换通道）。
+              推理模型或慢中转可能中途长时间不吐字，设得过短会打断正常回答。
+              两种超时都按下方「超时计入通道失败」开关记账，默认不冷却通道。
             </div>
           </div>
 
