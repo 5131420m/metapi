@@ -6,6 +6,7 @@ import {
   parseStoredUtcDateTime,
   type StoredUtcDateTimeInput,
 } from './localTimeService.js';
+import { meteredProxyLogCondition } from './proxyLogQueries.js';
 
 export type DownstreamKeyTrendRange = '24h' | '7d' | 'all';
 
@@ -246,7 +247,7 @@ async function readAllRangeTrendBuckets(
       totalCost: schema.proxyLogs.estimatedCost,
     })
       .from(schema.proxyLogs)
-      .where(and(...whereClauses))
+      .where(and(...whereClauses, meteredProxyLogCondition()))
       .orderBy(asc(schema.proxyLogs.createdAt), asc(schema.proxyLogs.id))
       .limit(ALL_RANGE_CHUNK_SIZE)
       .all();
@@ -289,7 +290,7 @@ async function readWindowedTrendBuckets(
     totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
   })
     .from(schema.proxyLogs)
-    .where(and(...whereClauses))
+    .where(and(...whereClauses, meteredProxyLogCondition()))
     .groupBy(bucketTs)
     .orderBy(bucketTs)
     .all();

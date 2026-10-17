@@ -11,6 +11,7 @@ import {
 } from "./accountHealthService.js";
 import { parseCheckinRewardAmount } from "./checkinRewardParser.js";
 import { getLocalDayRangeUtc } from "./localTimeService.js";
+import { meteredProxyLogCondition } from "./proxyLogQueries.js";
 import {
   readSnapshotCache,
   type SnapshotEnvelope,
@@ -122,6 +123,8 @@ async function loadAccountsSnapshotPayload(): Promise<AccountsSnapshotPayload> {
         and(
           gte(schema.proxyLogs.createdAt, startUtc),
           lt(schema.proxyLogs.createdAt, endUtc),
+          // Account spend must not be moved by metapi's own probe runs.
+          meteredProxyLogCondition(),
         ),
       )
       .groupBy(schema.proxyLogs.accountId)

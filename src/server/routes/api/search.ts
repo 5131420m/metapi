@@ -115,6 +115,8 @@ export async function searchRoutes(app: FastifyInstance) {
       .map(r => ({ ...r.checkin_logs, account: r.accounts }));
 
     // Search proxy logs (by model name)
+    // proxy-log-view: includes probe traffic — global search surfaces log ROWS, and a
+    // probe row is a row an operator may be looking for.
     const proxyLogs = await db.select(proxyLogBaseFields).from(schema.proxyLogs)
       .where(like(schema.proxyLogs.modelRequested, q))
       .orderBy(desc(schema.proxyLogs.createdAt))

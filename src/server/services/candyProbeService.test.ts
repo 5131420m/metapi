@@ -424,14 +424,14 @@ describe('runChannelCandyProbe', () => {
       routeId: channel.routeId,
       status: 'success',
       clientFamily: service.CANDY_PROBE_CLIENT_FAMILY,
+      clientAppName: '糖果题检测',
       estimatedCost: 0,
-      errorMessage: null,
     });
-    expect(logs[0].clientAppName).toContain('糖果题');
-    expect(logs[0].clientAppName).toContain('通过');
+    expect(logs[0].errorMessage).toContain('糖果题判定');
+    expect(logs[0].errorMessage).toContain('通过');
   });
 
-  it('logs a degraded verdict as a successful request carrying the reason', async () => {
+  it('keeps the verdict out of the client columns so the log filters stay stable', async () => {
     const { channel } = await seedChannel();
     dispatchRuntimeRequestMock.mockResolvedValue(new Response(
       sseChatText('1: 0\n2: 0\n3: 0'),
@@ -441,10 +441,11 @@ describe('runChannelCandyProbe', () => {
     await service.runChannelCandyProbe({ channelId: channel.id });
 
     const log = (await db.select().from(schema.proxyLogs).all())[0];
-    // The probe request itself succeeded; the verdict is the payload, not the HTTP outcome.
-    expect(log.status).toBe('success');
-    expect(log.clientAppName).toContain('疑似降智');
-    expect(log.errorMessage).toContain('低于通过阈值');
+    // The app name used to carry "疑似降智 1/3" / "通过 3/3", so the usage-log page grew one
+    // client-filter entry per wording. The verdict lives in errorMessage now.
+    expect(log.clientAppName).toBe('糖果题检测');
+    expect(log.clientAppName).not.toContain('降智');
+    expect(log.errorMessage).toContain('疑似降智');
   });
 
   it('logs an unreachable channel as a failed probe row', async () => {
@@ -459,7 +460,8 @@ describe('runChannelCandyProbe', () => {
     const log = (await db.select().from(schema.proxyLogs).all())[0];
     expect(log.status).toBe('failed');
     expect(log.httpStatus).toBe(502);
-    expect(log.clientAppName).toContain('不确定');
+    expect(log.clientAppName).toBe('糖果题检测');
+    expect(log.errorMessage).toContain('不确定');
   });
 
   it('stamps the usage-log row with a timestamp', async () => {
@@ -609,8 +611,11 @@ describe('candy probe timeout resolution', () => {
   });
 
   it('labels each verdict for the usage log', () => {
-    expect(serviceModule.buildCandyProbeLogLabel({ verdict: 'pass', score: 3, total: 3 })).toBe('糖果题 · 通过 3/3');
-    expect(serviceModule.buildCandyProbeLogLabel({ verdict: 'fail', score: 1, total: 3 })).toBe('糖果题 · 疑似降智 1/3');
-    expect(serviceModule.buildCandyProbeLogLabel({ verdict: 'inconclusive', score: 0, total: 3 })).toBe('糖果题 · 不确定');
+    expect(serviceModule.buildCandyProbeLogNote({ verdict: 'pass', score: 3, total: 3, reason: null }))
+      .toBe('糖果题判定：通过 3/3');
+    expect(serviceModule.buildCandyProbeLogNote({ verdict: 'fail', score: 1, total: 3, reason: '答对 1/3，低于通过阈值 2' }))
+      .toContain('疑似降智 1/3');
+    expect(serviceModule.buildCandyProbeLogNote({ verdict: 'inconclusive', score: 0, total: 3, reason: '探测超时' }))
+      .toContain('不确定');
   });
 });

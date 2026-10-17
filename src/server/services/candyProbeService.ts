@@ -29,6 +29,10 @@ import { dispatchRuntimeRequest } from './runtimeDispatch.js';
 import { isLikelyConversationModel } from './runtimeModelProbe.js';
 import { insertProxyLog } from './proxyLogStore.js';
 import {
+  CANDY_PROBE_CLIENT_APP_NAME,
+  CANDY_PROBE_CLIENT_FAMILY,
+} from '../../shared/candyProbe.js';
+import {
   buildUpstreamEndpointRequest,
   resolveUpstreamEndpointCandidates,
   type UpstreamEndpoint,
@@ -80,8 +84,12 @@ export const CANDY_PROBE_TIMEOUT_MS = 25_000;
 export const CANDY_PROBE_MIN_TIMEOUT_MS = 1_000;
 export const CANDY_PROBE_MAX_TIMEOUT_MS = 600_000;
 
-/** Usage-log marker, so probe traffic is identifiable and filterable in 使用日志. */
-export const CANDY_PROBE_CLIENT_FAMILY = 'candy_probe';
+/**
+ * Usage-log marker, so probe traffic is identifiable and filterable in 使用日志 (and
+ * excludable from every aggregate — see `proxyLogQueries.ts`). Re-exported here because
+ * callers of the probe already import this module.
+ */
+export { CANDY_PROBE_CLIENT_FAMILY } from '../../shared/candyProbe.js';
 
 function clampCandyProbeTimeoutMs(value: number): number {
   return Math.min(
@@ -138,10 +146,20 @@ function normalizeCandyProbeUsage(usage: Record<string, unknown> | null | undefi
   return { promptTokens, completionTokens, totalTokens };
 }
 
-export function buildCandyProbeLogLabel(result: Pick<CandyProbeResult, 'verdict' | 'score' | 'total'>): string {
-  if (result.verdict === 'pass') return `糖果题 · 通过 ${result.score}/${result.total}`;
-  if (result.verdict === 'fail') return `糖果题 · 疑似降智 ${result.score}/${result.total}`;
-  return '糖果题 · 不确定';
+/**
+ * The verdict, as one line of text.
+ *
+ * This used to BE the row's `client_app_name`, which meant the usage-log page's client
+ * filter grew one entry per wording ("通过 2/3", "通过 3/3", …). The app name is now a
+ * fixed marker and this text travels in `error_message`, where it reads as the note it is.
+ */
+export function buildCandyProbeLogNote(result: Pick<CandyProbeResult, 'verdict' | 'score' | 'total' | 'reason'>): string {
+  const score = `${result.score}/${result.total}`;
+  if (result.verdict === 'pass') return `糖果题判定：通过 ${score}`;
+  if (result.verdict === 'fail') {
+    return `糖果题判定：疑似降智 ${score}${result.reason ? `｜${result.reason}` : ''}`;
+  }
+  return `糖果题判定：不确定${result.reason ? `｜${result.reason}` : ''}`;
 }
 
 /** The downstream path the probe's fingerprint impersonates, for the debug trace. */
@@ -182,9 +200,11 @@ async function recordCandyProbeUsageLog(input: {
       totalTokens: tokens.totalTokens,
       estimatedCost: 0,
       clientFamily: CANDY_PROBE_CLIENT_FAMILY,
-      clientAppName: buildCandyProbeLogLabel(result),
+      clientAppName: CANDY_PROBE_CLIENT_APP_NAME,
       clientConfidence: 'high',
-      errorMessage: result.verdict === 'pass' ? null : result.reason,
+      // The verdict is this row's payload; it lives in error_message so the client columns
+      // stay a stable vocabulary (and so the log list shows it).
+      errorMessage: buildCandyProbeLogNote(result),
       retryCount: 0,
     });
   } catch {

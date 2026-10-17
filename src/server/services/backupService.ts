@@ -478,6 +478,8 @@ async function collectCurrentRuntimeStateSnapshot(): Promise<RuntimeStateSnapsho
     db.select().from(schema.accountTokens).all() as Promise<AccountTokenRow[]>,
     db.select().from(schema.tokenRoutes).all() as Promise<TokenRouteRow[]>,
     db.select().from(schema.routeChannels).all() as Promise<RouteChannelRow[]>,
+    // proxy-log-view: includes probe traffic — a backup copies the table, it does not
+    // interpret it; dropping rows here would silently lose audit history.
     db.select().from(schema.proxyLogs).all() as Promise<ProxyLogRow[]>,
     db.select().from(schema.checkinLogs).all() as Promise<CheckinLogRow[]>,
     db.select().from(schema.siteAnnouncements).all() as Promise<SiteAnnouncementRow[]>,

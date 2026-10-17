@@ -4,6 +4,7 @@ import { getLocalDayRangeUtc, formatLocalDateTime, getResolvedTimeZone } from '.
 import { parseCheckinRewardAmount } from './checkinRewardParser.js';
 import { estimateRewardWithTodayIncomeFallback } from './todayIncomeRewardService.js';
 import { getProxyLogBaseSelectFields } from './proxyLogStore.js';
+import { meteredProxyLogCondition } from './proxyLogQueries.js';
 
 export type DailySummaryMetrics = {
   localDay: string;
@@ -80,6 +81,8 @@ export async function collectDailySummaryMetrics(now = new Date()): Promise<Dail
       gte(schema.proxyLogs.createdAt, startUtc),
       lt(schema.proxyLogs.createdAt, endUtc),
       eq(schema.sites.status, 'active'),
+      // The daily summary is a demand report; probe runs would land in its success rate.
+      meteredProxyLogCondition(),
     ))
     .all();
   const todayProxyLogs = todayProxyRows.map((row) => row.proxy_logs);

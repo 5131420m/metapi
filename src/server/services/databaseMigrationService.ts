@@ -265,6 +265,7 @@ async function toBackupSnapshot(): Promise<BackupSnapshot> {
       tokenRoutes: await db.select().from(schema.tokenRoutes).all() as Array<Record<string, unknown>>,
       routeChannels: await db.select().from(schema.routeChannels).all() as Array<Record<string, unknown>>,
       routeGroupSources: await db.select().from(schema.routeGroupSources).all() as Array<Record<string, unknown>>,
+      // proxy-log-view: includes probe traffic — a migration moves the table verbatim.
       proxyLogs: await db.select().from(schema.proxyLogs).all() as Array<Record<string, unknown>>,
       proxyVideoTasks: await db.select().from(schema.proxyVideoTasks).all() as Array<Record<string, unknown>>,
       proxyFiles: await db.select().from(schema.proxyFiles).all() as Array<Record<string, unknown>>,
