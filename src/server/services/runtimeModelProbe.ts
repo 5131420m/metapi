@@ -44,7 +44,7 @@ const DEFINITE_UNSUPPORTED_PATTERNS = [
   /模型[^]{0,40}(无权限|未授权|禁止访问)/,
 ];
 
-function isLikelyConversationModel(modelName: string): boolean {
+export function isLikelyConversationModel(modelName: string): boolean {
   const normalized = String(modelName || '').trim();
   if (!normalized) return false;
   if (normalized.startsWith('__')) return false;

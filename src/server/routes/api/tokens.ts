@@ -22,6 +22,7 @@ import {
   saveRouteDecisionSnapshots,
 } from '../../services/routeDecisionSnapshotStore.js';
 import { clearChannelCooldown, clearRouteCooldown } from '../../services/routeCooldownService.js';
+import { getCandyProbeSnapshots } from '../../services/candyProbeService.js';
 import {
   refreshAllRouteDecisionSnapshots,
   ROUTE_DECISION_REFRESH_DEDUPE_KEY,
@@ -633,9 +634,13 @@ async function fetchChannelsForRouteRows(
     .flatMap((channels) => channels.map((channel) => channel.id))
     .filter((id): id is number => Number.isFinite(id));
   const qualityByChannelId = await tokenRouter.getChannelQualitySnapshots(qualityChannelIds);
+  // Display-only candy-probe verdict (degrade check). Same bulk shape as `quality`, and
+  // likewise never read by routing: P1 only surfaces the verdict.
+  const candyProbeByChannelId = getCandyProbeSnapshots(qualityChannelIds);
   for (const channels of channelsByActualRouteId.values()) {
     for (const channel of channels) {
       channel.quality = qualityByChannelId[String(channel.id)] ?? null;
+      channel.candyProbe = candyProbeByChannelId[String(channel.id)] ?? null;
     }
   }
 

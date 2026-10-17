@@ -18,6 +18,8 @@ import { searchRoutes } from './routes/api/search.js';
 import { eventsRoutes } from './routes/api/events.js';
 import { taskRoutes } from './routes/api/tasks.js';
 import { testRoutes } from './routes/api/test.js';
+import { candyProbeRoutes } from './routes/api/candyProbe.js';
+import { hydrateCandyProbeResultsFromSettings } from './services/candyProbeService.js';
 import { monitorRoutes } from './routes/api/monitor.js';
 import { downstreamApiKeysRoutes } from './routes/api/downstreamApiKeys.js';
 import { oauthRoutes } from './routes/api/oauth.js';
@@ -205,6 +207,10 @@ try {
   await migrateSiteApiKeysToAccounts();
   await ensureDefaultSitesSeeded();
   await ensureOauthIdentityBackfill();
+  // Display-only probe verdicts survive a restart; a failure here must not block startup.
+  await hydrateCandyProbeResultsFromSettings().catch((error) => {
+    console.warn(`Failed to hydrate candy probe results: ${(error as Error)?.message || 'unknown error'}`);
+  });
   await routeRefreshWorkflow.rebuildRoutesOnly();
 
   console.log('Loaded runtime settings overrides');
@@ -239,6 +245,7 @@ await app.register(siteAnnouncementsRoutes);
 await app.register(updateCenterRoutes);
 await app.register(taskRoutes);
 await app.register(testRoutes);
+await app.register(candyProbeRoutes);
 await app.register(monitorRoutes);
 await app.register(downstreamApiKeysRoutes);
 await app.register(oauthRoutes);
