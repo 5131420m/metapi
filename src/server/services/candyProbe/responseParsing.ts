@@ -10,6 +10,8 @@
  * collapsing whitespace here would destroy the very structure the grader relies on.
  */
 
+import { unwrapGeminiCliPayload } from '../../transformers/gemini/generate-content/cliBridge.js';
+
 export type CandyProbeAnswerPayload = {
   text: string;
   model: string | null;
@@ -106,7 +108,16 @@ function noteError(accumulator: PayloadAccumulator, value: unknown): void {
  * than protocol-first so an unexpected variant degrades to "text missing" instead of
  * throwing.
  */
-function applyPayloadObject(payload: unknown, accumulator: PayloadAccumulator): void {
+function applyPayloadObject(rawPayload: unknown, accumulator: PayloadAccumulator): void {
+  if (!isRecord(rawPayload)) return;
+  // gemini-cli upstreams wrap every payload in `{ response: … }`. The OpenAI Responses
+  // protocol ALSO carries a `response` field (on `response.created` and friends), so the
+  // unwrap has to be gated on the discriminator: only the gemini wrapper lacks `type`.
+  // Unwrapping unconditionally would turn a Responses event into its own inner object and
+  // lose the model, the usage and the stop reason with it.
+  const payload = rawPayload.type === undefined
+    ? unwrapGeminiCliPayload(rawPayload)
+    : rawPayload;
   if (!isRecord(payload)) return;
 
   if (payload.error) noteError(accumulator, payload.error);
@@ -146,7 +157,13 @@ function applyPayloadObject(payload: unknown, accumulator: PayloadAccumulator): 
         const response = isRecord(payload.response) ? payload.response : null;
         noteModel(accumulator, response?.model);
         noteUsage(accumulator, response?.usage);
-        noteStopReason(accumulator, response?.stop_reason ?? response?.incomplete_details);
+        // `incomplete_details` is an OBJECT ({ reason: 'max_output_tokens' }); passing it
+        // straight to a string field discarded the truncation signal entirely.
+        const incomplete = isRecord(response?.incomplete_details) ? response?.incomplete_details : null;
+        noteStopReason(
+          accumulator,
+          response?.stop_reason ?? readStringField(incomplete, 'reason'),
+        );
         if (eventType === 'response.failed') noteError(accumulator, response?.error);
         break;
       }
@@ -176,6 +193,11 @@ function applyPayloadObject(payload: unknown, accumulator: PayloadAccumulator): 
     if (delta) appendChunk(accumulator, readContentText(delta.content));
     if (message) appendChunk(accumulator, readContentText(message.content));
     noteStopReason(accumulator, choice?.finish_reason);
+  }
+  // Model/usage live OUTSIDE the `choices.length > 0` guard on purpose: OpenAI streams the
+  // usage-only final chunk as `{ choices: [], usage: {...} }`, so reading them only when a
+  // choice is present is how `stream_options.include_usage` ended up doing nothing.
+  if (choices) {
     noteModel(accumulator, payload.model);
     noteUsage(accumulator, payload.usage);
   }
@@ -189,17 +211,25 @@ function applyPayloadObject(payload: unknown, accumulator: PayloadAccumulator): 
     noteStopReason(accumulator, payload.stop_reason);
   }
 
-  // Buffered OpenAI Responses
-  if (typeof payload.output_text === 'string') {
-    appendChunk(accumulator, payload.output_text);
-  }
+  // Buffered OpenAI Responses.
+  //
+  // `output_text` is a convenience mirror of `output[]`, so a body carrying both (which
+  // some relays do) would otherwise append the same answer twice and push the line-based
+  // format out of alignment. The structured array wins; the flat field is only a fallback.
   const output = payload.output;
-  if (Array.isArray(output)) {
-    for (const item of output) {
-      if (!isRecord(item)) continue;
+  const outputItems = Array.isArray(output)
+    ? output.filter((item): item is Record<string, unknown> => isRecord(item))
+    : [];
+  if (outputItems.length > 0) {
+    for (const item of outputItems) {
       appendChunk(accumulator, readContentText(item.content));
       if (typeof item.text === 'string') appendChunk(accumulator, item.text);
     }
+    noteModel(accumulator, payload.model);
+    noteUsage(accumulator, payload.usage);
+    noteStopReason(accumulator, payload.status === 'incomplete' ? 'incomplete' : null);
+  } else if (typeof payload.output_text === 'string') {
+    appendChunk(accumulator, payload.output_text);
     noteModel(accumulator, payload.model);
     noteUsage(accumulator, payload.usage);
     noteStopReason(accumulator, payload.status === 'incomplete' ? 'incomplete' : null);

@@ -63,6 +63,59 @@ describe('candy probe answer extraction', () => {
     expect(payload.text).toBe('9.9');
   });
 
+  it('reads the usage-only chat chunk, which carries no choices', () => {
+    // OpenAI streams usage in a final `{ choices: [], usage: {...} }` chunk when
+    // `stream_options.include_usage` is requested; reading usage only inside the
+    // "choices present" branch is what made that request parameter do nothing.
+    const raw = sse([
+      { model: 'gpt-5.4', choices: [{ delta: { content: '1: 9.9' } }] },
+      { choices: [], usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 } },
+      { done: true },
+    ]);
+    const payload = extractCandyProbeAnswerPayload(raw, 'text/event-stream');
+    expect(payload.text).toBe('1: 9.9');
+    expect(payload.usage).toMatchObject({ prompt_tokens: 12, total_tokens: 17 });
+  });
+
+  it('reads the truncation reason out of an incomplete responses event', () => {
+    // `incomplete_details` is an object, so passing it straight to a string field lost it.
+    const raw = sse([
+      { type: 'response.output_text.delta', delta: '1: 9.9' },
+      { type: 'response.incomplete', response: { incomplete_details: { reason: 'max_output_tokens' } } },
+    ]);
+    const payload = extractCandyProbeAnswerPayload(raw, 'text/event-stream');
+    expect(payload.stopReason).toBe('max_output_tokens');
+  });
+
+  it('unwraps the gemini-cli response envelope', () => {
+    const raw = sse([
+      { response: { modelVersion: 'gemini-3-pro', candidates: [{ content: { parts: [{ text: '1: 9.9' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 12 } } },
+    ]);
+    const payload = extractCandyProbeAnswerPayload(raw, 'text/event-stream');
+    expect(payload.text).toBe('1: 9.9');
+    expect(payload.model).toBe('gemini-3-pro');
+    expect(payload.usage).toMatchObject({ promptTokenCount: 12 });
+  });
+
+  it('does not unwrap a responses event that merely has a response field', () => {
+    const raw = sse([
+      { type: 'response.completed', response: { model: 'gpt-5.4', usage: { output_tokens: 5 } } },
+    ]);
+    const payload = extractCandyProbeAnswerPayload(raw, 'text/event-stream');
+    expect(payload.model).toBe('gpt-5.4');
+    expect(payload.usage).toMatchObject({ output_tokens: 5 });
+  });
+
+  it('does not duplicate the text of a responses body that has both fields', () => {
+    const responses = extractCandyProbeAnswerPayload(JSON.stringify({
+      model: 'gpt-5.4',
+      status: 'completed',
+      output_text: '1: 9.9',
+      output: [{ type: 'message', content: [{ type: 'output_text', text: '1: 9.9' }] }],
+    }), 'application/json');
+    expect(responses.text).toBe('1: 9.9');
+  });
+
   it('reads buffered chat, anthropic and responses bodies', () => {
     const chat = extractCandyProbeAnswerPayload(JSON.stringify({
       model: 'gpt-5.4',
