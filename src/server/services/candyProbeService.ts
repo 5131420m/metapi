@@ -79,7 +79,6 @@ export type { CandyProbeResult, CandyProbeSnapshot };
 export const CANDY_PROBE_TIMEOUT_MS = 25_000;
 export const CANDY_PROBE_MIN_TIMEOUT_MS = 1_000;
 export const CANDY_PROBE_MAX_TIMEOUT_MS = 600_000;
-export const CANDY_PROBE_PASS_MIN_CORRECT = 2;
 
 /** Usage-log marker, so probe traffic is identifiable and filterable in 使用日志. */
 export const CANDY_PROBE_CLIENT_FAMILY = 'candy_probe';
@@ -621,7 +620,6 @@ export async function runChannelCandyProbe(input: {
     const grade = gradeCandyProbeRun({
       questions,
       text: payload.text,
-      minCorrect: CANDY_PROBE_PASS_MIN_CORRECT,
       stopReason: payload.stopReason,
     });
 

@@ -20,6 +20,8 @@ export type CandyQuestionTier = 'discriminative' | 'basic';
 export type CandyAnswerRule =
   /** Grade the first number appearing in the answer. */
   | { kind: 'firstNumber'; value: number }
+  /** Grade the LAST number: a reasoning answer puts its conclusion at the end. */
+  | { kind: 'lastNumber'; value: number }
   /** Grade an exact literal answer, ignoring case, punctuation and spacing. */
   | { kind: 'exact'; value: string };
 
@@ -31,6 +33,15 @@ export type CandyQuestion = {
   /** Human-readable expectation, shown in the UI detail panel. */
   expectedLabel: string;
   rule: CandyAnswerRule;
+  /**
+   * The classic wrong answers for this question.
+   *
+   * Used only when per-question attribution is impossible: a question whose expected
+   * answer never appears while its canonical trap answer does is evidence of a weak
+   * model, not of a formatting accident. Optional on purpose — inventing trap answers
+   * for coverage would invent failures.
+   */
+  wrongAnswers?: readonly (number | string)[];
 };
 
 /**
@@ -44,6 +55,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '9.11 和 9.9 哪个更大？只回答更大的那个数字。',
     expectedLabel: '9.9',
     rule: { kind: 'firstNumber', value: 9.9 },
+    wrongAnswers: [9.11],
   },
   {
     id: 'count-r-strawberry',
@@ -51,6 +63,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '单词 strawberry 里有几个字母 r？',
     expectedLabel: '3',
     rule: { kind: 'firstNumber', value: 3 },
+    wrongAnswers: [2],
   },
   {
     id: 'count-a-banana',
@@ -58,6 +71,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '单词 banana 里有几个字母 a？',
     expectedLabel: '3',
     rule: { kind: 'firstNumber', value: 3 },
+    wrongAnswers: [2],
   },
   {
     id: 'literal-ok',
@@ -65,6 +79,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '请只输出两个大写字母 OK，不要输出其他任何内容。',
     expectedLabel: 'OK',
     rule: { kind: 'exact', value: 'ok' },
+    wrongAnswers: ['no'],
   },
   {
     id: 'count-hanzi',
@@ -79,6 +94,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '2 的 10 次方等于多少？',
     expectedLabel: '1024',
     rule: { kind: 'firstNumber', value: 1024 },
+    wrongAnswers: [512],
   },
   {
     id: 'square-area',
@@ -86,6 +102,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '一个正方形的边长是 7，它的面积是多少？',
     expectedLabel: '49',
     rule: { kind: 'firstNumber', value: 49 },
+    wrongAnswers: [28],
   },
   {
     id: 'decimal-sum',
@@ -100,6 +117,7 @@ export const CANDY_QUESTIONS: readonly CandyQuestion[] = [
     prompt: '17、9、23 这三个数里哪个最大？只回答最大的那个数字。',
     expectedLabel: '23',
     rule: { kind: 'firstNumber', value: 23 },
+    wrongAnswers: [17],
   },
   {
     id: 'count-to-ten',
@@ -151,16 +169,55 @@ function matchesRule(rule: CandyAnswerRule, rawAnswer: string): boolean {
 
   const numbers = extractCandyNumbers(normalized);
   if (numbers.length <= 0) return false;
-  const first = numbers[0] as number;
-  return Math.abs(first - rule.value) < 1e-9;
+  const candidate = rule.kind === 'lastNumber' ? numbers[numbers.length - 1] : numbers[0];
+  return Math.abs((candidate as number) - rule.value) < 1e-9;
+}
+
+/**
+ * Does `token` appear in `text` as a standalone value?
+ *
+ * Boundaries matter: looking for `9.9` inside `9.11` (or `3` inside `13`) would let a
+ * wrong answer count as a hit, which is exactly the false negative this whole check
+ * exists to avoid.
+ */
+export function candyAnswerAppearsInText(token: number | string, text: string): boolean {
+  const haystack = asTrimmedText(text).toLowerCase();
+  if (!haystack) return false;
+
+  if (typeof token === 'number') {
+    const literal = String(token).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(?<![\\d.])${literal}(?![\\d.])`).test(haystack);
+  }
+
+  const word = token.trim().toLowerCase().replace(/[^a-z0-9]+/g, '');
+  if (!word) return false;
+  return new RegExp(`(?<![a-z0-9])${word}(?![a-z0-9])`).test(haystack);
+}
+
+/** The answer token a question accepts as correct, for whole-text matching. */
+function questionExpectedAppears(question: CandyQuestion, text: string): boolean {
+  return candyAnswerAppearsInText(question.rule.value, text);
+}
+
+/**
+ * A question is "actively wrong" only when its trap answer appears and its expected
+ * answer does not. Checking both halves is what keeps a correct-but-verbose answer from
+ * being scored as a wrong one.
+ */
+function questionAnsweredWrong(question: CandyQuestion, text: string): boolean {
+  const traps = question.wrongAnswers ?? [];
+  if (traps.length <= 0) return false;
+  if (questionExpectedAppears(question, text)) return false;
+  return traps.some((token) => candyAnswerAppearsInText(token, text));
 }
 
 /**
  * Grade one question against one answer.
  *
- * The "first number wins" rule is what makes verbose-but-correct answers pass
- * (`9.9 比 9.11 大` is correct) while the canonical wrong answer fails
- * (`9.11` never contains 9.9 first).
+ * `firstNumber` lets a verbose-but-correct answer pass (`9.9 比 9.11 大`) while the
+ * canonical wrong answer still fails (`9.11` never contains 9.9 first). `lastNumber`
+ * exists for reasoning questions, where the conclusion — not the first figure quoted —
+ * is the answer.
  */
 export function judgeCandyAnswer(question: CandyQuestion, rawAnswer: string): boolean {
   return matchesRule(question.rule, rawAnswer);
@@ -325,6 +382,34 @@ export type CandyProbeGrade = {
   questions: CandyGradedQuestion[];
 };
 
+/** Truncation stop reasons, kept together so both call sites agree on the vocabulary. */
+const CANDY_TRUNCATION_STOP_REASONS = new Set(['max_tokens', 'length', 'incomplete']);
+
+function isTruncatedStopReason(stopReason: string | null | undefined): boolean {
+  return typeof stopReason === 'string' && CANDY_TRUNCATION_STOP_REASONS.has(stopReason.trim().toLowerCase());
+}
+
+/** A short excerpt of the raw answer, so a verdict can be diagnosed without the trace. */
+function excerptForReason(text: string): string {
+  const flat = asTrimmedText(text).replace(/\s+/g, ' ');
+  if (!flat) return '';
+  return flat.length > 120 ? `${flat.slice(0, 120)}…` : flat;
+}
+
+/**
+ * The pass threshold for a run, derived from the question count.
+ *
+ * This is the ONLY place the threshold is decided. It used to be a fixed constant that
+ * callers passed in, which silently disagreed with the question count: a 1-question run
+ * graded against a threshold of 2 could never pass, and a 6-question run passed on 2.
+ * Two thirds (rounded up, never below one) keeps the intent — clearly more right than
+ * wrong — at every battery size.
+ */
+export function resolveCandyPassThreshold(total: number): number {
+  const safeTotal = Math.max(1, Math.trunc(total));
+  return Math.max(1, Math.min(safeTotal, Math.ceil(safeTotal * 2 / 3)));
+}
+
 /**
  * Grade a whole run.
  *
@@ -336,11 +421,11 @@ export type CandyProbeGrade = {
 export function gradeCandyProbeRun(input: {
   questions: readonly CandyQuestion[];
   text: string;
-  minCorrect: number;
   stopReason?: string | null;
 }): CandyProbeGrade {
   const questions = input.questions;
   const total = questions.length;
+  const threshold = resolveCandyPassThreshold(total);
   const parsed = parseCandyAnswers({ questions, text: input.text });
   const expectedAnswers = questions.map((question) => question.expectedLabel);
 
@@ -356,11 +441,17 @@ export function gradeCandyProbeRun(input: {
   });
   const score = graded.filter((item) => item.correct).length;
   const answered = graded.filter((item) => item.answer.length > 0).length;
+  const truncationNote = isTruncatedStopReason(input.stopReason) ? '（输出长度达到上限）' : '';
+  // Whole-text evidence about the answers, used when per-question attribution failed.
+  const wrongHits = questions.filter((question) => questionAnsweredWrong(question, input.text)).length;
+  const rightHits = questions.filter((question) => questionExpectedAppears(question, input.text)).length;
+  // How many questions we have ANY signal for: a parsed answer, or whole-text evidence.
+  const addressed = parsed.mode === 'none' ? rightHits + wrongHits : answered;
+  // With no per-question attribution, "addressed" is the honest count to report: it is how
+  // many questions we can say something about, which is what the UI wants to show.
+  const reportedAnswered = parsed.mode === 'none' ? addressed : answered;
 
   if (!asTrimmedText(input.text)) {
-    const truncationNote = input.stopReason === 'max_tokens' || input.stopReason === 'length'
-      ? '（输出长度达到上限）'
-      : '';
     return {
       verdict: 'inconclusive',
       score,
@@ -372,29 +463,63 @@ export function gradeCandyProbeRun(input: {
     };
   }
 
+  // Cut off mid-answer with questions unaccounted for: the missing answers are an artefact
+  // of the cut, not a property of the model, so the run cannot be scored either way. This
+  // is checked before the whole-text rescue below, which would otherwise read a truncated
+  // answer as "enough questions were right".
+  if (truncationNote && addressed < total) {
+    return {
+      verdict: 'inconclusive',
+      score,
+      total,
+      answered: reportedAnswered,
+      parseMode: parsed.mode,
+      reason: `输出被截断，仅答出 ${addressed}/${total} 题${truncationNote}`,
+      questions: graded,
+    };
+  }
+
   if (parsed.mode === 'none') {
-    // The answer did not follow the requested shape. Before calling that degradation,
-    // check whether the expected answers are present anywhere in the text: if they are,
-    // the model was right and only the format drifted.
-    const wholeTextHits = questions.filter((question) => judgeCandyAnswer(question, input.text)).length;
-    if (wholeTextHits > 0) {
+    // The output did not follow the requested shape. That on its own is NOT degradation:
+    // a relay answering 200 with "insufficient quota", a refusal, or a truncated body all
+    // land here, and calling them "疑似降智" would be a wrong conclusion.
+    //
+    // The only thing that can rescue a verdict from this state is evidence about the
+    // answers themselves, and it must be whole-text evidence, because per-question
+    // attribution is exactly what is unavailable.
+    const excerpt = excerptForReason(input.text);
+
+    if (wrongHits >= threshold) {
       return {
-        verdict: 'inconclusive',
-        score,
+        verdict: 'fail',
+        score: 0,
         total,
-        answered,
+        answered: reportedAnswered,
         parseMode: parsed.mode,
-        reason: '回答格式不符，但包含预期答案，无法逐题判分',
+        reason: `回答格式不符，且命中 ${wrongHits} 个已知错误答案`
+          + (excerpt ? `｜原文：${excerpt}` : ''),
+        questions: graded,
+      };
+    }
+    if (rightHits >= threshold) {
+      return {
+        verdict: 'pass',
+        score: rightHits,
+        total,
+        answered: reportedAnswered,
+        parseMode: parsed.mode,
+        reason: null,
         questions: graded,
       };
     }
     return {
-      verdict: 'fail',
+      verdict: 'inconclusive',
       score: 0,
       total,
-      answered,
+      answered: reportedAnswered,
       parseMode: parsed.mode,
-      reason: '回答格式不符，且未命中任何预期答案',
+      reason: `回答格式不符，无法逐题判分（命中预期 ${rightHits} / 命中已知错误 ${wrongHits}，阈值 ${threshold}）`
+        + (excerpt ? `｜原文：${excerpt}` : ''),
       questions: graded,
     };
   }
@@ -411,14 +536,14 @@ export function gradeCandyProbeRun(input: {
     };
   }
 
-  const passed = score >= Math.max(1, Math.trunc(input.minCorrect));
+  const passed = score >= threshold;
   return {
     verdict: passed ? 'pass' : 'fail',
     score,
     total,
     answered,
     parseMode: parsed.mode,
-    reason: passed ? null : `答对 ${score}/${total}，低于通过阈值`,
+    reason: passed ? null : `答对 ${score}/${total}，低于通过阈值 ${threshold}`,
     questions: graded,
   };
 }
