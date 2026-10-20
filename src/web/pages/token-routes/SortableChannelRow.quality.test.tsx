@@ -103,7 +103,8 @@ describe('SortableChannelRow channel quality badges', () => {
     const badgeTexts = collectBadgeTexts(root);
     expect(badgeTexts.some((text) => text.includes('首字 320ms'))).toBe(true);
     expect(badgeTexts.some((text) => text.includes('速度 42.5tps'))).toBe(true);
-    // Merged badge: recent-window counts and rate, one shared timescale.
+    // Merged badge: recent-window counts and the real rate — counts stay on the badge
+    // so the 0/0-vs-N/N evidence is readable at a glance.
     expect(badgeTexts.some((text) => text.includes('成功率39/1/98%'))).toBe(true);
     // The lifetime counters must NOT leak into the badge.
     expect(badgeTexts.some((text) => text.includes('成功率12/1'))).toBe(false);

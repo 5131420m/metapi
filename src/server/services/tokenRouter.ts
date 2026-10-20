@@ -1,7 +1,8 @@
-import { and, eq, inArray, isNull } from 'drizzle-orm';
+import { and, eq, inArray, isNull, gte } from 'drizzle-orm';
 import { db, schema } from '../db/index.js';
 import { upsertSetting } from '../db/upsertSetting.js';
 import { resetAccountAuthFailureStreak } from './accountAuthFailureStreak.js';
+import { formatUtcSqlDateTime } from './localTimeService.js';
 import {
   config,
   normalizeTokenRouterFailureCooldownMaxSec,
@@ -694,6 +695,17 @@ function decayRecentOutcomeCount(value: number, elapsedMs: number): number {
  */
 const RECENT_OUTCOME_SAMPLE_EPSILON = 1e-9;
 
+/**
+ * Display-side evidence floor for the channel success-rate badge. The epsilon above kills
+ * arithmetic float dust; this floor covers the adjacent band — a REAL observation decayed
+ * by the 30-minute half-life until it cannot even round into a visible count (a single
+ * success goes below 0.5 after ~30 minutes idle). Between the epsilon and this floor the
+ * prior smoothing still dominates the rate toward 0.5, and a badge that shows "0/0" must
+ * not hang a coloured percentage off evidence it cannot display. Scoring is unaffected:
+ * it blends by confidence, which is already ~0 in this band.
+ */
+const RECENT_OUTCOME_DISPLAY_MIN_SAMPLES = 0.5;
+
 function normalizeRecentOutcomeCount(value: number): number {
   const normalized = Math.max(0, value);
   return normalized < RECENT_OUTCOME_SAMPLE_EPSILON ? 0 : normalized;
@@ -1381,11 +1393,17 @@ async function persistSiteRuntimeHealthState(): Promise<void> {
     const payload = buildSiteRuntimeHealthPersistencePayload();
     await upsertSetting(SITE_RUNTIME_HEALTH_SETTING_KEY, payload);
   })();
-  siteRuntimeHealthPersistInFlight = persistTask.finally(() => {
-    if (siteRuntimeHealthPersistInFlight === persistTask) {
+  // The guard must compare against the promise stored in the field — which is the
+  // `.finally()` RESULT, a distinct promise from `persistTask`. Comparing against
+  // `persistTask` never matched, the field was never cleared, and every persist
+  // after the first one per process silently short-circuited on the settled guard:
+  // no write, no error, and the runtime-health blob frozen at the boot-time snapshot.
+  const finalTask = persistTask.finally(() => {
+    if (siteRuntimeHealthPersistInFlight === finalTask) {
       siteRuntimeHealthPersistInFlight = null;
     }
   });
+  siteRuntimeHealthPersistInFlight = finalTask;
   await siteRuntimeHealthPersistInFlight;
 }
 
@@ -1571,6 +1589,187 @@ export async function flushSiteRuntimeHealthPersistence(): Promise<void> {
   if (siteRuntimeHealthPersistInFlight) {
     await siteRuntimeHealthPersistInFlight;
   }
+}
+
+/** How far back the boot-time backfill reaches into proxy logs. One day covers the
+ * recent-outcome window many times over (30-min half-life) and defines the EMA's
+ * "recent day" semantics; logs are kept far longer than this. */
+const RUNTIME_HEALTH_BACKFILL_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+export type RuntimeHealthBackfillResult = {
+  /** True when the window holds no success rows at all — nothing to replay. */
+  skipped: boolean;
+  scannedRows: number;
+  seededChannels: number;
+  seededSiteModels: number;
+};
+
+type ProxyLogBackfillRow = {
+  channelId: number | null;
+  siteId: number | null;
+  modelActual: string | null;
+  modelRequested: string | null;
+  latencyMs: number | null;
+  firstByteLatencyMs: number | null;
+  completionTokens: number | null;
+  isStream: boolean | null;
+  createdAt: string;
+};
+
+/** Proxy logs store UTC datetimes as "YYYY-MM-DD HH:mm:ss" — parse them back to epoch ms. */
+function parseSqlUtcDateTimeMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const ms = Date.parse(`${value.replace(' ', 'T')}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * One-shot, success-path backfill of runtime-health state from proxy logs.
+ *
+ * Fills the gap between what the persisted blob knows and what recent traffic actually
+ * did: after a data-loss event, a fresh deployment, or a low-traffic instance's restart,
+ * the channel panel would otherwise start from zero and wait for live traffic, even
+ * though the last day of evidence is sitting in proxy_logs (30-day retention).
+ *
+ * Shape, deliberately narrow:
+ *  - **Success rows only.** A success in the log is perfectly attributed and perfectly
+ *    classifiable; failures are not (exempt-timeout and usage-limit suppression depend on
+ *    record-time context the log does not carry), so penalty/breaker/failure counts are
+ *    left to the blob and live traffic rather than replayed approximately.
+ *  - **The scan IS the gap detector.** "Is the blob complete?" cannot be answered from
+ *    the blob alone — a blob can be fresh for the channels that served since boot while
+ *    missing others entirely (exactly the data-loss shape this exists for). So the scan
+ *    runs whenever the window holds success rows, and the per-entity fill-gaps guard is
+ *    the only protection needed: entities the blob already has are never re-seeded, and
+ *    live-recorded state (always higher fidelity than a log replay) always wins.
+ *  - **Through the real state math.** Every replayed row goes through the same EMA /
+ *    window / tps-gate helpers with the row's own timestamp, so no second state machine
+ *    can drift from the first.
+ */
+export async function backfillRuntimeHealthFromProxyLogs(nowMs = Date.now()): Promise<RuntimeHealthBackfillResult> {
+  const empty: RuntimeHealthBackfillResult = { skipped: true, scannedRows: 0, seededChannels: 0, seededSiteModels: 0 };
+  await ensureSiteRuntimeHealthStateLoaded();
+
+  const windowStartAt = formatUtcSqlDateTime(new Date(nowMs - RUNTIME_HEALTH_BACKFILL_WINDOW_MS));
+  // proxy_logs carries no site column — the site comes from the account that served
+  // (left join: rows without an account still seed channel-level state).
+  const rows: ProxyLogBackfillRow[] = await db.select({
+    channelId: schema.proxyLogs.channelId,
+    siteId: schema.accounts.siteId,
+    modelActual: schema.proxyLogs.modelActual,
+    modelRequested: schema.proxyLogs.modelRequested,
+    latencyMs: schema.proxyLogs.latencyMs,
+    firstByteLatencyMs: schema.proxyLogs.firstByteLatencyMs,
+    completionTokens: schema.proxyLogs.completionTokens,
+    isStream: schema.proxyLogs.isStream,
+    createdAt: schema.proxyLogs.createdAt,
+  }).from(schema.proxyLogs)
+    .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
+    .where(and(
+      eq(schema.proxyLogs.status, 'success'),
+      gte(schema.proxyLogs.createdAt, windowStartAt),
+    )).orderBy(schema.proxyLogs.createdAt)
+    .all();
+  if (rows.length === 0) return empty;
+
+  // A deleted channel's log rows must not resurrect state the persist TTL would only
+  // prune again; only seed channels that still exist.
+  const logChannelIds = Array.from(new Set(rows
+    .map((row) => row.channelId)
+    .filter((id): id is number => Number.isFinite(id) && (id ?? 0) > 0)));
+  const existingChannelIds = new Set(logChannelIds.length > 0
+    ? (await db.select({ id: schema.routeChannels.id })
+      .from(schema.routeChannels)
+      .where(inArray(schema.routeChannels.id, logChannelIds))
+      .all()).map((row) => row.id)
+    : []);
+
+  const qualityForRow = (row: ProxyLogBackfillRow) => resolveStreamTimingQualityMetrics(
+    Math.max(0, row.latencyMs ?? 0),
+    {
+      firstByteLatencyMs: row.firstByteLatencyMs,
+      completionTokens: row.completionTokens,
+      isStream: row.isStream,
+    },
+  );
+
+  // Group in chronological order (rows are ASC, so per-entity order is preserved).
+  const rowsByChannel = new Map<number, ProxyLogBackfillRow[]>();
+  const rowsBySite = new Map<number, ProxyLogBackfillRow[]>();
+  const rowsBySiteModel = new Map<string, ProxyLogBackfillRow[]>();
+  for (const row of rows) {
+    if (parseSqlUtcDateTimeMs(row.createdAt) == null) continue;
+    if (Number.isFinite(row.channelId) && (row.channelId ?? 0) > 0) {
+      const list = rowsByChannel.get(row.channelId!) ?? [];
+      list.push(row);
+      rowsByChannel.set(row.channelId!, list);
+    }
+    if (Number.isFinite(row.siteId) && (row.siteId ?? 0) > 0) {
+      const siteId = row.siteId!;
+      const siteList = rowsBySite.get(siteId) ?? [];
+      siteList.push(row);
+      rowsBySite.set(siteId, siteList);
+      const modelKey = normalizeModelAlias(row.modelActual || row.modelRequested || '');
+      if (modelKey) {
+        const key = `${siteId}::${modelKey}`;
+        const modelList = rowsBySiteModel.get(key) ?? [];
+        modelList.push(row);
+        rowsBySiteModel.set(key, modelList);
+      }
+    }
+  }
+
+  let seededChannels = 0;
+  // Sync blocks: the has() check and the replay happen without an await between them,
+  // so live traffic arriving mid-backfill cannot interleave with the seed decision.
+  for (const [channelId, channelRows] of rowsByChannel) {
+    if (!existingChannelIds.has(channelId)) continue;
+    if (channelQualityByChannelId.has(channelId)) continue;
+    for (const row of channelRows) {
+      recordChannelQualitySuccess(channelId, qualityForRow(row), parseSqlUtcDateTimeMs(row.createdAt)!);
+    }
+    seededChannels += 1;
+  }
+
+  let seededSiteModels = 0;
+  for (const [siteId, siteRows] of rowsBySite) {
+    if (!siteRuntimeHealthStates.has(siteId)) {
+      for (const row of siteRows) {
+        const eventMs = parseSqlUtcDateTimeMs(row.createdAt)!;
+        applyRuntimeHealthSuccess(
+          getOrCreateSiteRuntimeHealthState(siteId, eventMs),
+          Math.max(0, row.latencyMs ?? 0),
+          eventMs,
+          qualityForRow(row),
+        );
+      }
+    }
+  }
+  for (const [key, modelRows] of rowsBySiteModel) {
+    const separatorIndex = key.indexOf('::');
+    const siteId = Number(key.slice(0, separatorIndex));
+    const modelKey = key.slice(separatorIndex + 2);
+    if (!Number.isFinite(siteId) || siteId <= 0) continue;
+    if (siteModelRuntimeHealthStates.get(siteId)?.has(modelKey)) continue;
+    for (const row of modelRows) {
+      const eventMs = parseSqlUtcDateTimeMs(row.createdAt)!;
+      const modelState = getOrCreateSiteModelRuntimeHealthState(siteId, modelKey, eventMs);
+      if (!modelState) continue;
+      applyRuntimeHealthSuccess(
+        modelState,
+        Math.max(0, row.latencyMs ?? 0),
+        eventMs,
+        qualityForRow(row),
+      );
+    }
+    seededSiteModels += 1;
+  }
+
+  if (seededChannels > 0 || seededSiteModels > 0) {
+    scheduleSiteRuntimeHealthPersistence();
+  }
+
+  return { skipped: false, scannedRows: rows.length, seededChannels, seededSiteModels };
 }
 
 /**
@@ -3614,7 +3813,15 @@ export class TokenRouter {
         tpsSampleCount: state.tpsSampleCount,
         recentSuccessCount: recent.successCount,
         recentFailureCount: recent.failureCount,
-        recentSuccessRate: recent.sampleCount > 0 ? recent.successRate : null,
+        // Display truth, scoring stability — deliberately different numbers. The
+        // weighted-random path blends the PRIOR-SMOOTHED rate (successCount + 1) /
+        // (sampleCount + 2) by confidence (see the internal snapshot consumers); the
+        // badge shows the REAL decayed ratio successCount / sampleCount, so operators
+        // see true recent performance (0% after failures, 100% after clean successes)
+        // while the router stays un-persuadable by a single sample.
+        recentSuccessRate: recent.sampleCount >= RECENT_OUTCOME_DISPLAY_MIN_SAMPLES
+          ? recent.successCount / recent.sampleCount
+          : null,
         recentSampleCount: recent.sampleCount,
         lastUpdatedAtMs: state.lastUpdatedAtMs,
       };

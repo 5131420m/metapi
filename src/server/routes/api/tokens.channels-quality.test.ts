@@ -134,7 +134,8 @@ describe('GET /api/routes/:id/channels attaches channel quality', () => {
     expect(quality?.tpsEma).toBeCloseTo((120 * 1000) / (3200 - 250), 3);
     expect(quality?.recentSuccessCount).toBeCloseTo(3, 0);
     expect(quality?.recentFailureCount).toBeCloseTo(0, 1);
-    expect(quality?.recentSuccessRate).toBeCloseTo(4 / 5, 3);
+    // The badge rate is the real decayed ratio: 3/3 clean successes = 100%.
+    expect(quality?.recentSuccessRate).toBeCloseTo(1, 6);
   });
 
   it('returns an all-null quality object for channels without traffic', async () => {

@@ -124,8 +124,8 @@ describe('TokenRouter channel quality telemetry', () => {
     // Recent-window counts share the quality timescale, not the lifetime counters.
     expect(quality.recentSuccessCount).toBeCloseTo(5, 0);
     expect(quality.recentFailureCount).toBeCloseTo(0, 1);
-    // Recent rate is prior-smoothed: (5 successes + 1 prior) / (5 samples + 2 priors).
-    expect(quality.recentSuccessRate).toBeCloseTo(6 / 7, 3);
+    // Recent rate is the REAL decayed ratio shown to operators: 5/5 clean successes.
+    expect(quality.recentSuccessRate).toBeCloseTo(1, 6);
     expect(quality.lastUpdatedAtMs).not.toBeNull();
   });
 
@@ -153,13 +153,13 @@ describe('TokenRouter channel quality telemetry', () => {
     expect(firstQuality.recentSampleCount).toBeCloseTo(1, 0);
     expect(firstQuality.recentSuccessCount).toBeCloseTo(1, 0);
     expect(firstQuality.recentFailureCount).toBeCloseTo(0, 1);
-    // (1 + 1 prior success) / (1 + 2 priors).
-    expect(firstQuality.recentSuccessRate).toBeCloseTo(2 / 3, 3);
+    // Real decayed ratio: one clean success -> 100%.
+    expect(firstQuality.recentSuccessRate).toBeCloseTo(1, 6);
     expect(secondQuality.firstByteEmaMs).toBe(7000);
     expect(secondQuality.recentSampleCount).toBeCloseTo(2, 0);
     expect(secondQuality.recentSuccessCount).toBeCloseTo(1, 0);
     expect(secondQuality.recentFailureCount).toBeCloseTo(1, 0);
-    // 1 success + 1 failure -> (1 + 1) / (2 + 2).
+    // 1 success + 1 failure -> the real ratio 1/2.
     expect(secondQuality.recentSuccessRate).toBeCloseTo(0.5, 3);
     expect(secondQuality.recentSuccessRate).toBeLessThan(firstQuality.recentSuccessRate!);
   });
@@ -181,8 +181,8 @@ describe('TokenRouter channel quality telemetry', () => {
     const snapshots = await router.getChannelQualitySnapshots([channel.id]);
     const quality = snapshots[String(channel.id)];
     expect(quality.recentSampleCount).toBeCloseTo(2, 0);
-    expect(quality.recentSuccessRate).toBeLessThan(0.9);
-    expect(quality.recentSuccessRate).toBeGreaterThanOrEqual(0.2);
+    // Real ratio: 1 success + 1 throttled failure = exactly one half.
+    expect(quality.recentSuccessRate).toBeCloseTo(0.5, 3);
   });
 
   it('skips exempt first-byte timeouts in the channel recent window', async () => {
@@ -202,8 +202,8 @@ describe('TokenRouter channel quality telemetry', () => {
     const snapshots = await router.getChannelQualitySnapshots([channel.id]);
     const quality = snapshots[String(channel.id)];
     expect(quality.recentSampleCount).toBeCloseTo(1, 0);
-    // Only the success counts: the exempt timeout is not channel evidence.
-    expect(quality.recentSuccessRate).toBeCloseTo(2 / 3, 3);
+    // Only the success counts: the exempt timeout is not channel evidence — real ratio 1/1.
+    expect(quality.recentSuccessRate).toBeCloseTo(1, 6);
   });
 
   it('restores channel quality after a persistence round-trip', async () => {
@@ -448,7 +448,7 @@ describe('TokenRouter channel quality telemetry', () => {
     expect(quality.recentSuccessRate).toBeNull();
   });
 
-  it('keeps decayed counts that are still above the residue epsilon visible', async () => {
+  it('keeps decayed counts honest above the residue epsilon, but hides the rate below the display floor', async () => {
     const { channel } = await createChannelFixture('gpt-cq-residue-live', 'cq-rl');
     const router = new TokenRouter();
     for (let index = 0; index < 5; index += 1) {
@@ -463,8 +463,113 @@ describe('TokenRouter channel quality telemetry', () => {
 
     const snapshots = await router.getChannelQualitySnapshots([channel.id]);
     const quality = snapshots[String(channel.id)];
+    // The counts stay honest decayed values: above the residue epsilon, so not snapped.
     expect(quality.recentSampleCount).toBeCloseTo(0.3125, 6);
-    // Prior-smoothed rate over the decayed count, still non-null above the epsilon.
-    expect(quality.recentSuccessRate).toBeCloseTo((0.3125 + 1) / (0.3125 + 2), 6);
+    // …but 0.3125 is below the display floor (0.5): the prior would dominate the rate
+    // toward 0.5, and a badge cannot hang a coloured percentage off sub-count evidence.
+    expect(quality.recentSuccessRate).toBeNull();
+  });
+
+  /**
+   * In-flight guard regression: the persist guard used to compare the field against the
+   * pre-`.finally()` promise, never matched, and never cleared — so the FIRST persist per
+   * process was also the LAST one. Every later flush silently short-circuited on the settled
+   * guard (no error, no write) and the runtime-health blob stayed frozen at the boot-time
+   * snapshot while the in-memory state kept diverging — a restart then "lost" two days of
+   * quality data (observed in production).
+   */
+  it('persists the runtime-health blob on every flush, not only the first one per process', async () => {
+    const { channel } = await createChannelFixture('gpt-cq-persist', 'cq-p');
+    const router = new TokenRouter();
+    const readPersistedState = async () => {
+      const row = await db.select().from(schema.settings).get();
+      expect(row).toBeTruthy();
+      const payload = JSON.parse(row!.value as string);
+      return {
+        savedAtMs: payload.savedAtMs as number,
+        firstByteSampleCount: payload.channelById?.[String(channel.id)]?.firstByteSampleCount ?? 0,
+      };
+    };
+
+    await router.recordSuccess(channel.id, 4000, 0, 'gpt-cq-persist', undefined, {
+      firstByteLatencyMs: 300,
+      isStream: false,
+    });
+    await flushSiteRuntimeHealthPersistence();
+    const first = await readPersistedState();
+    expect(first.firstByteSampleCount).toBe(1);
+
+    // Let the wall clock advance so the two snapshots cannot share a savedAtMs millisecond.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    await router.recordSuccess(channel.id, 4000, 0, 'gpt-cq-persist', undefined, {
+      firstByteLatencyMs: 320,
+      isStream: false,
+    });
+    await flushSiteRuntimeHealthPersistence();
+    const second = await readPersistedState();
+
+    // The second flush must have actually written: a newer timestamp AND the second sample.
+    expect(second.savedAtMs).toBeGreaterThan(first.savedAtMs);
+    expect(second.firstByteSampleCount).toBe(2);
+
+    // And a third round, to prove the guard clears repeatedly rather than once.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await router.recordFailure(channel.id, { status: 500, errorText: 'boom' });
+    await flushSiteRuntimeHealthPersistence();
+    const third = await readPersistedState();
+    expect(third.savedAtMs).toBeGreaterThan(second.savedAtMs);
+    expect(third.firstByteSampleCount).toBe(2); // failures do not add FB samples
+  });
+
+  /**
+   * Display-floor regression: a REAL single observation decays through the 30-minute
+   * half-life into the band between the residue epsilon and one visible count. The
+   * prior smoothing still pulls the rate to 0.5 there, and a "成功率0/0/50%" red badge
+   * on evidence that cannot even round into a count is the same operator lie the residue
+   * fix removed — so the badge must show "—" once the decayed sample count drops below
+   * the display floor.
+   */
+  it('hides the success-rate badge once a real observation decays below the display floor', async () => {
+    const { channel } = await createChannelFixture('gpt-cq-display-floor', 'cq-df');
+    const router = new TokenRouter();
+    await router.recordSuccess(channel.id, 10_000, 0, 'gpt-cq-display-floor', undefined, {
+      firstByteLatencyMs: 2000,
+      isStream: false,
+    });
+    await flushSiteRuntimeHealthPersistence();
+    // 11h idle = 22 half-lives: the single count decays to 0.5^22 ≈ 2.4e-7 — above the
+    // residue epsilon (so the counts stay honest decayed values) yet far below one
+    // visible count. Observed live as "成功率0/0/50%" on production channel 21753.
+    await patchPersistedChannelWindowAgeMs(channel.id, 11 * 60 * 60 * 1000);
+
+    const snapshots = await router.getChannelQualitySnapshots([channel.id]);
+    const quality = snapshots[String(channel.id)];
+    // The decayed count survives the epsilon as honest (sub-visible) evidence…
+    expect(quality.recentSampleCount).toBeGreaterThan(0);
+    expect(quality.recentSampleCount).toBeLessThan(0.5);
+    // …but the rate badge must not render a prior-dominated 50% off it.
+    expect(quality.recentSuccessRate).toBeNull();
+  });
+
+  it('keeps showing the success rate while a single observation is still within the display floor', async () => {
+    const { channel } = await createChannelFixture('gpt-cq-display-live', 'cq-dl');
+    const router = new TokenRouter();
+    await router.recordSuccess(channel.id, 10_000, 0, 'gpt-cq-display-live', undefined, {
+      firstByteLatencyMs: 2000,
+      isStream: false,
+    });
+    await flushSiteRuntimeHealthPersistence();
+    // 20 minutes ≈ 0.67 half-lives: count ≈ 1 × 0.5^(2/3) ≈ 0.63 — still displayable.
+    await patchPersistedChannelWindowAgeMs(channel.id, 20 * 60 * 1000);
+
+    const snapshots = await router.getChannelQualitySnapshots([channel.id]);
+    const quality = snapshots[String(channel.id)];
+    expect(quality.recentSampleCount).toBeGreaterThan(0.5);
+    // The REAL decayed ratio of the single clean success — decay shrinks s and n by the
+    // same factor, so the ratio stays 1 while both counts fade together.
+    const expectedRate = quality.recentSuccessCount! / quality.recentSampleCount;
+    expect(quality.recentSuccessRate).toBeCloseTo(expectedRate, 6);
+    expect(quality.recentSuccessRate).toBeCloseTo(1, 6);
   });
 });

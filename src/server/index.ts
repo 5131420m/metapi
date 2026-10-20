@@ -26,6 +26,7 @@ import { updateCenterRoutes } from './routes/api/updateCenter.js';
 import { proxyRoutes } from './routes/proxy/router.js';
 import { startScheduler } from './services/checkinScheduler.js';
 import * as routeRefreshWorkflow from './services/routeRefreshWorkflow.js';
+import { backfillRuntimeHealthFromProxyLogs } from './services/tokenRouter.js';
 import { startProxyFileRetentionService, stopProxyFileRetentionService } from './services/proxyFileRetentionService.js';
 import { setLegacyProxyLogRetentionFallbackEnabled, stopProxyLogRetentionService } from './services/proxyLogRetentionService.js';
 import { buildStartupSummaryLines } from './services/startupInfo.js';
@@ -285,6 +286,17 @@ startSub2ApiManagedRefreshScheduler();
 startUpdateCenterPolling();
 startUsageAggregationProjectorScheduler();
 startAdminSnapshotWarmScheduler();
+// Seed runtime-health state from the last day of proxy logs: the scan is the gap
+// detector, and the per-entity fill-gaps guard keeps live-recorded state authoritative.
+void backfillRuntimeHealthFromProxyLogs().then((result) => {
+  if (!result.skipped && (result.seededChannels > 0 || result.seededSiteModels > 0)) {
+    console.info(
+      `Runtime health backfill: seeded ${result.seededChannels} channels and ${result.seededSiteModels} site-model states from ${result.scannedRows} recent proxy log rows`,
+    );
+  }
+}).catch((error) => {
+  console.warn(`Runtime health backfill failed: ${(error as Error)?.message || 'unknown error'}`);
+});
 try {
   await startOAuthLoopbackCallbackServers();
 } catch (error) {
