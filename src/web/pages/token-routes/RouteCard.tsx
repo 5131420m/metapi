@@ -99,6 +99,14 @@ type RouteCardProps = {
   // Per-channel cooldown release
   onClearChannelCooldown: (channelId: number, routeId: number) => void;
   clearingCooldownByChannel: Record<number, boolean>;
+  // Per-channel candy-question (degrade) probe. Optional so existing call sites and tests
+  // that only care about routing/priority keep working unchanged.
+  candyProbeTestingByChannel?: Record<number, boolean>;
+  onRunCandyProbe?: (channelId: number, routeId: number) => void;
+  onOpenCandyProbeDetail?: (channelId: number) => void;
+  /** Route-wide batch probe: progress by route id, present only while a sweep is running. */
+  candyProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
+  onRunCandyProbeAllChannels?: (routeId: number) => void;
   // Source group expansion
   expandedSourceGroupMap: Record<string, boolean>;
   onToggleSourceGroup: (groupKey: string) => void;
@@ -379,6 +387,11 @@ type SortableChannelShellProps = {
   onSiteBlockModel: (channelId: number, routeId: number) => void;
   onClearChannelCooldown: (channelId: number, routeId: number) => void;
   clearingCooldownByChannel: Record<number, boolean>;
+  candyProbeTestingByChannel?: Record<number, boolean>;
+  onRunCandyProbe?: (channelId: number, routeId: number) => void;
+  onOpenCandyProbeDetail?: (channelId: number) => void;
+  candyProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
+  onRunCandyProbeAllChannels?: (routeId: number) => void;
   railLabel: string;
   mobileRailLabel: string;
   railNodeStyle: CSSProperties;
@@ -411,6 +424,9 @@ function SortableChannelShell({
   onSiteBlockModel,
   onClearChannelCooldown,
   clearingCooldownByChannel,
+  candyProbeTestingByChannel,
+  onRunCandyProbe,
+  onOpenCandyProbeDetail,
   railLabel,
   mobileRailLabel,
   railNodeStyle,
@@ -537,6 +553,13 @@ function SortableChannelShell({
         onSiteBlockModel={channelManagementDisabled ? undefined : () => onSiteBlockModel(channel.id, routeId)}
         onClearCooldown={readOnlyRoute ? undefined : () => onClearChannelCooldown(channel.id, routeId)}
         clearingCooldown={!!clearingCooldownByChannel[channel.id]}
+        candyProbeTesting={!!candyProbeTestingByChannel?.[channel.id]}
+        onRunCandyProbe={
+          readOnlyRoute || !onRunCandyProbe || channel.candyProbeApplicable === false
+            ? undefined
+            : () => onRunCandyProbe(channel.id, routeId)
+        }
+        onOpenCandyProbeDetail={onOpenCandyProbeDetail ? () => onOpenCandyProbeDetail(channel.id) : undefined}
       />
     </div>
   );
@@ -577,6 +600,11 @@ function RouteCardInner({
   onSiteBlockModel,
   onClearChannelCooldown,
   clearingCooldownByChannel,
+  candyProbeTestingByChannel,
+  onRunCandyProbe,
+  onOpenCandyProbeDetail,
+  candyProbeBatchProgressByRoute,
+  onRunCandyProbeAllChannels,
   expandedSourceGroupMap,
   onToggleSourceGroup,
 }: RouteCardProps) {
@@ -656,6 +684,36 @@ function RouteCardInner({
     return (
       <button onClick={() => onClearCooldown(route.id)} className="btn btn-link btn-link-info" disabled={clearingCooldown}>
         {clearingCooldown ? tr('清除中...') : tr('清除冷却')}
+      </button>
+    );
+  };
+  const renderCandyProbeAllButton = () => {
+    if (readOnlyRoute || !onRunCandyProbeAllChannels) return null;
+    const progress = candyProbeBatchProgressByRoute?.[route.id] ?? null;
+    const running = progress !== null;
+    // `channels?.length ?? route.channelCount` would be wrong: `0 ?? x` is 0, so an empty or
+    // not-yet-loaded list would read as "no channels" even when the route reports some.
+    const loadedChannelCount = channels && channels.length > 0 ? channels.length : null;
+    const channelTotal = progress?.total ?? loadedChannelCount ?? route.channelCount ?? 0;
+    if (!running && channelTotal <= 0) return null;
+    // Every channel on this route is a non-conversation model: a sweep could only fire a
+    // request per channel and collect the same rejection each time.
+    if (!running && channels && channels.length > 0
+      && channels.every((channel) => channel.candyProbeApplicable === false)) {
+      return null;
+    }
+    return (
+      <button
+        onClick={() => onRunCandyProbeAllChannels(route.id)}
+        className="btn btn-link btn-link-info"
+        disabled={running}
+        data-tooltip={running
+          ? undefined
+          : '对该路由下所有通道依次做糖果题检测（只记录结果，不改变路由；每次检测会写入使用日志）'}
+      >
+        {running
+          ? `${tr('测智商中')} ${progress.done}/${progress.total}`
+          : `🍬 ${tr('一键测智商')}`}
       </button>
     );
   };
@@ -897,6 +955,7 @@ function RouteCardInner({
           </div>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            {renderCandyProbeAllButton()}
             {renderClearCooldownButton()}
             {!readOnlyRoute && (explicitGroupRoute || !exactRoute) && (
               <button onClick={() => onEdit(route)} className="btn btn-link">{tr('编辑群组')}</button>
@@ -976,6 +1035,7 @@ function RouteCardInner({
             </div>
             {!readOnlyRoute && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                {renderCandyProbeAllButton()}
                 {renderClearCooldownButton()}
                 {(explicitGroupRoute || !exactRoute) && (
                   <button onClick={() => onEdit(route)} className="btn btn-link">{tr('编辑群组')}</button>
@@ -1225,6 +1285,9 @@ function RouteCardInner({
                             onSiteBlockModel={onSiteBlockModel}
                             onClearChannelCooldown={onClearChannelCooldown}
                             clearingCooldownByChannel={clearingCooldownByChannel}
+                            candyProbeTestingByChannel={candyProbeTestingByChannel}
+                            onRunCandyProbe={onRunCandyProbe}
+                            onOpenCandyProbeDetail={onOpenCandyProbeDetail}
                             railLabel={railSection ? `P${bucketIndex} · ${railSection.channelCount}` : railLabel}
                             mobileRailLabel={mobileRailLabel}
                             railNodeStyle={railNodeStyle}
@@ -1312,6 +1375,11 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.onSiteBlockModel !== next.onSiteBlockModel
     || prev.onClearChannelCooldown !== next.onClearChannelCooldown
     || prev.clearingCooldownByChannel !== next.clearingCooldownByChannel
+    || prev.candyProbeTestingByChannel !== next.candyProbeTestingByChannel
+    || prev.onRunCandyProbe !== next.onRunCandyProbe
+    || prev.onOpenCandyProbeDetail !== next.onOpenCandyProbeDetail
+    || prev.candyProbeBatchProgressByRoute !== next.candyProbeBatchProgressByRoute
+    || prev.onRunCandyProbeAllChannels !== next.onRunCandyProbeAllChannels
     || prev.onToggleSourceGroup !== next.onToggleSourceGroup
     || prev.clearingCooldown !== next.clearingCooldown
     || prev.updatingRoutingStrategy !== next.updatingRoutingStrategy

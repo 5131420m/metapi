@@ -12,6 +12,7 @@ import {
   toPersistenceJson,
 } from '../../services/downstreamApiKeyService.js';
 import { formatUtcSqlDateTime } from '../../services/localTimeService.js';
+import { meteredProxyLogCondition } from '../../services/proxyLogQueries.js';
 import type { DownstreamExcludedCredentialRef } from '../../services/downstreamPolicyTypes.js';
 import {
   readDownstreamApiKeyTrendBuckets,
@@ -340,6 +341,9 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
         .where(and(
           inArray(schema.proxyLogs.downstreamApiKeyId, ids),
           ...(sinceUtc ? [sql`${schema.proxyLogs.createdAt} >= ${sinceUtc}`] : []),
+          // Key usage belongs to the customer, not to metapi's own probe runs (which have
+          // no downstream key at all, but the exclusion keeps the two views consistent).
+          meteredProxyLogCondition(),
         ))
         .groupBy(schema.proxyLogs.downstreamApiKeyId)
         .all()
@@ -428,6 +432,7 @@ export async function downstreamApiKeysRoutes(app: FastifyInstance) {
         .where(and(
           eq(schema.proxyLogs.downstreamApiKeyId, id),
           ...(sinceUtc ? [sql`${schema.proxyLogs.createdAt} >= ${sinceUtc}`] : []),
+          meteredProxyLogCondition(),
         ))
         .get();
 

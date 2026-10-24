@@ -371,6 +371,12 @@ class ProxyChannelCoordinator {
   async acquireSiteLease(input: {
     siteId: number;
     maxConcurrency?: number | null;
+    /**
+     * Per-caller wait override. `0` means "do not queue behind real traffic": background
+     * work (the candy probe's schedule) must not make a busy site's real requests wait
+     * longer, so it takes the busy answer instead of a slot.
+     */
+    waitMs?: number;
   }): Promise<AcquireProxySiteLeaseResult> {
     const siteId = Math.trunc(input.siteId || 0);
     const concurrencyLimit = normalizeSiteConcurrencyLimit(input.maxConcurrency);
@@ -390,7 +396,9 @@ class ProxyChannelCoordinator {
       };
     }
 
-    const waitMs = getChannelQueueWaitMs();
+    const waitMs = input.waitMs !== undefined
+      ? Math.max(0, Math.trunc(input.waitMs))
+      : getChannelQueueWaitMs();
     if (waitMs <= 0) {
       return { status: 'timeout', waitMs: 0, scope: 'site' };
     }

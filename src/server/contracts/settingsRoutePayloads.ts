@@ -15,6 +15,8 @@ const runtimeSettingsPayloadSchema = z.object({
   payloadRules: z.unknown().optional(),
   modelAvailabilityProbeEnabled: z.boolean().optional(),
   channelRecoveryProbeEnabled: z.boolean().optional(),
+  candyProbeScheduleEnabled: z.boolean().optional(),
+  candyProbeScheduleRecheckHours: finiteNumber.min(1).max(72).optional(),
   codexUpstreamWebsocketEnabled: z.boolean().optional(),
   responsesCompactFallbackToResponsesEnabled: z.boolean().optional(),
   disableCrossProtocolFallback: z.boolean().optional(),
@@ -141,6 +143,8 @@ function formatSettingsPayloadError(error: z.ZodError): string {
   const firstPath = firstIssue?.path[0];
   const runtimeMessages: Record<string, string> = {
     channelRecoveryProbeEnabled: '渠道恢复探针开关格式无效：需要 boolean',
+    candyProbeScheduleEnabled: '糖果题巡检开关格式无效：需要 boolean',
+    candyProbeScheduleRecheckHours: '糖果题巡检复测周期必须是 1-72 之间的整数小时',
     codexUpstreamWebsocketEnabled: 'Codex 上游 WebSocket 开关格式无效：需要 boolean',
     responsesCompactFallbackToResponsesEnabled: 'Compact 回退到 Responses 开关格式无效：需要 boolean',
     disableCrossProtocolFallback: '跨协议回退开关格式无效：需要 boolean',

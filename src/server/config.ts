@@ -153,6 +153,18 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     modelAvailabilityProbeTimeoutMs: Math.max(3_000, Math.trunc(parseNumber(env.MODEL_AVAILABILITY_PROBE_TIMEOUT_MS, 15_000))),
     modelAvailabilityProbeConcurrency: Math.max(1, Math.min(16, Math.trunc(parseNumber(env.MODEL_AVAILABILITY_PROBE_CONCURRENCY, 1)))),
     channelRecoveryProbeEnabled: parseBoolean(env.CHANNEL_RECOVERY_PROBE_ENABLED, false),
+    // Candy-question schedule. Off by default: every scheduled run is real upstream traffic
+    // against quota-limited keys, so it must be a deliberate choice (see candyProbeScheduler).
+    candyProbeScheduleEnabled: parseBoolean(env.CANDY_PROBE_SCHEDULE_ENABLED, false),
+    // Per-channel recheck cadence, in hours. One tick probes at most `…MaxPerTick`
+    // channels, so coverage spreads across ticks rather than landing in one burst.
+    candyProbeScheduleRecheckHours: Math.min(72, Math.max(1, Math.trunc(parseNumber(env.CANDY_PROBE_SCHEDULE_RECHECK_HOURS, 12)))),
+    candyProbeScheduleTickMs: Math.max(60_000, Math.trunc(parseNumber(env.CANDY_PROBE_SCHEDULE_TICK_MS, 5 * 60_000))),
+    candyProbeScheduleMaxPerTick: Math.min(8, Math.max(1, Math.trunc(parseNumber(env.CANDY_PROBE_SCHEDULE_MAX_PER_TICK, 1)))),
+    // Rolling-24h ceiling on scheduled runs (= upstream requests: a run is one question,
+    // one request), whatever the tick and recheck cadence say: the hard cost guard for
+    // quota-limited upstream keys.
+    candyProbeScheduleDailyMaxRuns: Math.min(1000, Math.max(1, Math.trunc(parseNumber(env.CANDY_PROBE_SCHEDULE_DAILY_MAX_RUNS, 48)))),
     proxyLogRetentionDays: Math.max(0, Math.trunc(parseNumber(env.PROXY_LOG_RETENTION_DAYS, 30))),
     proxyLogRetentionPruneIntervalMinutes: Math.max(1, Math.trunc(parseNumber(env.PROXY_LOG_RETENTION_PRUNE_INTERVAL_MINUTES, 30))),
     proxyFileRetentionDays: Math.max(0, Math.trunc(parseNumber(env.PROXY_FILE_RETENTION_DAYS, 30))),

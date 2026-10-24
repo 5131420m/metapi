@@ -41,6 +41,59 @@ export type RouteChannelQuality = {
   lastUpdatedAtMs: number | null;
 };
 
+// The verdict, sample and question shapes are shared with the server: a new verdict value must
+// not be able to compile on one side and fall through the other.
+import type {
+  CandyProbeExpectation,
+  CandyProbeQuestionInfo,
+  CandyProbeSampleResult,
+  CandyProbeTrigger,
+  CandyProbeVerdict,
+} from '../../../shared/candyProbe.js';
+
+export type {
+  CandyProbeExpectation,
+  CandyProbeQuestionInfo,
+  CandyProbeSampleResult,
+  CandyProbeTrigger,
+  CandyProbeVerdict,
+};
+
+/**
+ * Display-only degrade-check verdict. `fresh` is false once the verdict is older than the
+ * freshness TTL; the list payload omits `samples` (fetched on demand for the detail panel).
+ *
+ * One question, one answer: `score` is 1 or 0 and `total` is always 1. `validSampleCount`
+ * is 1 when the answer was readable, 0 when the run could not be scored.
+ */
+export type CandyProbeSnapshot = {
+  channelId: number;
+  routeId: number | null;
+  model: string;
+  fingerprint: string;
+  verdict: CandyProbeVerdict;
+  score: number;
+  total: number;
+  endpoint: string | null;
+  actualModel: string | null;
+  latencyMs: number | null;
+  checkedAt: string;
+  reason: string | null;
+  question: CandyProbeQuestionInfo;
+  /** 1 when the answer was readable, 0 when it was not. */
+  validSampleCount: number;
+  /** What a wrong answer may mean for THIS model; guards the "降智" wording. */
+  expectation: CandyProbeExpectation;
+  /** What started the run; missing on payloads older than the schedule feature (manual runs). */
+  trigger?: CandyProbeTrigger;
+  fresh: boolean;
+  expiresAt: string;
+};
+
+export type CandyProbeResult = Omit<CandyProbeSnapshot, 'fresh' | 'expiresAt'> & {
+  samples: CandyProbeSampleResult[];
+};
+
 export type RouteChannel = {
   id: number;
   routeId?: number;
@@ -56,6 +109,16 @@ export type RouteChannel = {
   cooldownUntil?: string | null;
   /** Display-only recent quality measured on this channel; null before first traffic. */
   quality?: RouteChannelQuality | null;
+  /** Display-only candy-question verdict; null before the first manual probe. */
+  candyProbe?: CandyProbeSnapshot | null;
+  /**
+   * Whether a probe could succeed at all (false for a non-conversation model).
+   *
+   * Computed by the server with the same rule the probe enforces, so the UI never has to
+   * duplicate model-family knowledge — and never offers a button that can only come back
+   * rejected.
+   */
+  candyProbeApplicable?: boolean;
   account?: {
     username: string | null;
     accessToken?: string | null;
@@ -179,6 +242,10 @@ export type SortableChannelRowProps = {
   onSiteBlockModel?: () => void;
   clearingCooldown?: boolean;
   onClearCooldown?: () => void;
+  /** A candy-question probe is currently running for this channel. */
+  candyProbeTesting?: boolean;
+  onRunCandyProbe?: () => void;
+  onOpenCandyProbeDetail?: () => void;
 };
 
 export type GroupRouteItem = {

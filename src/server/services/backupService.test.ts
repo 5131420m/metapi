@@ -6,6 +6,7 @@ import { asc, eq } from 'drizzle-orm';
 
 type DbModule = typeof import('../db/index.js');
 type BackupServiceModule = typeof import('./backupService.js');
+type CandyProbeStoreModule = typeof import('./candyProbe/resultStore.js');
 type SiteRow = DbModule['schema']['sites']['$inferSelect'];
 type AccountRow = DbModule['schema']['accounts']['$inferSelect'];
 type AccountTokenRow = DbModule['schema']['accountTokens']['$inferSelect'];
@@ -17,6 +18,7 @@ describe('backupService', () => {
   let db: DbModule['db'];
   let schema: DbModule['schema'];
   let backupService: BackupServiceModule;
+  let candyProbeStore: CandyProbeStoreModule;
   let dataDir = '';
 
   beforeAll(async () => {
@@ -26,13 +28,16 @@ describe('backupService', () => {
     await import('../db/migrate.js');
     const dbModule = await import('../db/index.js');
     const serviceModule = await import('./backupService.js');
+    const storeModule = await import('./candyProbe/resultStore.js');
 
     db = dbModule.db;
     schema = dbModule.schema;
     backupService = serviceModule;
+    candyProbeStore = storeModule;
   });
 
   beforeEach(async () => {
+    candyProbeStore.resetCandyProbeStoreForTests();
     await db.delete(schema.routeChannels).run();
     await db.delete(schema.routeGroupSources).run();
     await db.delete(schema.tokenRoutes).run();
@@ -356,6 +361,21 @@ describe('backupService', () => {
     ]);
   });
 
+  it('does not export candy-probe verdicts', async () => {
+    // Verdicts describe the channels of THIS box. Shipping them would let another instance
+    // import them and show the source box's verdicts as its own.
+    await db.insert(schema.settings).values([
+      { key: 'candy_probe_results_v1', value: JSON.stringify({ '1': { channelId: 1, verdict: 'fail' } }) },
+      { key: 'routing_fallback_unit_cost', value: JSON.stringify(0.25) },
+    ]).run();
+
+    const exported = await backupService.exportBackup('preferences') as any;
+    const exportedSettingKeys = exported.preferences.settings.map((row: { key: string }) => row.key);
+
+    expect(exportedSettingKeys).toContain('routing_fallback_unit_cost');
+    expect(exportedSettingKeys).not.toContain('candy_probe_results_v1');
+  });
+
   it('does not export runtime database config in preferences backups', async () => {
     await db.insert(schema.settings).values([
       { key: 'db_type', value: JSON.stringify('postgres') },
@@ -371,6 +391,75 @@ describe('backupService', () => {
     expect(exportedSettingKeys).not.toContain('db_type');
     expect(exportedSettingKeys).not.toContain('db_url');
     expect(exportedSettingKeys).not.toContain('db_ssl');
+  });
+
+  it('clears persisted candy-probe verdicts on import, so a restart cannot revive them', async () => {
+    // The scenario: the running instance has verdicts in memory for channels that the import
+    // is about to replace. Those verdicts describe the OLD channels, and the imported data
+    // commonly reuses ids — so if they end up in the settings row, the next start hydrates
+    // them as the new database's own.
+    //
+    // Only a factory reset wipes `settings`; an import does not, so the row has to be cleared
+    // explicitly. (With an EMPTY in-memory store the old flush happened to write `{}` and hid
+    // the bug — the store must be populated for this test to discriminate.)
+    const staleResult = {
+      channelId: 5,
+      routeId: 2,
+      model: 'gpt-5.6-sol',
+      fingerprint: 'codex',
+      verdict: 'fail',
+      score: 0,
+      total: 3,
+      endpoint: 'responses',
+      actualModel: 'gpt-5.6-sol',
+      latencyMs: 12,
+      checkedAt: new Date().toISOString(),
+      reason: 'stale',
+      parseMode: 'numbered',
+      questions: [],
+      config: { model: 'gpt-5.6-sol', accountId: 2, tokenId: null },
+    };
+    candyProbeStore.recordCandyProbeResult(staleResult as any);
+
+    // An accounts import replaces the channels; an empty export of this box is enough.
+    const exported = await backupService.exportBackup('accounts') as Record<string, unknown>;
+    await backupService.importBackup(exported);
+
+    const row = await db.select().from(schema.settings)
+      .where(eq(schema.settings.key, candyProbeStore.CANDY_PROBE_SETTING_KEY))
+      .get();
+    expect(JSON.parse((row?.value as string) ?? '{}')).toEqual({});
+
+    // What a restart does: read the row back. Nothing must come back.
+    await candyProbeStore.hydrateCandyProbeResultsFromSettings();
+    expect(candyProbeStore.getCandyProbeResultForChannel(5)).toBeNull();
+  });
+
+  it('keeps candy-probe verdicts on a preferences-only import: the channels did not change', async () => {
+    candyProbeStore.recordCandyProbeResult({
+      channelId: 7,
+      routeId: 3,
+      model: 'gpt-5.6-sol',
+      fingerprint: 'codex',
+      verdict: 'pass',
+      score: 1,
+      total: 1,
+      endpoint: 'responses',
+      actualModel: 'gpt-5.6-sol',
+      latencyMs: 12,
+      checkedAt: new Date().toISOString(),
+      reason: null,
+      config: { model: 'gpt-5.6-sol', accountId: 2, tokenId: null },
+    } as any);
+
+    await backupService.importBackup({
+      version: '2.1',
+      timestamp: Date.now(),
+      type: 'preferences',
+      preferences: { settings: [{ key: 'routing_fallback_unit_cost', value: '0.25' }] },
+    } as any);
+
+    expect(candyProbeStore.getCandyProbeResultForChannel(7)?.verdict).toBe('pass');
   });
 
   it('ignores imported runtime database config settings', async () => {

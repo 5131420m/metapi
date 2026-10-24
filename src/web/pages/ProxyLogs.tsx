@@ -21,6 +21,7 @@ import {
   type ProxyLogUsageSource,
 } from "../api.js";
 import { useToast } from "../components/Toast.js";
+import { CANDY_PROBE_CLIENT_FAMILY } from "../../shared/candyProbe.js";
 import { ModelBadge } from "../components/BrandIcon.js";
 import CenteredModal from "../components/CenteredModal.js";
 import MobileDrawer from "../components/MobileDrawer.js";
@@ -92,6 +93,9 @@ const PROXY_LOG_CLIENT_FAMILY_LABELS: Record<string, string> = {
   claude_code: "Claude Code",
   gemini_cli: "Gemini CLI",
   generic: "通用",
+  // metapi's own candy-question probe: visible here so a click in 路由 leaves an audit
+  // trail, without ever counting as downstream client traffic in the aggregates.
+  [CANDY_PROBE_CLIENT_FAMILY]: "糖果题检测",
 };
 const EMPTY_SUMMARY: ProxyLogsSummary = {
   totalCount: 0,

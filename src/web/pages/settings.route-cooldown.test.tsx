@@ -138,6 +138,7 @@ describe('Settings route cooldown cap', () => {
         tokenRouterFailureCooldownMaxSec: 10,
         disableCrossProtocolFallback: false,
         channelRecoveryProbeEnabled: false,
+        // The candy schedule section is parked, so a routing save does not send its keys.
       });
     } finally {
       root?.unmount();
@@ -246,6 +247,7 @@ describe('Settings route cooldown cap', () => {
         tokenRouterFailureCooldownMaxSec: 30 * 24 * 60 * 60,
         disableCrossProtocolFallback: false,
         channelRecoveryProbeEnabled: false,
+        // The candy schedule section is parked, so a routing save does not send its keys.
       });
     } finally {
       root?.unmount();

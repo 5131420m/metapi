@@ -63,6 +63,19 @@ export function applyRuntimeSettings(
     config.channelRecoveryProbeEnabled = channelRecoveryProbeEnabled;
   }
 
+  const candyProbeScheduleEnabled = parseSettingFromMap<boolean>(settingsMap, 'candy_probe_schedule_enabled');
+  if (typeof candyProbeScheduleEnabled === 'boolean') {
+    config.candyProbeScheduleEnabled = candyProbeScheduleEnabled;
+  }
+
+  const candyProbeScheduleRecheckHours = parseSettingFromMap<number>(settingsMap, 'candy_probe_schedule_recheck_hours');
+  if (typeof candyProbeScheduleRecheckHours === 'number'
+    && Number.isFinite(candyProbeScheduleRecheckHours)
+    && candyProbeScheduleRecheckHours >= 1
+    && candyProbeScheduleRecheckHours <= 72) {
+    config.candyProbeScheduleRecheckHours = Math.trunc(candyProbeScheduleRecheckHours);
+  }
+
   const codexUpstreamWebsocketEnabled = parseSettingFromMap<boolean>(settingsMap, 'codex_upstream_websocket_enabled');
   if (typeof codexUpstreamWebsocketEnabled === 'boolean') {
     config.codexUpstreamWebsocketEnabled = codexUpstreamWebsocketEnabled;

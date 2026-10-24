@@ -42,6 +42,8 @@ import type {
   MissingTokenRouteSiteActionItem,
   MissingTokenGroupRouteSiteActionItem,
   GroupRouteItem,
+  CandyProbeResult,
+  RouteChannel,
 } from './token-routes/types.js';
 import {
   ROUTE_RENDER_CHUNK,
@@ -64,6 +66,8 @@ import RouteFilterBar, { type EnabledFilter } from './token-routes/RouteFilterBa
 import ManualRoutePanel from './token-routes/ManualRoutePanel.js';
 import RouteCard from './token-routes/RouteCard.js';
 import AddChannelModal from './token-routes/AddChannelModal.js';
+import CandyProbeDetailModal from './token-routes/candyProbe/CandyProbeDetailModal.js';
+import { buildCandyProbeBatchSummary, buildCandyProbeVerdictLabel, formatCandyProbeFingerprint } from './token-routes/candyProbe/presentation.js';
 
 const EMPTY_ROUTE_CANDIDATE_VIEW: RouteCandidateView = {
   routeCandidates: [],
@@ -213,6 +217,22 @@ export default function TokenRoutes() {
   const [updatingRoutingStrategyByRoute, setUpdatingRoutingStrategyByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByRoute, setClearingCooldownByRoute] = useState<Record<number, boolean>>({});
   const [clearingCooldownByChannel, setClearingCooldownByChannel] = useState<Record<number, boolean>>({});
+  const [candyProbeTestingByChannel, setCandyProbeTestingByChannel] = useState<Record<number, boolean>>({});
+  const [candyProbeBatchByRoute, setCandyProbeBatchByRoute] = useState<Record<number, { done: number; total: number }>>({});
+  const [candyProbeDetail, setCandyProbeDetail] = useState<{
+    channelId: number;
+    label: string;
+    result: CandyProbeResult | null;
+  } | null>(null);
+  const [candyProbeDetailLoading, setCandyProbeDetailLoading] = useState(false);
+  /**
+   * Latest detail-fetch id. Bumped on every open and on close, so a response that arrives
+   * after the user moved to another channel (or closed the modal) is ignored — including its
+   * `finally`, which used to clear the loading state of a request that was still running.
+   */
+  const candyProbeDetailRequestRef = useRef(0);
+  /** Routes whose candy sweep has been clicked but has not set its progress state yet. */
+  const candyProbeBatchStartingRef = useRef<Set<number>>(new Set());
 
   const [decisionByRoute, setDecisionByRoute] = useState<Record<number, RouteDecision | null>>({});
   const [loadingDecision, setLoadingDecision] = useState(false);
@@ -1279,6 +1299,177 @@ export default function TokenRoutes() {
     }
   };
 
+  const handleRunCandyProbe = async (channelId: number, routeId: number) => {
+    if (candyProbeTestingByChannel[channelId]) return;
+    setCandyProbeTestingByChannel((prev) => ({ ...prev, [channelId]: true }));
+    try {
+      const response = await api.runChannelCandyProbe(channelId);
+      const result = response?.result as CandyProbeResult | null | undefined;
+      // The fingerprint goes through the same label table the badge uses; showing the raw id
+      // here made the toast disagree with the row next to it.
+      const fingerprintLabel = formatCandyProbeFingerprint(result?.fingerprint);
+      if (result?.verdict === 'pass') {
+        toast.success(`糖果题通过（${fingerprintLabel} 指纹）`);
+      } else if (result?.verdict === 'fail') {
+        toast.error(`${buildCandyProbeVerdictLabel('fail', result.expectation)}：${result?.reason || '答案错误'}（${fingerprintLabel} 指纹）`);
+      } else {
+        toast.info(`检测未完成：${result?.reason || '未能判分'}`);
+      }
+
+      try {
+        await loadChannels(routeId, true);
+      } catch {
+        toast.info('检测已完成，但通道列表刷新失败');
+      }
+    } catch (e: any) {
+      toast.error(e.message || '糖果题检测失败');
+    } finally {
+      setCandyProbeTestingByChannel((prev) => ({ ...prev, [channelId]: false }));
+    }
+  };
+
+  /**
+   * Route-wide sweep: probe every channel in the route with a small concurrency.
+   *
+   * Deliberately client-driven rather than one long server batch call: each channel's own
+   * endpoint is already the unit of truth, so badges fill in as the sweep advances and one
+   * slow/stalled channel cannot hold the rest hostage. Concurrency stays low because every
+   * probe is a real upstream completion.
+   */
+  const handleRunCandyProbeAllChannels = async (routeId: number) => {
+    // A synchronous guard: the progress state is only set after the channel list loads, so
+    // a second click during that await would otherwise start a second sweep.
+    if (candyProbeBatchByRoute[routeId] || candyProbeBatchStartingRef.current.has(routeId)) return;
+    candyProbeBatchStartingRef.current.add(routeId);
+    try {
+      await runCandyProbeSweep(routeId);
+    } finally {
+      candyProbeBatchStartingRef.current.delete(routeId);
+    }
+  };
+
+  const runCandyProbeSweep = async (routeId: number) => {
+    let targets: RouteChannel[] = [];
+    try {
+      const loaded = await loadChannels(routeId, true);
+      targets = Array.isArray(loaded) ? loaded : [];
+    } catch {
+      toast.error('读取通道列表失败，无法批量检测');
+      return;
+    }
+    if (targets.length <= 0) {
+      toast.info('该路由下没有通道');
+      return;
+    }
+
+    // A non-conversation model (an embedding, a reranker) can only come back rejected, so a
+    // sweep over it is one doomed request per channel. Counted as 跳过 rather than 失败.
+    const probeable = targets.filter((channel) => channel.candyProbeApplicable !== false);
+    const skipped = targets.length - probeable.length;
+    if (probeable.length <= 0) {
+      toast.info('该路由下没有可做糖果题检测的通道（非对话模型不适用）');
+      return;
+    }
+
+    setCandyProbeBatchByRoute((prev) => ({ ...prev, [routeId]: { done: 0, total: probeable.length } }));
+    // The fail tier is graded by the badge's own vocabulary: only an `expected` model's
+    // wrong answer counts as 疑似降智, everything else is a plain 答错.
+    const tally = { pass: 0, degraded: 0, wrong: 0, inconclusive: 0, rejected: 0 };
+
+    const runOne = async (channel: RouteChannel) => {
+      setCandyProbeTestingByChannel((prev) => ({ ...prev, [channel.id]: true }));
+      try {
+        const response = await api.runChannelCandyProbe(channel.id);
+        const result = response?.result as CandyProbeResult | null | undefined;
+        if (result?.verdict === 'pass') tally.pass += 1;
+        else if (result?.verdict === 'fail') {
+          if (result.expectation === 'expected') tally.degraded += 1;
+          else tally.wrong += 1;
+        } else tally.inconclusive += 1;
+      } catch {
+        // A channel that cannot be probed at all (non-conversation model, no credential)
+        // counts as rejected rather than as a degraded verdict.
+        tally.rejected += 1;
+      } finally {
+        setCandyProbeTestingByChannel((prev) => ({ ...prev, [channel.id]: false }));
+        setCandyProbeBatchByRoute((prev) => {
+          const current = prev[routeId];
+          if (!current) return prev;
+          return { ...prev, [routeId]: { done: current.done + 1, total: current.total } };
+        });
+      }
+    };
+
+    const queue = [...probeable];
+    const workerCount = Math.min(2, queue.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        const next = queue.shift();
+        if (!next) break;
+        await runOne(next);
+      }
+    }));
+
+    setCandyProbeBatchByRoute((prev) => {
+      const next = { ...prev };
+      delete next[routeId];
+      return next;
+    });
+
+    // `rejected` is shown separately from the verdicts: a channel the probe could not even
+    // reach is not evidence about the model, and folding it into "未完成" would hide that.
+    const summary = buildCandyProbeBatchSummary(tally, skipped);
+    if (tally.degraded > 0) toast.error(`批量检测完成：${summary}`);
+    else if (tally.wrong > 0) toast.info(`批量检测完成：${summary}`);
+    else toast.success(`批量检测完成：${summary}`);
+
+    try {
+      await loadChannels(routeId, true);
+    } catch {
+      toast.info('检测已完成，但通道列表刷新失败');
+    }
+  };
+
+  const findChannelById = (channelId: number) => {
+    for (const channels of Object.values(channelsByRouteId)) {
+      const found = channels.find((channel) => channel.id === channelId);
+      if (found) return found;
+    }
+    return null;
+  };
+
+  const handleOpenCandyProbeDetail = async (channelId: number) => {
+    // Sequence guard: opening another channel (or closing the modal) while a fetch is in
+    // flight must not let the older response write to the newer view, and its `finally` must
+    // not clear the loading state of a request that is still running.
+    const requestId = candyProbeDetailRequestRef.current + 1;
+    candyProbeDetailRequestRef.current = requestId;
+    const isCurrent = () => candyProbeDetailRequestRef.current === requestId;
+
+    const channel = findChannelById(channelId);
+    const label = channel
+      ? `${channel.sourceModel || '未知模型'} @ ${channel.site?.name || '未知站点'} #${channelId}`
+      : `通道 #${channelId}`;
+    setCandyProbeDetail({ channelId, label, result: null });
+    setCandyProbeDetailLoading(true);
+    try {
+      const response = await api.getChannelCandyProbe(channelId);
+      if (!isCurrent()) return;
+      setCandyProbeDetail((current) => (
+        current && current.channelId === channelId
+          ? { ...current, result: (response?.result as CandyProbeResult | null) ?? null }
+          : current
+      ));
+    } catch (e: any) {
+      // A superseded request must not report a failure for a view the user has left.
+      if (!isCurrent()) return;
+      toast.error(e.message || '读取糖果题检测结果失败');
+      setCandyProbeDetail(null);
+    } finally {
+      if (isCurrent()) setCandyProbeDetailLoading(false);
+    }
+  };
+
   const handleClearRouteCooldown = async (routeId: number) => {
     if (clearingCooldownByRoute[routeId]) return;
     setClearingCooldownByRoute((prev) => ({ ...prev, [routeId]: true }));
@@ -1553,6 +1744,27 @@ export default function TokenRoutes() {
   handleClearRouteCooldownRef.current = handleClearRouteCooldown;
   const stableClearRouteCooldown = useCallback(
     (routeId: number) => handleClearRouteCooldownRef.current(routeId),
+    [],
+  );
+  // Stable identities keep the memoized RouteCard from re-rendering on every toast/state tick.
+  const handleRunCandyProbeRef = useRef(handleRunCandyProbe);
+  handleRunCandyProbeRef.current = handleRunCandyProbe;
+  const stableRunCandyProbe = useCallback(
+    (channelId: number, routeId: number) => handleRunCandyProbeRef.current(channelId, routeId),
+    [],
+  );
+  const handleOpenCandyProbeDetailRef = useRef(handleOpenCandyProbeDetail);
+  handleOpenCandyProbeDetailRef.current = handleOpenCandyProbeDetail;
+  const stableOpenCandyProbeDetail = useCallback(
+    (channelId: number) => handleOpenCandyProbeDetailRef.current(channelId),
+    [],
+  );
+  const handleRunCandyProbeAllChannelsRef = useRef(handleRunCandyProbeAllChannels);
+  handleRunCandyProbeAllChannelsRef.current = handleRunCandyProbeAllChannels;
+  const stableRunCandyProbeAllChannels = useCallback(
+    (routeId: number) => {
+      void handleRunCandyProbeAllChannelsRef.current(routeId);
+    },
     [],
   );
 
@@ -1920,6 +2132,11 @@ export default function TokenRoutes() {
                     onSiteBlockModel={stableSiteBlockModel}
                     clearingCooldownByChannel={clearingCooldownByChannel}
                     onClearChannelCooldown={stableClearChannelCooldown}
+                    candyProbeTestingByChannel={candyProbeTestingByChannel}
+                    onRunCandyProbe={stableRunCandyProbe}
+                    onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
+                    candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
+                    onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
                     expandedSourceGroupMap={expandedSourceGroupMap}
                     onToggleSourceGroup={stableToggleSourceGroup}
                   />
@@ -1962,6 +2179,11 @@ export default function TokenRoutes() {
               onSiteBlockModel={stableSiteBlockModel}
                     clearingCooldownByChannel={clearingCooldownByChannel}
                     onClearChannelCooldown={stableClearChannelCooldown}
+                    candyProbeTestingByChannel={candyProbeTestingByChannel}
+                    onRunCandyProbe={stableRunCandyProbe}
+                    onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
+                    candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
+                    onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
               expandedSourceGroupMap={expandedSourceGroupMap}
               onToggleSourceGroup={stableToggleSourceGroup}
             />
@@ -2003,6 +2225,11 @@ export default function TokenRoutes() {
                   onSiteBlockModel={stableSiteBlockModel}
                     clearingCooldownByChannel={clearingCooldownByChannel}
                     onClearChannelCooldown={stableClearChannelCooldown}
+                    candyProbeTestingByChannel={candyProbeTestingByChannel}
+                    onRunCandyProbe={stableRunCandyProbe}
+                    onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
+                    candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
+                    onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
                   expandedSourceGroupMap={expandedSourceGroupMap}
                   onToggleSourceGroup={stableToggleSourceGroup}
                 />
@@ -2098,6 +2325,19 @@ export default function TokenRoutes() {
           existingChannelAccountIds={new Set((channelsByRouteId[addChannelModalRoute.id] || []).map((c) => c.accountId))}
         />
       )}
+
+      <CandyProbeDetailModal
+        open={!!candyProbeDetail}
+        onClose={() => {
+          // Invalidate any in-flight fetch so a late response cannot reopen content.
+          candyProbeDetailRequestRef.current += 1;
+          setCandyProbeDetail(null);
+          setCandyProbeDetailLoading(false);
+        }}
+        result={candyProbeDetail?.result ?? null}
+        loading={candyProbeDetailLoading}
+        channelLabel={candyProbeDetail?.label ?? null}
+      />
     </div>
   );
 }

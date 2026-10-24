@@ -12,6 +12,7 @@ import {
   type StoredUtcDateTimeInput,
 } from './localTimeService.js';
 import { clearSnapshotCache } from './snapshotCacheService.js';
+import { meteredProxyLogCondition } from './proxyLogQueries.js';
 
 const USAGE_PROJECTOR_KEY = 'usage-aggregates-v1';
 const PROJECTION_BATCH_SIZE = 1_000;
@@ -400,7 +401,9 @@ async function fetchProjectionBatch(afterId: number, limit: number) {
     .from(schema.proxyLogs)
     .leftJoin(schema.accounts, eq(schema.proxyLogs.accountId, schema.accounts.id))
     .leftJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .where(gt(schema.proxyLogs.id, afterId))
+    // Probe traffic is metapi testing a channel, not a user request: it must not reach the
+    // usage/billing projection that every spend figure is built from.
+    .where(and(gt(schema.proxyLogs.id, afterId), meteredProxyLogCondition()))
     .orderBy(asc(schema.proxyLogs.id))
     .limit(limit)
     .all();
@@ -728,7 +731,9 @@ async function applyPendingRecompute(checkpoint: ProjectionCheckpointRow) {
       createdAt: schema.proxyLogs.createdAt,
     })
     .from(schema.proxyLogs)
-    .where(gte(schema.proxyLogs.id, recomputeFromId))
+    // Probe rows are in the table but never in the projection, so a recompute boundary
+    // that landed on one would restart the walk at a row the projection does not cover.
+    .where(and(gte(schema.proxyLogs.id, recomputeFromId), meteredProxyLogCondition()))
     .orderBy(asc(schema.proxyLogs.id))
     .get();
 
@@ -758,7 +763,10 @@ async function applyPendingRecompute(checkpoint: ProjectionCheckpointRow) {
       createdAt: schema.proxyLogs.createdAt,
     })
     .from(schema.proxyLogs)
-    .where(gte(schema.proxyLogs.createdAt, affectedDayStartUtc))
+    .where(and(
+      gte(schema.proxyLogs.createdAt, affectedDayStartUtc),
+      meteredProxyLogCondition(),
+    ))
     .orderBy(asc(schema.proxyLogs.id))
     .get();
 

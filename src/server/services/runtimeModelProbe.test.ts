@@ -91,6 +91,39 @@ describe('probeRuntimeModel', () => {
     expect(result.latencyMs).not.toBeNull();
   });
 
+  it('requests the upstream URL, never the forwarding proxy address, when the site has one', async () => {
+    // A forwarding proxy is a dispatcher, not a destination: with one configured the old
+    // code built the target URL from the proxy address, so the model probe never reached
+    // the upstream and every proxied channel probed as failed.
+    resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['chat']);
+    resolveChannelProxyUrlMock.mockReturnValue('http://127.0.0.1:7890');
+    dispatchRuntimeRequestMock.mockImplementation(async (input: {
+      buildInit: (requestUrl: string, request: Record<string, unknown>) => Promise<RequestInit>;
+      request: Record<string, unknown>;
+      targetUrl?: string;
+    }) => {
+      await input.buildInit(input.targetUrl || '', input.request);
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+
+    const { probeRuntimeModel } = await import('./runtimeModelProbe.js');
+    const result = await probeRuntimeModel({
+      site,
+      account,
+      modelName: 'gpt-5.4',
+      timeoutMs: 2_000,
+    });
+
+    expect(result.status).toBe('supported');
+    const dispatchInput = dispatchRuntimeRequestMock.mock.calls[0]?.[0] as { targetUrl?: string };
+    expect(dispatchInput.targetUrl).toContain('https://probe.example.com/v1/chat/completions');
+    expect(dispatchInput.targetUrl).not.toContain('127.0.0.1:7890');
+    // The proxy stays in play as the dispatcher buildInit hands to fetch.
+    const proxyInit = withSiteRecordProxyRequestInitMock.mock.calls
+      .find((call) => String(call[2] || '').includes('127.0.0.1:7890'));
+    expect(proxyInit).toBeTruthy();
+  });
+
   it('uses the remaining timeout budget for the runtime request phase', async () => {
     resolveUpstreamEndpointCandidatesMock.mockImplementation(async () => {
       await new Promise((resolve) => setTimeout(resolve, 15));
@@ -126,5 +159,52 @@ describe('probeRuntimeModel', () => {
     expect(result.status).toBe('inconclusive');
     expect(result.latencyMs).not.toBeNull();
     expect(elapsedMs).toBeLessThan(200);
+  });
+
+  it('bounds a successful response whose body never finishes arriving', async () => {
+    // The body read has to live inside the deadline: `runWithDeadline` clears its timer as
+    // soon as the flow resolves, so an upstream that sends headers and then stalls would hang
+    // the recovery sweep forever. The stream below never closes.
+    resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['chat']);
+    dispatchRuntimeRequestMock.mockImplementation(async (input: {
+      buildInit: (requestUrl: string, request: Record<string, unknown>) => Promise<RequestInit>;
+      request: Record<string, unknown>;
+      targetUrl?: string;
+    }) => {
+      const init = await input.buildInit(input.targetUrl || 'https://probe.example.com/v1/chat/completions', input.request);
+      const signal = init.signal as AbortSignal | undefined;
+      let close: (() => void) | null = null;
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"partial":'));
+          close = () => {
+            try {
+              controller.close();
+            } catch {
+              // already closed
+            }
+          };
+          signal?.addEventListener('abort', () => close?.(), { once: true });
+        },
+        cancel() {
+          close?.();
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+
+    const { probeRuntimeModel } = await import('./runtimeModelProbe.js');
+    const startedAt = Date.now();
+    const result = await probeRuntimeModel({
+      site,
+      account,
+      modelName: 'gpt-5.4',
+      timeoutMs: 40,
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(result.status).toBe('inconclusive');
+    expect(result.reason).toMatch(/timeout/i);
+    expect(elapsedMs).toBeLessThan(400);
   });
 });

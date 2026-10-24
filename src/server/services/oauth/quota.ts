@@ -12,6 +12,7 @@ import {
 } from './oauthAccount.js';
 import { resolveOauthAccountProxyUrl } from './requestProxy.js';
 import type { OauthQuotaSnapshot, OauthQuotaWindowSnapshot } from './quotaTypes.js';
+import { CODEX_CLIENT_VERSION, CODEX_DEFAULT_USER_AGENT } from '../../proxy-core/providers/headerUtils.js';
 
 type CodexJwtClaims = {
   'https://api.openai.com/auth'?: {
@@ -49,8 +50,11 @@ type NormalizedCodexQuotaHeaders = {
 };
 
 const CODEX_QUOTA_PROBE_MODEL = 'gpt-5.4';
-const CODEX_QUOTA_PROBE_VERSION = '0.101.0';
-const CODEX_QUOTA_PROBE_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
+// Shared with the proxy runtime and the candy-probe fingerprints: this used to be a second
+// hardcoded copy of the client identity, so bumping the version left the quota probe
+// advertising the old one.
+const CODEX_QUOTA_PROBE_VERSION = CODEX_CLIENT_VERSION;
+const CODEX_QUOTA_PROBE_USER_AGENT = CODEX_DEFAULT_USER_AGENT;
 const CODEX_QUOTA_PROBE_BETA = 'responses-2025-03-11';
 const CODEX_QUOTA_PROBE_INSTRUCTIONS = 'You are a helpful assistant.';
 const CODEX_QUOTA_PROBE_TIMEOUT_MS = 10_000;

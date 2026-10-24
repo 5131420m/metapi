@@ -22,6 +22,11 @@ import {
   saveRouteDecisionSnapshots,
 } from '../../services/routeDecisionSnapshotStore.js';
 import { clearChannelCooldown, clearRouteCooldown } from '../../services/routeCooldownService.js';
+import { getCandyProbeSnapshots } from '../../services/candyProbeService.js';
+import {
+  isChannelProbeApplicable,
+  resolveExactProbeModelName,
+} from '../../services/channelProbeContext.js';
 import {
   refreshAllRouteDecisionSnapshots,
   ROUTE_DECISION_REFRESH_DEDUPE_KEY,
@@ -633,9 +638,42 @@ async function fetchChannelsForRouteRows(
     .flatMap((channels) => channels.map((channel) => channel.id))
     .filter((id): id is number => Number.isFinite(id));
   const qualityByChannelId = await tokenRouter.getChannelQualitySnapshots(qualityChannelIds);
+  // Display-only candy-probe verdict (degrade check). Same bulk shape as `quality`, and
+  // likewise never read by routing: P1 only surfaces the verdict.
+  //
+  // The current channel configuration is passed alongside so a verdict recorded against a
+  // different source model / credential is dropped instead of shown: after such a change the
+  // honest answer to "is this channel degraded" is "unknown", not last week's badge.
+  const candyProbeConfigByChannelId: Record<number, {
+    model: string;
+    accountId: number | null;
+    tokenId: number | null;
+  }> = {};
+  for (const channels of channelsByActualRouteId.values()) {
+    for (const channel of channels) {
+      // The same name the probe itself would resolve, so the snapshot tells "the channel
+      // changed" and "the list labelled it" from one source. `sourceModel` here is already
+      // the resolved value (the route's exact pattern is its fallback, applied when the rows
+      // are built), so passing a `modelPattern` as well would be dead weight.
+      const model = resolveExactProbeModelName({ sourceModel: channel.sourceModel });
+      candyProbeConfigByChannelId[channel.id] = {
+        model,
+        accountId: Number.isFinite(channel.accountId) ? Number(channel.accountId) : null,
+        tokenId: Number.isFinite(channel.tokenId) ? Number(channel.tokenId) : null,
+      };
+    }
+  }
+  const candyProbeByChannelId = getCandyProbeSnapshots(qualityChannelIds, candyProbeConfigByChannelId);
   for (const channels of channelsByActualRouteId.values()) {
     for (const channel of channels) {
       channel.quality = qualityByChannelId[String(channel.id)] ?? null;
+      channel.candyProbe = candyProbeByChannelId[String(channel.id)] ?? null;
+      // Lets the UI hide a button that could only ever come back rejected, and lets the
+      // batch skip those channels instead of firing a doomed request per channel.
+      channel.candyProbeApplicable = isChannelProbeApplicable({
+        sourceModel: channel.sourceModel,
+        modelPattern: channel.modelPattern,
+      });
     }
   }
 

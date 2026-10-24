@@ -1,4 +1,4 @@
-﻿import { FastifyInstance } from "fastify";
+import { FastifyInstance } from "fastify";
 import { db, schema } from "../../db/index.js";
 import { and, desc, eq, gte, lt, sql } from "drizzle-orm";
 import { config } from "../../config.js";
@@ -32,6 +32,7 @@ import {
   listProxyDebugTraces,
 } from "../../services/proxyDebugTraceStore.js";
 import { parseProxyLogMessageMeta } from "../../services/proxyLogMessage.js";
+import { meteredProxyLogCondition } from "../../services/proxyLogQueries.js";
 import { requiresManagedAccountTokens } from "../../services/accountExtraConfig.js";
 import { ACCOUNT_TOKEN_VALUE_STATUS_READY } from "../../services/accountTokenService.js";
 import {
@@ -731,6 +732,8 @@ export async function statsRoutes(app: FastifyInstance) {
               tags: schema.downstreamApiKeys.tags,
             },
           })
+          // proxy-log-view: includes probe traffic — the usage-log list is the audit
+          // trail for the probe, and its paging must agree with the rows it shows.
           .from(schema.proxyLogs)
           .leftJoin(
             schema.accounts,
@@ -776,6 +779,8 @@ export async function statsRoutes(app: FastifyInstance) {
       .select({
         total: sql<number>`count(*)`,
       })
+      // proxy-log-view: includes probe traffic — this is the list's own total; excluding
+      // probes here would make the page count and the rows disagree.
       .from(schema.proxyLogs)
       .leftJoin(
         schema.accounts,
@@ -840,6 +845,8 @@ export async function statsRoutes(app: FastifyInstance) {
             clientAppId: fields.clientAppId!,
             clientAppName: fields.clientAppName!,
           })
+          // proxy-log-view: includes probe traffic — these are the entries of the list's
+          // "客户端" filter, so the probe family has to be selectable there.
           .from(schema.proxyLogs)
           .leftJoin(
             schema.accounts,
@@ -886,6 +893,9 @@ export async function statsRoutes(app: FastifyInstance) {
             totalCost: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.estimatedCost}, 0)), 0)`,
             totalTokensAll: sql<number>`coalesce(sum(coalesce(${schema.proxyLogs.totalTokens}, 0)), 0)`,
           })
+          // proxy-log-view: includes probe traffic — this is the summary OF THE LIST above
+          // (使用日志 page header). Excluding probes here while the list shows them would
+          // make the header contradict the rows; the dashboard is the demand view.
           .from(schema.proxyLogs)
           .leftJoin(
             schema.accounts,
@@ -984,6 +994,8 @@ export async function statsRoutes(app: FastifyInstance) {
                 tags: schema.downstreamApiKeys.tags,
               },
             })
+            // proxy-log-view: includes probe traffic — a single log row, opened by id from
+            // the list; a probe row must be openable like any other.
             .from(schema.proxyLogs)
             .leftJoin(
               schema.accounts,
@@ -1159,7 +1171,9 @@ export async function statsRoutes(app: FastifyInstance) {
       const recentLogs = await db
         .select(proxyLogBaseFields)
         .from(schema.proxyLogs)
-        .where(gte(schema.proxyLogs.createdAt, last7d))
+        // Feeds per-model 7-day success rate / latency — a demand view, so probe rows are
+        // excluded (they are metapi's own requests, not evidence about the model's users).
+        .where(and(gte(schema.proxyLogs.createdAt, last7d), meteredProxyLogCondition()))
         .all();
 
       const modelLogStats: Record<

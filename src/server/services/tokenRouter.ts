@@ -38,6 +38,7 @@ import {
   type RouteMode,
 } from '../../shared/tokenRouteContract.js';
 import { ROUTING_SPEED_TARGET_TPS } from '../../shared/routingQualityContract.js';
+import { meteredProxyLogCondition } from './proxyLogQueries.js';
 
 interface RouteMatch {
   route: RouteRow;
@@ -1668,6 +1669,10 @@ export async function backfillRuntimeHealthFromProxyLogs(nowMs = Date.now()): Pr
     .where(and(
       eq(schema.proxyLogs.status, 'success'),
       gte(schema.proxyLogs.createdAt, windowStartAt),
+      // A candy-probe success is not real traffic success: seeding channel health from
+      // the probe would let the display-only verdict leak into routing state — the read
+      // policy condition excludes the probe's rows like every other metered read.
+      meteredProxyLogCondition(),
     )).orderBy(schema.proxyLogs.createdAt)
     .all();
   if (rows.length === 0) return empty;

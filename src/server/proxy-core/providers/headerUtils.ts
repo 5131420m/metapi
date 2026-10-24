@@ -1,9 +1,17 @@
 import { pbkdf2Sync, randomUUID } from 'node:crypto';
 import { inferCodexOfficialOriginator } from '../../shared/codexClientFamily.js';
 
-const CODEX_CLIENT_VERSION = '0.101.0';
-const CODEX_DEFAULT_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
-const CLAUDE_DEFAULT_USER_AGENT = 'claude-cli/2.1.63 (external, cli)';
+// Exported so the candy-probe client fingerprints reuse the very same identity strings the
+// proxy runtime sends: one source of truth per client version.
+//
+// NOTE: these are the identity of EVERY real proxied request, not just the probe's. Moving
+// them to a newer CLI version is a cross-cutting change to the whole box's request camouflage
+// and belongs in its own PR, with its own assessment of the Codex OAuth / Claude upstream
+// risk — not bundled into a feature branch. The probe follows whatever is here, which is the
+// point: it has to look like the traffic it stands in for.
+export const CODEX_CLIENT_VERSION = '0.101.0';
+export const CODEX_DEFAULT_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
+export const CLAUDE_DEFAULT_USER_AGENT = 'claude-cli/2.1.63 (external, cli)';
 export const CLAUDE_TOKEN_COUNTING_BETA = 'token-counting-2024-11-01';
 export const CLAUDE_DEFAULT_BETA_HEADER = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05';
 export const CLAUDE_API_KEY_DEFAULT_BETA_HEADER = 'claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05';

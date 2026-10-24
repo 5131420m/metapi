@@ -9,6 +9,13 @@ import {
 } from './tokenBindingPresentation.js';
 import { getChannelDecisionState, getPriorityTagStyle, getProbabilityColor } from './utils.js';
 import {
+  buildCandyProbeBadgeLabel,
+  formatCandyProbeCheckedAt,
+  formatCandyProbeFingerprint,
+  formatCandyProbeTrigger,
+  resolveCandyProbeTone,
+} from './candyProbe/presentation.js';
+import {
   firstByteTone,
   qualityToneBgColor,
   qualityToneColor,
@@ -184,13 +191,90 @@ function buildChannelQualityBadges(channel: RouteChannel, suppressTooltips: bool
   return badges.map((badge) => <Fragment key={badge.key}>{badge.node}</Fragment>);
 }
 
-function ChannelQualityStrip({ channel, suppressTooltips, style }: {
+/**
+ * The candy-question (degrade check) marker.
+ *
+ * Rendered so "never tested" is visible as a state rather than as absence — a channel
+ * without a verdict is not the same as a channel that passed. NOT rendered for a channel
+ * the server marked inapplicable (`candyProbeApplicable === false`): "未测" would read as
+ * a todo for something that can never run. Display-only: the badge never reflects routing
+ * state, because no routing rule reads the verdict yet.
+ */
+function buildCandyProbeBadge(
+  channel: RouteChannel,
+  suppressTooltips: boolean,
+  onOpenDetail?: () => void,
+) {
+  const probe = channel.candyProbe ?? null;
+
+  if (!probe) {
+    return (
+      <span
+        className="badge badge-muted"
+        style={{ fontSize: 10 }}
+        data-tooltip={suppressTooltips ? undefined : '尚未做过糖果题测试'}
+      >
+        🍬 未测
+      </span>
+    );
+  }
+
+  const tone = resolveCandyProbeTone(probe.verdict, probe.expectation);
+  const label = buildCandyProbeBadgeLabel(probe);
+  const tooltipParts = [
+    `${formatCandyProbeFingerprint(probe.fingerprint)} 指纹`,
+    `模型 ${probe.model}`,
+    probe.actualModel ? `实际 ${probe.actualModel}` : null,
+    probe.endpoint ? `端点 ${probe.endpoint}` : null,
+    `来源 ${formatCandyProbeTrigger(probe.trigger)}`,
+    `检测于 ${formatCandyProbeCheckedAt(probe.checkedAt)}`,
+    `有效至 ${formatCandyProbeCheckedAt(probe.expiresAt)}`,
+    probe.fresh ? null : '已过期',
+    // The baseline travels with the badge: the same "0/3" means something different for a
+    // flagship and for a small model, and the tooltip is where that is visible.
+    probe.verdict === 'fail' && probe.expectation === 'reference-only'
+      ? '小模型答错属预期内，仅供参考'
+      : null,
+    probe.verdict === 'fail' && probe.expectation === 'unknown' ? '无基准模型档位，不判定为降智' : null,
+    probe.reason,
+    onOpenDetail ? '点击查看每次采样明细' : null,
+  ].filter(Boolean);
+
+  return (
+    <button
+      type="button"
+      className="badge"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpenDetail?.();
+      }}
+      data-tooltip={suppressTooltips ? undefined : tooltipParts.join(' · ')}
+      style={{
+        fontSize: 10,
+        fontFamily: 'inherit',
+        border: 'none',
+        color: qualityToneColor(tone),
+        background: qualityToneBgColor(tone),
+        opacity: probe.fresh ? 1 : 0.6,
+        cursor: onOpenDetail ? 'pointer' : 'default',
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
+function ChannelQualityStrip({ channel, suppressTooltips, style, onOpenCandyProbeDetail }: {
   channel: RouteChannel;
   suppressTooltips: boolean;
   style?: CSSProperties;
+  onOpenCandyProbeDetail?: () => void;
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', ...style }}>
+      {/* Only an explicit server-computed false hides the marker: undefined must keep the
+          badge, or a list payload from an older server would silently lose every verdict. */}
+      {channel.candyProbeApplicable === false ? null : buildCandyProbeBadge(channel, suppressTooltips, onOpenCandyProbeDetail)}
       {buildChannelQualityBadges(channel, suppressTooltips)}
     </div>
   );
@@ -221,6 +305,9 @@ export function SortableChannelRow({
   onSiteBlockModel,
   clearingCooldown = false,
   onClearCooldown,
+  candyProbeTesting = false,
+  onRunCandyProbe,
+  onOpenCandyProbeDetail,
 }: SortableChannelRowProps) {
   const resolvedPriority = displayPriority ?? channel.priority ?? 0;
   const managementLocked = readOnly || channelManagementDisabled;
@@ -337,7 +424,7 @@ export function SortableChannelRow({
                 {channel.site?.name || 'unknown'}
               </span>
 
-              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} />
+              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} />
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
@@ -506,6 +593,16 @@ export function SortableChannelRow({
                     {channel.enabled === false ? '启用' : '禁用'}
                   </button>
 
+                  {onRunCandyProbe && channel.candyProbeApplicable !== false ? (
+                    <button
+                      onClick={onRunCandyProbe}
+                      disabled={candyProbeTesting}
+                      className="btn btn-link btn-link-info"
+                    >
+                      {candyProbeTesting ? '测试中...' : '🍬 测智商'}
+                    </button>
+                  ) : null}
+
                   {onClearCooldown ? (
                     <button
                       onClick={onClearCooldown}
@@ -651,7 +748,7 @@ export function SortableChannelRow({
           </>
         ) : null}
 
-        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} />
+        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} />
 
         {routeUnitMemberSummaryText ? (
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, width: '100%', flexWrap: 'wrap' }}>
@@ -747,6 +844,17 @@ export function SortableChannelRow({
           </button>
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+            {onRunCandyProbe && channel.candyProbeApplicable !== false ? (
+              <button
+                onClick={onRunCandyProbe}
+                disabled={candyProbeTesting}
+                className="btn btn-link btn-link-info"
+                data-tooltip={suppressTooltips ? undefined : '用糖果题探测该通道是否降智（只记录结果，不改变路由）'}
+              >
+                {candyProbeTesting ? '测试中...' : '🍬 测智商'}
+              </button>
+            ) : null}
+
             {onClearCooldown ? (
               <button
                 onClick={onClearCooldown}

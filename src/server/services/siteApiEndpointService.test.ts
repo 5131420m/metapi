@@ -745,4 +745,43 @@ describe('siteApiEndpointService', () => {
     const second = await secondPromise;
     expect(await (second as { upstream: Response }).upstream.text()).toBe('second');
   });
+
+  it('honors the per-caller siteLeaseWaitMs: zero fails fast, a budget waits it out', async () => {
+    const site = await db.insert(schema.sites).values({
+      name: 'lease-wait-site',
+      url: 'https://panel.example.com',
+      platform: 'new-api',
+      status: 'active',
+      maxConcurrency: 1,
+    }).returning().get();
+
+    const service = await import('./siteApiEndpointService.js');
+    const first = await service.runWithSiteApiEndpointPool(
+      site,
+      async () => ({ upstream: new Response('first') }),
+    );
+
+    try {
+      // Background callers pass 0: a saturated site answers at once instead of queueing
+      // the probe behind real traffic.
+      const fastStart = Date.now();
+      await expect(service.runWithSiteApiEndpointPool(
+        site,
+        async () => ({ upstream: new Response('never') }),
+        { siteLeaseWaitMs: 0 },
+      )).rejects.toThrow('no concurrency slot available');
+      expect(Date.now() - fastStart).toBeLessThan(100);
+
+      // A budget waits exactly that long, then reports how long it queued.
+      const waitStart = Date.now();
+      await expect(service.runWithSiteApiEndpointPool(
+        site,
+        async () => ({ upstream: new Response('never') }),
+        { siteLeaseWaitMs: 50 },
+      )).rejects.toThrow('waited 50ms');
+      expect(Date.now() - waitStart).toBeGreaterThanOrEqual(45);
+    } finally {
+      await (first as { upstream: Response }).upstream.text();
+    }
+  });
 });

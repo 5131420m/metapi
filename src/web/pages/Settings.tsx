@@ -36,6 +36,13 @@ const PROXY_TOKEN_PREFIX = 'sk-';
 const FACTORY_RESET_ADMIN_TOKEN = 'change-me-admin-token';
 const FACTORY_RESET_CONFIRM_SECONDS = 3;
 const MODEL_AVAILABILITY_PROBE_CONFIRM_TEXT = '我确认我使用的中转站全部允许批量测活，如因开启此功能被中转站封号，自行负责。';
+/**
+ * The candy-probe schedule UI is parked: the feature stays server-side (env
+ * CANDY_PROBE_SCHEDULE_ENABLED, default off) and the settings route still accepts the keys,
+ * but the toggle is not shown until the pool-alignment work settles. Flip to false to
+ * bring the section back — the block below is the only thing this gates.
+ */
+const CANDY_PROBE_SCHEDULE_UI_HIDDEN = true;
 const SECONDS_PER_DAY = 24 * 60 * 60;
 const ROUTE_COOLDOWN_UNIT_OPTIONS = [
   { value: 'second', label: '秒', multiplierSec: 1 },
@@ -71,6 +78,8 @@ type RuntimeSettings = {
   logCleanupRetentionDays: number;
   modelAvailabilityProbeEnabled: boolean;
   channelRecoveryProbeEnabled: boolean;
+  candyProbeScheduleEnabled: boolean;
+  candyProbeScheduleRecheckHours: number;
   codexUpstreamWebsocketEnabled: boolean;
   responsesCompactFallbackToResponsesEnabled: boolean;
   disableCrossProtocolFallback: boolean;
@@ -386,6 +395,8 @@ export default function Settings() {
     logCleanupRetentionDays: 30,
     modelAvailabilityProbeEnabled: false,
     channelRecoveryProbeEnabled: false,
+    candyProbeScheduleEnabled: false,
+    candyProbeScheduleRecheckHours: 12,
     codexUpstreamWebsocketEnabled: false,
     responsesCompactFallbackToResponsesEnabled: false,
     disableCrossProtocolFallback: false,
@@ -428,6 +439,7 @@ export default function Settings() {
   const [savingPayloadRules, setSavingPayloadRules] = useState(false);
   const [showPayloadRulesEditor, setShowPayloadRulesEditor] = useState(false);
   const [savingRouting, setSavingRouting] = useState(false);
+  const [disablingCandySchedule, setDisablingCandySchedule] = useState(false);
   const [showAdvancedRouting, setShowAdvancedRouting] = useState(false);
   const [allBrandNames, setAllBrandNames] = useState<string[] | null>(null);
   const [blockedBrands, setBlockedBrands] = useState<string[]>([]);
@@ -723,6 +735,11 @@ export default function Settings() {
           : 30,
         modelAvailabilityProbeEnabled: !!runtimeInfo.modelAvailabilityProbeEnabled,
         channelRecoveryProbeEnabled: !!runtimeInfo.channelRecoveryProbeEnabled,
+        candyProbeScheduleEnabled: !!runtimeInfo.candyProbeScheduleEnabled,
+        candyProbeScheduleRecheckHours: Number(runtimeInfo.candyProbeScheduleRecheckHours) >= 1
+          && Number(runtimeInfo.candyProbeScheduleRecheckHours) <= 72
+          ? Math.trunc(Number(runtimeInfo.candyProbeScheduleRecheckHours))
+          : 12,
         codexUpstreamWebsocketEnabled: !!runtimeInfo.codexUpstreamWebsocketEnabled,
         responsesCompactFallbackToResponsesEnabled: !!runtimeInfo.responsesCompactFallbackToResponsesEnabled,
         disableCrossProtocolFallback: !!runtimeInfo.disableCrossProtocolFallback,
@@ -1121,6 +1138,25 @@ export default function Settings() {
     toast.success('已将高级 JSON 同步到可视化规则');
   };
 
+  /**
+   * The candy schedule's UI is parked, but an instance that turned it on earlier keeps
+   * sweeping in the background — with the toggle hidden there would be no way to see or
+   * stop it. This is the escape hatch: a read-only notice plus one button that turns the
+   * schedule off without un-parking the section.
+   */
+  const disableCandySchedule = async () => {
+    setDisablingCandySchedule(true);
+    try {
+      await api.updateRuntimeSettings({ candyProbeScheduleEnabled: false });
+      setRuntime((prev) => ({ ...prev, candyProbeScheduleEnabled: false }));
+      toast.success('已关闭糖果题定时巡检');
+    } catch (err: any) {
+      toast.error(err?.message || '关闭巡检失败');
+    } finally {
+      setDisablingCandySchedule(false);
+    }
+  };
+
   const saveRouting = async () => {
     setSavingRouting(true);
     try {
@@ -1143,6 +1179,13 @@ export default function Settings() {
         ),
         disableCrossProtocolFallback: runtime.disableCrossProtocolFallback,
         channelRecoveryProbeEnabled: runtime.channelRecoveryProbeEnabled,
+        // While the schedule section is parked the operator cannot see these values, so a
+        // routing save must not write them: it would pin an env-enabled schedule into the
+        // database, or silently turn it off when the runtime read had failed.
+        ...(CANDY_PROBE_SCHEDULE_UI_HIDDEN ? {} : {
+          candyProbeScheduleEnabled: runtime.candyProbeScheduleEnabled,
+          candyProbeScheduleRecheckHours: runtime.candyProbeScheduleRecheckHours,
+        }),
       });
       toast.success('Routing weights saved');
     } catch (err: any) {
@@ -2418,6 +2461,88 @@ export default function Settings() {
               </span>
             </span>
           </label>
+
+          {!CANDY_PROBE_SCHEDULE_UI_HIDDEN && (
+            <>
+              <label style={{ display: 'flex', alignItems: 'flex-start', gap: 10, marginBottom: 12, cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={runtime.candyProbeScheduleEnabled}
+                  onChange={(e) => setRuntime((prev) => ({
+                    ...prev,
+                    candyProbeScheduleEnabled: e.target.checked,
+                  }))}
+                  style={{ marginTop: 2 }}
+                />
+                <span>
+                  <span style={{ display: 'block', fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}>
+                    定时巡检糖果题（降智检测）
+                  </span>
+                  <span style={{ display: 'block', fontSize: 12, color: 'var(--color-text-muted)', lineHeight: 1.7 }}>
+                    开启后，后台按复测周期对通道定期发起糖果题检测。结论仅用于展示，不影响通道路由；巡检请求会占用站点并发并计入 API 请求池的端点记录。默认关闭——每次巡检都是真实的上游补全请求，额度有限的 Key 请斟酌；同一上游身份只测一次，且有每日运行上限兜底。
+                  </span>
+                </span>
+              </label>
+
+              <div style={{ marginBottom: 12, paddingLeft: 22 }}>
+                <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>
+                  糖果题巡检复测周期（小时）
+                </div>
+                <select
+                  aria-label="糖果题巡检复测周期"
+                  value={runtime.candyProbeScheduleRecheckHours}
+                  onChange={(e) => {
+                    const nextValue = Number(e.target.value);
+                    setRuntime((prev) => ({
+                      ...prev,
+                      candyProbeScheduleRecheckHours: Number.isFinite(nextValue) && nextValue >= 1 && nextValue <= 72
+                        ? Math.trunc(nextValue)
+                        : prev.candyProbeScheduleRecheckHours,
+                    }));
+                  }}
+                  style={inputStyle}
+                  disabled={!runtime.candyProbeScheduleEnabled}
+                >
+                  {[...new Set([6, 12, 24, 48, runtime.candyProbeScheduleRecheckHours])]
+                    .sort((left, right) => left - right)
+                    .map((hours) => (
+                      <option key={hours} value={hours}>{hours} 小时</option>
+                    ))}
+                </select>
+                <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+                  通过的通道按此周期复测；答错或未完成的通道会更快复测：首次按周期的 1/4（不短于 1 小时），之后每连续失败一次间隔翻倍，最长不超过复测周期。
+                </div>
+              </div>
+            </>
+          )}
+
+          {CANDY_PROBE_SCHEDULE_UI_HIDDEN && runtime.candyProbeScheduleEnabled === true ? (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                marginBottom: 12,
+                padding: '8px 10px',
+                borderRadius: 10,
+                border: '1px solid color-mix(in srgb, var(--color-warning) 35%, transparent)',
+                background: 'color-mix(in srgb, var(--color-warning) 8%, transparent)',
+              }}
+            >
+              <span style={{ fontSize: 12, color: 'var(--color-text-primary)', lineHeight: 1.7, flex: 1 }}>
+                糖果题定时巡检当前处于开启状态（该设置暂时隐藏）。巡检会按复测周期对通道发起真实上游请求。
+              </span>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                style={{ border: '1px solid var(--color-border)', whiteSpace: 'nowrap' }}
+                disabled={disablingCandySchedule}
+                onClick={disableCandySchedule}
+              >
+                {disablingCandySchedule ? '关闭中...' : '关闭巡检'}
+              </button>
+            </div>
+          ) : null}
 
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6 }}>

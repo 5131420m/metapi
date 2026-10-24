@@ -101,6 +101,12 @@ export interface SiteApiEndpointPoolOptions {
   deadlineAtMs?: number;
   timeoutMessage?: string;
   requestScopeId?: string;
+  /**
+   * How long the site lease may queue behind real traffic before giving up. `0` makes the
+   * pool fail fast on a saturated site — background callers (the candy probe's schedule)
+   * use it so a probe never makes a busy site's real requests wait longer.
+   */
+  siteLeaseWaitMs?: number;
 }
 
 function buildSiteConcurrencyBusyMessage(waitMs: number): string {
@@ -552,6 +558,7 @@ export async function runWithSiteApiEndpointPool<T>(
   const leaseResult = await proxyChannelCoordinator.acquireSiteLease({
     siteId: site.id,
     maxConcurrency: site.maxConcurrency,
+    waitMs: options.siteLeaseWaitMs,
   });
   if (leaseResult.status === 'timeout') {
     throw new SiteApiEndpointRequestError(buildSiteConcurrencyBusyMessage(leaseResult.waitMs), {

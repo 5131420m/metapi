@@ -64,7 +64,6 @@ export type EndpointFlowResult =
 
 export type ExecuteEndpointFlowInput = {
   siteUrl: string;
-  proxyUrl?: string | null;
   disableCrossProtocolFallback?: boolean;
   endpointCandidates: UpstreamEndpoint[];
   buildRequest: (endpoint: UpstreamEndpoint, endpointIndex: number) => BuiltEndpointRequest;
@@ -117,10 +116,10 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
   for (let endpointIndex = 0; endpointIndex < endpointCount; endpointIndex += 1) {
     const endpoint = input.endpointCandidates[endpointIndex] as UpstreamEndpoint;
     const request = input.buildRequest(endpoint, endpointIndex);
-    const defaultTarget = buildUpstreamUrl(input.siteUrl, request.path);
-    const targetUrl = input.proxyUrl
-      ? buildUpstreamUrl(input.proxyUrl, request.path)
-      : defaultTarget;
+    // The target URL is always the upstream base URL + path. A forwarding proxy is a
+    // dispatcher injected by the caller's buildInit — it must never appear here, or the
+    // request targets the proxy address itself (the M1 bug).
+    const targetUrl = buildUpstreamUrl(input.siteUrl, request.path);
 
     const attemptStartedAtMs = Date.now();
     let response = await fetchWithObservedFirstByte(
@@ -193,11 +192,8 @@ export async function executeEndpointFlow(input: ExecuteEndpointFlowInput): Prom
         || baseContext.rawErrText !== rawErrText;
       if (recovered?.upstream?.ok) {
         const recoveredRequest = recovered.request ?? baseContext.request;
-        const recoveredTargetUrl = recovered.targetUrl ?? (
-          input.proxyUrl
-            ? buildUpstreamUrl(input.proxyUrl, recovered.upstreamPath)
-            : buildUpstreamUrl(input.siteUrl, recovered.upstreamPath)
-        );
+        const recoveredTargetUrl = recovered.targetUrl
+          ?? buildUpstreamUrl(input.siteUrl, recovered.upstreamPath);
         await runEndpointFlowHook(input.onAttemptSuccess, {
           endpointIndex,
           endpointCount,

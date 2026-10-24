@@ -22,6 +22,7 @@ import {
 import { estimateRewardWithTodayIncomeFallback } from "./todayIncomeRewardService.js";
 import { createAdminSnapshotPersistence } from "./adminSnapshotStore.js";
 import { runUsageAggregationProjectionPass } from "./usageAggregationService.js";
+import { meteredProxyLogCondition } from "./proxyLogQueries.js";
 
 export type DashboardSummaryPayload = {
   totalBalance: number;
@@ -140,6 +141,9 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
         and(
           gte(schema.proxyLogs.createdAt, last24hDate),
           eq(schema.sites.status, "active"),
+          // The dashboard is the headline demand view: probe runs must not move its
+          // success/failure counts or its latency figures.
+          meteredProxyLogCondition(),
         ),
       )
       .get(),
@@ -158,6 +162,7 @@ async function loadDashboardSummaryPayload(): Promise<DashboardSummaryPayload> {
         and(
           gte(schema.proxyLogs.createdAt, lastMinuteDate),
           eq(schema.sites.status, "active"),
+          meteredProxyLogCondition(),
         ),
       )
       .get(),

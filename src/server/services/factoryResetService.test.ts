@@ -94,4 +94,106 @@ describe('factoryResetService', () => {
       { key: 'db_ssl', value: JSON.stringify(true) },
     ]);
   });
+
+  it('stops the candy schedule and its freshness-TTL override when resetting to factory state', async () => {
+    const schedulerModule = await import('./candyProbeScheduler.js');
+    const storeModule = await import('./candyProbe/resultStore.js');
+    const originalEnabled = config.candyProbeScheduleEnabled;
+    const buildResult = (channelId: number) => ({
+      channelId,
+      routeId: null,
+      model: 'gpt-5.6-sol',
+      fingerprint: 'generic_openai',
+      verdict: 'pass',
+      score: 1,
+      total: 1,
+      endpoint: 'chat',
+      actualModel: null,
+      latencyMs: 1,
+      checkedAt: new Date().toISOString(),
+      reason: null,
+      question: { id: 'candy-bag-reference', prompt: '', expected: '21' },
+      samples: [{ index: 1, answer: '21', correct: true, note: null }],
+      validSampleCount: 1,
+      expectation: 'expected',
+      config: { model: 'gpt-5.6-sol', accountId: null, tokenId: null },
+      trigger: 'schedule',
+      failStreak: 0,
+    });
+
+    try {
+      config.candyProbeScheduleEnabled = true;
+      schedulerModule.startCandyProbeScheduler(60_000);
+      storeModule.recordCandyProbeResult(buildResult(424242));
+      const scheduled = storeModule.getCandyProbeSnapshots([424242])[String(424242)]!;
+      expect(Date.parse(scheduled.expiresAt) - Date.parse(scheduled.checkedAt)).toBeGreaterThan(60 * 60 * 1000);
+
+      const switchRuntimeDatabase = vi.fn(async () => undefined);
+      const runSqliteMigrations = vi.fn(() => undefined);
+      const ensureDefaultSitesSeeded = vi.fn(async () => ({ seeded: 0, alreadyMarked: false, hadExistingSites: false }));
+      await performFactoryReset({ switchRuntimeDatabase, runSqliteMigrations, ensureDefaultSitesSeeded });
+
+      // The reset restored the baseline config (schedule off) — the running timer and the
+      // TTL override must have followed, not survive until the next tick.
+      expect(config.candyProbeScheduleEnabled).toBe(false);
+      storeModule.recordCandyProbeResult(buildResult(424242));
+      const afterReset = storeModule.getCandyProbeSnapshots([424242])[String(424242)]!;
+      expect(Date.parse(afterReset.expiresAt) - Date.parse(afterReset.checkedAt)).toBe(60 * 60 * 1000);
+    } finally {
+      config.candyProbeScheduleEnabled = originalEnabled;
+      schedulerModule.resetCandyProbeSchedulerForTests();
+    }
+  });
+
+  it('restarts an env-enabled candy schedule after the reset instead of leaving it stopped', async () => {
+    const schedulerModule = await import('./candyProbeScheduler.js');
+    const storeModule = await import('./candyProbe/resultStore.js');
+    const originalEnabled = config.candyProbeScheduleEnabled;
+    const originalEnv = process.env.CANDY_PROBE_SCHEDULE_ENABLED;
+    const buildResult = (channelId: number) => ({
+      channelId,
+      routeId: null,
+      model: 'gpt-5.6-sol',
+      fingerprint: 'generic_openai',
+      verdict: 'pass',
+      score: 1,
+      total: 1,
+      endpoint: 'chat',
+      actualModel: null,
+      latencyMs: 1,
+      checkedAt: new Date().toISOString(),
+      reason: null,
+      question: { id: 'candy-bag-reference', prompt: '', expected: '21' },
+      samples: [{ index: 1, answer: '21', correct: true, note: null }],
+      validSampleCount: 1,
+      expectation: 'expected',
+      config: { model: 'gpt-5.6-sol', accountId: null, tokenId: null },
+      trigger: 'schedule',
+      failStreak: 0,
+    });
+
+    try {
+      // The reset baseline comes from buildConfig(process.env): an env-enabled schedule
+      // survives the reset as ENABLED config, so the timer must be running again rather
+      // than stopped behind an enabled flag until the next restart. The freshness-TTL
+      // override the scheduler installs is the observable.
+      process.env.CANDY_PROBE_SCHEDULE_ENABLED = 'true';
+      schedulerModule.startCandyProbeScheduler(60_000);
+
+      const switchRuntimeDatabase = vi.fn(async () => undefined);
+      const runSqliteMigrations = vi.fn(() => undefined);
+      const ensureDefaultSitesSeeded = vi.fn(async () => ({ seeded: 0, alreadyMarked: false, hadExistingSites: false }));
+      await performFactoryReset({ switchRuntimeDatabase, runSqliteMigrations, ensureDefaultSitesSeeded });
+
+      expect(config.candyProbeScheduleEnabled).toBe(true);
+      storeModule.recordCandyProbeResult(buildResult(424243));
+      const afterReset = storeModule.getCandyProbeSnapshots([424243])[String(424243)]!;
+      expect(Date.parse(afterReset.expiresAt) - Date.parse(afterReset.checkedAt)).toBeGreaterThan(60 * 60 * 1000);
+    } finally {
+      if (originalEnv === undefined) delete process.env.CANDY_PROBE_SCHEDULE_ENABLED;
+      else process.env.CANDY_PROBE_SCHEDULE_ENABLED = originalEnv;
+      config.candyProbeScheduleEnabled = originalEnabled;
+      schedulerModule.resetCandyProbeSchedulerForTests();
+    }
+  });
 });

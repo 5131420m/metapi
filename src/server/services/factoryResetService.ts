@@ -5,6 +5,19 @@ import { updateBalanceRefreshCron, updateCheckinCron, updateLogCleanupSettings }
 import { ensureDefaultSitesSeeded } from './defaultSiteSeedService.js';
 import { startProxyLogRetentionService } from './proxyLogRetentionService.js';
 import { invalidateSiteProxyCache } from './siteProxy.js';
+import { discardCandyProbeResults } from './candyProbe/resultStore.js';
+import {
+  startModelAvailabilityProbeScheduler,
+  stopModelAvailabilityProbeScheduler,
+} from './modelAvailabilityProbeService.js';
+import {
+  startChannelRecoveryProbeScheduler,
+  stopChannelRecoveryProbeScheduler,
+} from './channelRecoveryProbeService.js';
+import {
+  startCandyProbeScheduler,
+  stopCandyProbeScheduler,
+} from './candyProbeScheduler.js';
 
 export const FACTORY_RESET_ADMIN_TOKEN = 'change-me-admin-token';
 
@@ -81,6 +94,20 @@ function resetRuntimeConfigToInitialState(preserved: PreservedInfrastructureStat
     retentionDays: config.logCleanupRetentionDays,
   });
   startProxyLogRetentionService();
+  // The probes read their enabled flags from config, and the reset just flipped them all
+  // off — the running timers must actually stop, or a tick still fires against the reset
+  // baseline (and the candy schedule's freshness-TTL override survives too).
+  stopModelAvailabilityProbeScheduler();
+  stopChannelRecoveryProbeScheduler();
+  stopCandyProbeScheduler();
+  // The reset baseline comes from buildConfig(process.env), which can turn the flags back
+  // ON via environment variables. A stopped timer behind an enabled flag (or a running one
+  // behind a disabled flag) would leave config and reality inconsistent until the next
+  // restart, so each probe is restarted per the post-reset config: the availability probe
+  // checks its own switch, the other two are started only when theirs is set.
+  startModelAvailabilityProbeScheduler();
+  if (config.channelRecoveryProbeEnabled) startChannelRecoveryProbeScheduler();
+  if (config.candyProbeScheduleEnabled) startCandyProbeScheduler();
   invalidateSiteProxyCache();
 }
 
@@ -111,6 +138,12 @@ export async function performFactoryReset(deps: FactoryResetDependencies = {}): 
   const runSqliteMigrationsImpl = deps.runSqliteMigrations ?? runDefaultSqliteMigrations;
   const ensureDefaultSitesSeededImpl = deps.ensureDefaultSitesSeeded ?? ensureDefaultSitesSeeded;
   const preserved = captureInfrastructureState();
+
+  // Candy-probe verdicts live in memory and are persisted into `settings`. Clearing the
+  // table alone would leave the old verdicts in the Map, and the next write would put them
+  // back into the settings row of the freshly reset database; the persisted row is cleared
+  // too, so a database swap cannot carry them across either.
+  await discardCandyProbeResults();
 
   await clearAllBusinessData();
   resetRuntimeConfigToInitialState(preserved);

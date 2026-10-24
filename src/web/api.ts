@@ -1,4 +1,5 @@
 import { clearAuthSession, getAuthToken } from "./authSession.js";
+import { CANDY_PROBE_MAX_TIMEOUT_MS } from "../shared/candyProbe.js";
 
 type BufferLike = {
   from(data: ArrayBuffer): { toString(encoding: "base64"): string };
@@ -368,6 +369,8 @@ export type RuntimeSettingsPayload = {
   payloadRules?: Record<string, unknown> | null;
   modelAvailabilityProbeEnabled?: boolean;
   channelRecoveryProbeEnabled?: boolean;
+  candyProbeScheduleEnabled?: boolean;
+  candyProbeScheduleRecheckHours?: number;
   codexUpstreamWebsocketEnabled?: boolean;
   responsesCompactFallbackToResponsesEnabled?: boolean;
   disableCrossProtocolFallback?: boolean;
@@ -966,6 +969,24 @@ export const api = {
     request(`/api/routes/${id}/cooldown/clear`, { method: "POST" }),
   clearChannelCooldown: (channelId: number) =>
     request(`/api/channels/${channelId}/cooldown/clear`, { method: "POST" }),
+  // Candy-question degrade probe (display-only). The probe waits on a real upstream
+  // completion, so it gets a wider timeout than an ordinary admin call. `fingerprint` is
+  // the only override the server accepts: a run is one question, one answer.
+  runChannelCandyProbe: (
+    channelId: number,
+    options?: { fingerprint?: string },
+  ) =>
+    request(`/api/channels/${channelId}/candy-probe`, {
+      method: "POST",
+      body: JSON.stringify(options ?? {}),
+      // Backstop only, and deliberately LONGER than the server's own ceiling: the server's
+      // budget comes from settings (up to CANDY_PROBE_MAX_TIMEOUT_MS) and it always resolves
+      // its own deadline. A shorter client timeout used to fire first, so the UI reported a
+      // timeout for a probe that then finished and wrote a verdict anyway.
+      timeoutMs: CANDY_PROBE_MAX_TIMEOUT_MS + 15_000,
+    }),
+  getChannelCandyProbe: (channelId: number) =>
+    request(`/api/channels/${channelId}/candy-probe`),
   batchUpdateRoutes: (data: { ids: number[]; action: "enable" | "disable" }) =>
     request("/api/routes/batch", {
       method: "POST",

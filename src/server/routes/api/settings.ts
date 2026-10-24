@@ -49,6 +49,10 @@ import {
   startChannelRecoveryProbeScheduler,
   stopChannelRecoveryProbeScheduler,
 } from '../../services/channelRecoveryProbeService.js';
+import {
+  startCandyProbeScheduler,
+  stopCandyProbeScheduler,
+} from '../../services/candyProbeScheduler.js';
 import { parsePayloadRulesConfigInput } from '../../services/payloadRules.js';
 import { parseDownstreamErrorPolicyConfig } from '../../services/downstreamErrorPolicy.js';
 
@@ -60,6 +64,8 @@ interface RuntimeSettingsBody {
   payloadRules?: unknown;
   modelAvailabilityProbeEnabled?: boolean;
   channelRecoveryProbeEnabled?: boolean;
+  candyProbeScheduleEnabled?: boolean;
+  candyProbeScheduleRecheckHours?: number;
   codexUpstreamWebsocketEnabled?: boolean;
   responsesCompactFallbackToResponsesEnabled?: boolean;
   disableCrossProtocolFallback?: boolean;
@@ -486,6 +492,28 @@ function applyImportedSettingToRuntime(key: string, value: unknown) {
       }
       return;
     }
+    case 'candy_probe_schedule_enabled': {
+      if (typeof value !== 'boolean') return;
+      config.candyProbeScheduleEnabled = value;
+      // Imported preferences must behave like the toggle: take effect now, not after a
+      // restart — including the freshness-TTL alignment start/stop performs.
+      if (value) {
+        startCandyProbeScheduler();
+      } else {
+        stopCandyProbeScheduler();
+      }
+      return;
+    }
+    case 'candy_probe_schedule_recheck_hours': {
+      const recheckHours = Number(value);
+      if (!Number.isFinite(recheckHours) || recheckHours < 1 || recheckHours > 72) return;
+      config.candyProbeScheduleRecheckHours = Math.trunc(recheckHours);
+      // Restarting re-reads the cadence, so a running schedule's windows follow at once.
+      if (config.candyProbeScheduleEnabled) {
+        startCandyProbeScheduler();
+      }
+      return;
+    }
     case 'codex_upstream_websocket_enabled': {
       if (typeof value !== 'boolean') return;
       config.codexUpstreamWebsocketEnabled = value;
@@ -814,6 +842,8 @@ function getRuntimeSettingsResponse(currentAdminIp = '') {
     logCleanupRetentionDays: config.logCleanupRetentionDays,
     modelAvailabilityProbeEnabled: config.modelAvailabilityProbeEnabled,
     channelRecoveryProbeEnabled: config.channelRecoveryProbeEnabled,
+    candyProbeScheduleEnabled: config.candyProbeScheduleEnabled,
+    candyProbeScheduleRecheckHours: config.candyProbeScheduleRecheckHours,
     codexUpstreamWebsocketEnabled: config.codexUpstreamWebsocketEnabled,
     responsesCompactFallbackToResponsesEnabled: config.responsesCompactFallbackToResponsesEnabled,
     disableCrossProtocolFallback: config.disableCrossProtocolFallback,
@@ -1427,6 +1457,51 @@ export async function settingsRoutes(app: FastifyInstance) {
         startChannelRecoveryProbeScheduler();
       } else {
         stopChannelRecoveryProbeScheduler();
+      }
+    }
+
+    if (body.candyProbeScheduleEnabled !== undefined) {
+      let nextValue = false;
+      try {
+        nextValue = parseBooleanFlag(body.candyProbeScheduleEnabled, '糖果题巡检开关');
+      } catch (err: any) {
+        return reply.code(400).send({
+          success: false,
+          message: err?.message || '糖果题巡检开关格式无效',
+        });
+      }
+
+      if (nextValue !== config.candyProbeScheduleEnabled) {
+        changedLabels.push(nextValue ? '开启糖果题巡检' : '关闭糖果题巡检');
+      }
+      await upsertSetting('candy_probe_schedule_enabled', nextValue);
+      config.candyProbeScheduleEnabled = nextValue;
+      // Same immediate start/stop contract as the other probe switches: flipping the
+      // toggle takes effect now, not after a restart.
+      if (nextValue) {
+        startCandyProbeScheduler();
+      } else {
+        stopCandyProbeScheduler();
+      }
+    }
+
+    if (body.candyProbeScheduleRecheckHours !== undefined) {
+      const nextValue = Math.trunc(Number(body.candyProbeScheduleRecheckHours));
+      if (!Number.isFinite(nextValue) || nextValue < 1 || nextValue > 72) {
+        return reply.code(400).send({
+          success: false,
+          message: '糖果题巡检复测周期必须是 1-72 之间的整数小时',
+        });
+      }
+      if (nextValue !== config.candyProbeScheduleRecheckHours) {
+        changedLabels.push(`糖果题巡检周期 ${nextValue} 小时`);
+      }
+      await upsertSetting('candy_probe_schedule_recheck_hours', nextValue);
+      config.candyProbeScheduleRecheckHours = nextValue;
+      // The freshness TTL and the (already running) schedule both derive from the cadence;
+      // restarting the scheduler re-reads it, so the badges follow the new window at once.
+      if (config.candyProbeScheduleEnabled) {
+        startCandyProbeScheduler();
       }
     }
 

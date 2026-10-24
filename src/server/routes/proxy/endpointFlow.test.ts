@@ -367,7 +367,7 @@ describe('executeEndpointFlow', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it('uses proxyUrl for the default fetch path when no dispatch hook is provided', async () => {
+  it('requests the site URL for the default fetch path when no dispatch hook is provided', async () => {
     fetchMock.mockResolvedValueOnce(toUndiciResponse(new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
@@ -375,27 +375,27 @@ describe('executeEndpointFlow', () => {
 
     await executeEndpointFlow({
       siteUrl: 'https://example.com',
-      proxyUrl: 'https://proxy.internal/base',
       endpointCandidates: ['responses'],
       buildRequest: () => requestFor('/v1/responses'),
     });
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://proxy.internal/base/v1/responses');
+    // The target URL is always the upstream base URL + path — there is no proxyUrl field
+    // any more; a forwarding proxy is a dispatcher injected by the caller's buildInit.
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://example.com/v1/responses');
   });
-  it('normalizes proxyUrl with versioned base paths instead of duplicating path segments', async () => {
+  it('normalizes a versioned siteUrl base path instead of duplicating path segments', async () => {
     fetchMock.mockResolvedValueOnce(toUndiciResponse(new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })));
 
     await executeEndpointFlow({
-      siteUrl: 'https://example.com',
-      proxyUrl: 'https://proxy.internal/api/v1?mode=relay#frag',
+      siteUrl: 'https://example.com/api/v1?mode=relay#frag',
       endpointCandidates: ['responses'],
       buildRequest: () => requestFor('/v1/responses'),
     });
 
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://proxy.internal/api/v1/responses?mode=relay#frag');
+    expect(fetchMock.mock.calls[0]?.[0]).toBe('https://example.com/api/v1/responses?mode=relay#frag');
   });
   it('returns normalized final error when all endpoints fail', async () => {
     fetchMock.mockResolvedValueOnce(toUndiciResponse(new Response(JSON.stringify({
