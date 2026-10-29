@@ -11,6 +11,7 @@ import {
   formatIdentityCandidate,
   formatIdentityClaimedRank,
   formatIdentityProbability,
+  formatIdentityProbeClientIdentity,
   formatIdentityProbeVerdict,
   IDENTITY_PROBE_DISCLAIMER,
   IDENTITY_PROBE_VERDICT_EXPLANATIONS,
@@ -124,6 +125,7 @@ export default function IdentityProbeDetailModal({
             <SummaryItem label="耗时" value={result.latencyMs == null ? '—' : `${(result.latencyMs / 1000).toFixed(1)} s`} />
             <SummaryItem label="检测时间" value={new Date(result.checkedAt).toLocaleString()} />
             <SummaryItem label="参考库版本" value={result.config.bankBuiltAt ? new Date(result.config.bankBuiltAt).toLocaleString() : '—'} />
+            <SummaryItem label="客户端身份" value={formatIdentityProbeClientIdentity(result)} />
           </div>
 
           {result.candidates.length > 0 ? (
@@ -187,8 +189,9 @@ export default function IdentityProbeDetailModal({
 
           <div style={{ fontSize: 10.5, lineHeight: 1.5, color: 'var(--color-text-muted)' }}>
             {IDENTITY_PROBE_DISCLAIMER}
-            本检测让模型写出约 300 个 1–355 的整数，用 lm-detector 参考库比对数值分布；请求以普通 SDK 身份发送，
-            与糖果题使用的客户端身份不同，按客户端分流的中转站可能让两项结果不一致。
+            本检测让模型写出约 300 个 1–355 的整数，用 lm-detector 参考库比对数值分布。
+            请求头使用本机观察到的真实客户端身份（与糖果题相同），请求体保持参考库采样时的原样；
+            若中转站看到客户端身份后改写请求体（例如注入系统提示），结果可能偏离。
             判定结果仅用于展示，不影响通道路由与健康；请求经过站点 API 请求池，会计入端点的成功/失败记录。
           </div>
         </div>

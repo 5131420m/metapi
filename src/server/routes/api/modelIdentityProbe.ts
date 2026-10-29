@@ -32,16 +32,24 @@ export async function modelIdentityProbeRoutes(app: FastifyInstance) {
     },
   );
 
-  // Run one detection round (three challenges). No body parameters in this version.
-  app.post<{ Params: { channelId: string } }>(
+  // Run one detection round (three challenges). Optional body: { clientIdentity }.
+  app.post<{ Params: { channelId: string }; Body: { clientIdentity?: unknown } | undefined }>(
     '/api/channels/:channelId/identity-probe',
     async (request, reply) => {
       const channelId = parseChannelId(request.params.channelId);
       if (channelId === null) {
         return reply.code(400).send({ success: false, message: '无效的通道 ID' });
       }
+      const rawClientIdentity = request.body?.clientIdentity;
+      if (rawClientIdentity !== undefined && rawClientIdentity !== 'observed' && rawClientIdentity !== 'sdk') {
+        return reply.code(400).send({ success: false, message: 'clientIdentity 只能是 observed 或 sdk' });
+      }
       try {
-        const result = await runChannelIdentityProbe({ channelId, requestId: request.id });
+        const result = await runChannelIdentityProbe({
+          channelId,
+          requestId: request.id,
+          ...(rawClientIdentity ? { clientIdentity: rawClientIdentity } : {}),
+        });
         return { success: true, result };
       } catch (error) {
         if (error instanceof IdentityProbeRequestError) {

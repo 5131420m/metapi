@@ -140,6 +140,24 @@ describe('identity probe result store', () => {
     expect(restored?.claimedProbability).toBeNull();
   });
 
+  it('reads rows stored before the identity source existed as sdk', async () => {
+    const legacy = { ...makeResult({ channelId: 4 }) } as unknown as Record<string, unknown>;
+    delete legacy.identitySource;
+    delete legacy.identityUserAgent;
+    await db.insert(schema.settings).values({
+      key: store.IDENTITY_PROBE_SETTING_KEY,
+      value: JSON.stringify({
+        4: legacy,
+        5: { ...makeResult({ channelId: 5 }), identitySource: 'observed', identityUserAgent: 'claude-cli/2.1.151' },
+      }),
+    }).run();
+    await store.hydrateIdentityProbeResultsFromSettings();
+    expect(store.getIdentityProbeResultForChannel(4)?.identitySource).toBe('sdk');
+    expect(store.getIdentityProbeResultForChannel(4)?.identityUserAgent).toBeNull();
+    expect(store.getIdentityProbeResultForChannel(5)?.identitySource).toBe('observed');
+    expect(store.getIdentityProbeResultForChannel(5)?.identityUserAgent).toBe('claude-cli/2.1.151');
+  });
+
   it('drops a run that finished after a reset', () => {
     const generation = store.getIdentityProbeStoreGeneration();
     store.resetIdentityProbeStoreForTests();

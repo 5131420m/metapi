@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BUILTIN_CLAUDE_CODE_USER_AGENT,
+  BUILTIN_CODEX_USER_AGENT,
   buildClaudeCodeUserId,
   CANDY_FINGERPRINTS,
   CANDY_FINGERPRINT_IDS,
@@ -11,7 +13,6 @@ import {
 import { detectCliProfile } from '../../proxy-core/cliProfiles/registry.js';
 import {
   CLAUDE_DEFAULT_USER_AGENT,
-  CODEX_CLIENT_VERSION,
   CODEX_DEFAULT_USER_AGENT,
 } from '../../proxy-core/providers/headerUtils.js';
 
@@ -59,10 +60,30 @@ describe('candy fingerprints', () => {
     // identity it claims to wear.
     const detected = detectCliProfile({
       downstreamPath: '/v1/messages',
-      headers: { ...headers, 'user-agent': CLAUDE_DEFAULT_USER_AGENT },
+      headers: { ...headers, 'user-agent': BUILTIN_CLAUDE_CODE_USER_AGENT },
       body,
     });
     expect(detected.id).toBe('claude_code');
+  });
+
+  it('pins the built-in template to real releases, independent of the runtime defaults', () => {
+    // Claude Code 2.1.280 is CLIProxyAPI's measured baseline; Codex 0.165.0 the current release.
+    expect(BUILTIN_CLAUDE_CODE_USER_AGENT).toBe('claude-cli/2.1.280 (external, cli)');
+    expect(BUILTIN_CODEX_USER_AGENT).toBe('codex_cli_rs/0.165.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464');
+    // The template must not follow the proxy runtime's fallback identity: that one is the
+    // identity of every real proxied request and moves on its own schedule.
+    expect(BUILTIN_CLAUDE_CODE_USER_AGENT).not.toBe(CLAUDE_DEFAULT_USER_AGENT);
+    expect(BUILTIN_CODEX_USER_AGENT).not.toBe(CODEX_DEFAULT_USER_AGENT);
+
+    const claude = getCandyFingerprint('claude_code').buildProviderHeaders({ model: 'claude-x', prompt: '', scopeKey: '1:1' });
+    expect(claude['User-Agent']).toBe(BUILTIN_CLAUDE_CODE_USER_AGENT);
+    for (const id of ['codex', 'codex_chat'] as const) {
+      const codex = getCandyFingerprint(id).buildProviderHeaders({ model: 'gpt-x', prompt: '', scopeKey: '1:1' });
+      expect(codex['User-Agent']).toBe(BUILTIN_CODEX_USER_AGENT);
+      // The user agent's leading client name must match the originator: upstreams that gate
+      // on official Codex clients reject a mismatched pair.
+      expect(codex['User-Agent'].startsWith(`${codex.Originator}/`)).toBe(true);
+    }
   });
 
   it('sends the Claude Code identity line and user id in the Claude body', () => {
@@ -81,14 +102,75 @@ describe('candy fingerprints', () => {
     const profile = getCandyFingerprint('codex');
     expect(profile.downstreamFormat).toBe('responses');
     const headers = profile.buildProviderHeaders({ model: 'gpt-5.4', prompt: 'Q', scopeKey: '3:8' });
-    expect(headers['User-Agent']).toBe(CODEX_DEFAULT_USER_AGENT);
+    expect(headers['User-Agent']).toBe(BUILTIN_CODEX_USER_AGENT);
     expect(headers.Originator).toBe('codex_cli_rs');
-    expect(headers.Session_id).toMatch(/^[0-9a-f-]{36}$/i);
+    // The shape real Codex traffic was observed to carry: a hyphenated session-id and
+    // nothing else — no Version, no Conversation_id, no underscored Session_id.
+    expect(headers['session-id']).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(Object.keys(headers).sort()).toEqual(['Originator', 'User-Agent', 'session-id']);
 
     const body = profile.buildResponsesBody!({ model: 'gpt-5.4', prompt: 'Q', scopeKey: '3:8' }) as Record<string, any>;
     expect(body.store).toBe(false);
     expect(body.stream).toBe(true);
     expect(body.input[0].content[0].text).toBe('Q');
+  });
+
+  it('carries a Claude Code session header in the built-in template', () => {
+    const headers = getCandyFingerprint('claude_code').buildProviderHeaders({ model: 'claude-x', prompt: '', scopeKey: '9:1' });
+    expect(headers['x-claude-code-session-id']).toMatch(/^[0-9a-f-]{36}$/i);
+    // The same session the template user id names.
+    expect(buildClaudeCodeUserId('9:1')).toContain(headers['x-claude-code-session-id']);
+  });
+
+  it('follows observed body traits instead of the template on Claude', () => {
+    const body = CANDY_FINGERPRINTS.claude_code.buildClaudeBody!({
+      model: 'claude-opus-5-5',
+      prompt: 'Q',
+      scopeKey: '2:7',
+      bodyTraits: { hasTopLevelSystem: false, hasMetadataUserId: false },
+      sessionId: '11111111-2222-5333-8444-555555555555',
+    }) as Record<string, any>;
+    expect(body.system).toBeUndefined();
+    expect(body.metadata).toBeUndefined();
+    expect(body.max_tokens).toBe(CANDY_PROBE_MAX_OUTPUT_TOKENS);
+
+    const withUserId = CANDY_FINGERPRINTS.claude_code.buildClaudeBody!({
+      model: 'claude-opus-5-5',
+      prompt: 'Q',
+      scopeKey: '2:7',
+      bodyTraits: { hasTopLevelSystem: false, hasMetadataUserId: true },
+      sessionId: '11111111-2222-5333-8444-555555555555',
+    }) as Record<string, any>;
+    // The body-level session id matches the session header the identity carries.
+    expect(withUserId.metadata.user_id).toMatch(/_account__session_11111111-2222-5333-8444-555555555555$/);
+  });
+
+  it('follows observed body traits on Codex responses', () => {
+    const body = CANDY_FINGERPRINTS.codex.buildResponsesBody!({
+      model: 'gpt-5.6-luna',
+      prompt: 'Q',
+      scopeKey: '3:8',
+      bodyTraits: {
+        reasoningEffort: 'medium',
+        include: ['reasoning.encrypted_content'],
+        store: false,
+        hasMaxOutputTokens: false,
+        hasPromptCacheKey: true,
+        parallelToolCalls: true,
+      },
+      sessionId: '11111111-2222-5333-8444-555555555555',
+    }) as Record<string, any>;
+    expect(body).toEqual({
+      model: 'gpt-5.6-luna',
+      instructions: '',
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Q' }] }],
+      stream: true,
+      reasoning: { effort: 'medium' },
+      parallel_tool_calls: true,
+      include: ['reasoning.encrypted_content'],
+      store: false,
+      prompt_cache_key: '11111111-2222-5333-8444-555555555555',
+    });
   });
 
   it('wears the extension variant on chat: Codex identity, minimal headers, no session metadata', () => {
@@ -98,7 +180,7 @@ describe('candy fingerprints', () => {
     // Exactly the two identity headers the extension variant carries: adding
     // Session_id/Conversation_id/Version would describe a client that does not exist on
     // the chat surface.
-    expect(headers['User-Agent']).toBe(CODEX_DEFAULT_USER_AGENT);
+    expect(headers['User-Agent']).toBe(BUILTIN_CODEX_USER_AGENT);
     expect(headers.Originator).toBe('codex_cli_rs');
     expect(headers.Session_id).toBeUndefined();
     expect(headers.Conversation_id).toBeUndefined();

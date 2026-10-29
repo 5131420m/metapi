@@ -7,6 +7,7 @@ import { startProxyLogRetentionService } from './proxyLogRetentionService.js';
 import { invalidateSiteProxyCache } from './siteProxy.js';
 import { discardCandyProbeResults } from './candyProbe/resultStore.js';
 import { discardIdentityProbeResults } from './modelIdentityProbe/resultStore.js';
+import { discardObservedClientIdentities } from './observedClientIdentity.js';
 import {
   startModelAvailabilityProbeScheduler,
   stopModelAvailabilityProbeScheduler,
@@ -147,6 +148,8 @@ export async function performFactoryReset(deps: FactoryResetDependencies = {}): 
   await discardCandyProbeResults();
   // Model fingerprint verdicts: same lifecycle, same reasoning.
   await discardIdentityProbeResults();
+  // Observed client identities: in memory too, and debounced into `settings` the same way.
+  await discardObservedClientIdentities();
 
   await clearAllBusinessData();
   resetRuntimeConfigToInitialState(preserved);

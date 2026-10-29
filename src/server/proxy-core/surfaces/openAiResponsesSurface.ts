@@ -85,6 +85,7 @@ import {
   createSurfaceFailureToolkit,
   createSurfaceDispatchRequest,
   getSurfaceStickyPreferredChannelId,
+  recordSurfaceClientIdentityObservation,
   recordSurfaceSuccess,
   selectSurfaceChannelForAttempt,
   trySurfaceOauthRefreshRecovery,
@@ -886,6 +887,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
           streamDebugBody: unknown,
           upstreamUsagePresent: boolean,
         ) => {
+          recordSurfaceClientIdentityObservation({
+            clientContext,
+            downstreamFormat: 'responses',
+            headers: request.headers as Record<string, unknown>,
+            clientIp: request.ip,
+            body,
+          });
           try {
             await recordSurfaceSuccess({
               selected,
@@ -1463,6 +1471,13 @@ export async function handleOpenAiResponsesSurfaceRequest(
           normalized,
           usage: parsedUsage,
           serializationMode: isCompactRequest ? 'compact' : 'response',
+        });
+        recordSurfaceClientIdentityObservation({
+          clientContext,
+          downstreamFormat: 'responses',
+          headers: request.headers as Record<string, unknown>,
+          clientIp: request.ip,
+          body,
         });
         try {
           await recordSurfaceSuccess({

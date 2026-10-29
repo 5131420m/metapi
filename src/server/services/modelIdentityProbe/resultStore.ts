@@ -176,6 +176,11 @@ export function normalizeIdentityProbeResult(value: unknown): IdentityProbeResul
     checkedAt,
     config: normalizeConfig(value.config, model),
     trigger: 'manual',
+    // Rows written before the field existed were all measured under the neutral SDK identity.
+    identitySource: value.identitySource === 'observed' || value.identitySource === 'builtin'
+      ? value.identitySource
+      : 'sdk',
+    identityUserAgent: asStringOrNull(value.identityUserAgent),
   };
 }
 

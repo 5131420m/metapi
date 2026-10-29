@@ -21,7 +21,18 @@ import { refreshOauthAccessTokenSingleflight } from '../../services/oauth/refres
 import { proxyChannelCoordinator } from '../../services/proxyChannelCoordinator.js';
 import { runWithSiteApiEndpointPool, SiteApiEndpointRequestError } from '../../services/siteApiEndpointService.js';
 import { readRuntimeResponseText } from '../executors/types.js';
-import { selectProxyChannelForAttempt } from '../channelSelection.js';
+import {
+  isTrustedTesterRequest,
+  selectProxyChannelForAttempt,
+  TESTER_REQUEST_HEADER,
+} from '../channelSelection.js';
+import {
+  isObservedClientKind,
+  isObservedDownstreamFormat,
+  recordObservedClientIdentity,
+} from '../../services/observedClientIdentity.js';
+import { CANDY_PROBE_CLIENT_FAMILY } from '../../../shared/candyProbe.js';
+import { IDENTITY_PROBE_CLIENT_FAMILY } from '../../../shared/modelIdentityProbe.js';
 import { config } from '../../config.js';
 import {
   MAX_TOTAL_CHANNEL_ATTEMPTS,
@@ -557,6 +568,48 @@ export async function recordSurfaceSuccess(input: {
     estimatedCost,
     billingDetails,
   };
+}
+
+/**
+ * Record the client identity of one SUCCESSFUL real request (see `observedClientIdentity`).
+ *
+ * The single write point for observed identities. Only real CLI traffic is recorded: a
+ * playground request replays an observed identity, so recording it would make the store
+ * learn from itself; probes never pass through a surface, but are excluded defensively by
+ * their client family. Best-effort: a failure here never touches the request.
+ */
+export function recordSurfaceClientIdentityObservation(input: {
+  clientContext?: DownstreamClientContext | null;
+  downstreamFormat: string;
+  headers?: Record<string, unknown>;
+  clientIp?: string | null;
+  body?: unknown;
+}): void {
+  try {
+    const clientKind = input.clientContext?.clientKind as string | undefined;
+    if (clientKind === CANDY_PROBE_CLIENT_FAMILY || clientKind === IDENTITY_PROBE_CLIENT_FAMILY) return;
+    if (!isObservedClientKind(clientKind)) return;
+    if (!isObservedDownstreamFormat(input.downstreamFormat)) return;
+    // Any request carrying the tester marker is skipped, trusted or not: an untrusted one
+    // is not real CLI traffic either.
+    if (isTrustedTesterRequest({ headers: input.headers, clientIp: input.clientIp })
+      || hasTesterRequestMarker(input.headers)) {
+      return;
+    }
+    recordObservedClientIdentity({
+      clientKind,
+      downstreamFormat: input.downstreamFormat,
+      headers: input.headers,
+      body: input.body,
+    });
+  } catch (error) {
+    console.warn('[proxy/shared] failed to record client identity observation', error);
+  }
+}
+
+function hasTesterRequestMarker(headers: Record<string, unknown> | undefined): boolean {
+  if (!headers) return false;
+  return Object.keys(headers).some((key) => key.trim().toLowerCase() === TESTER_REQUEST_HEADER);
 }
 
 export function createSurfaceFailureToolkit(input: {

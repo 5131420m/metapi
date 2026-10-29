@@ -724,7 +724,8 @@ describe('runChannelCandyProbe', () => {
       // The body must carry the Claude Code identity line, and the headers its UA/x-app.
       expect(input.request.body.system[0].text).toContain('You are Claude Code');
       expect(input.request.body.metadata.user_id).toMatch(/^user_[0-9a-f]{64}_account__session_/);
-      expect(input.request.headers['User-Agent']).toContain('claude-cli/');
+      // The built-in template's own version, not the older proxy-runtime default.
+      expect(input.request.headers['User-Agent']).toBe('claude-cli/2.1.280 (external, cli)');
       expect(input.request.headers['X-App']).toBe('cli');
       return new Response(sseChatText(WRONG_ANSWER), {
         status: 200,
@@ -738,6 +739,86 @@ describe('runChannelCandyProbe', () => {
     expect(result.verdict).toBe('fail');
     expect(result.endpoint).toBe('messages');
     expect(dispatchRuntimeRequestMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('wears the observed Claude Code identity through the real passthrough rules', async () => {
+    const identityStore = await import('./observedClientIdentity.js');
+    const fixtures = await import('../test-fixtures/observedClientIdentityFixtures.js');
+    identityStore.resetObservedClientIdentityStoreForTests();
+    identityStore.recordObservedClientIdentity({
+      clientKind: 'claude_code',
+      downstreamFormat: 'claude',
+      headers: fixtures.CLAUDE_CODE_FIXTURE_HEADERS,
+      body: fixtures.CLAUDE_CODE_FIXTURE_BODY,
+    });
+    try {
+      const { channel } = await seedChannel({ platform: 'sub2api' });
+      resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['messages']);
+      let seen: { headers: Record<string, string>; body: Record<string, any> } | null = null;
+      dispatchRuntimeRequestMock.mockImplementation(async (input: {
+        request: { headers: Record<string, string>; body: Record<string, any> };
+      }) => {
+        seen = { headers: input.request.headers, body: input.request.body };
+        return new Response(sseChatText(WRONG_ANSWER), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      });
+
+      const result = await service.runChannelCandyProbe({ channelId: channel.id, random: () => 0 });
+
+      expect(result.identitySource).toBe('observed');
+      expect(result.identityUserAgent).toBe('claude-cli/2.1.151 (external, cli)');
+      expect(seen!.headers['User-Agent']).toBe('claude-cli/2.1.151 (external, cli)');
+      // Real Stainless values, not buildClaudeRuntimeHeaders' Windows/x64 defaults.
+      expect(seen!.headers['X-Stainless-Os']).toBe('MacOS');
+      expect(seen!.headers['X-Stainless-Package-Version']).toBe('0.112.1');
+      const sessionHeader = seen!.headers['x-claude-code-session-id'];
+      expect(sessionHeader).toMatch(/^[0-9a-f-]{36}$/);
+      expect(sessionHeader).not.toBe(fixtures.CLAUDE_CODE_FIXTURE_HEADERS['x-claude-code-session-id']);
+      // Real traffic on this box sends neither, so the probe sends neither.
+      expect(seen!.body.system).toBeUndefined();
+      expect(seen!.body.metadata).toBeUndefined();
+    } finally {
+      identityStore.resetObservedClientIdentityStoreForTests();
+    }
+  });
+
+  it('wears the observed Codex identity on responses without the template extras', async () => {
+    const identityStore = await import('./observedClientIdentity.js');
+    const fixtures = await import('../test-fixtures/observedClientIdentityFixtures.js');
+    identityStore.resetObservedClientIdentityStoreForTests();
+    identityStore.recordObservedClientIdentity({
+      clientKind: 'codex',
+      downstreamFormat: 'responses',
+      headers: fixtures.CODEX_RESPONSES_FIXTURE_HEADERS,
+      body: fixtures.CODEX_RESPONSES_FIXTURE_BODY,
+    });
+    try {
+      const { channel } = await seedChannel({ sourceModel: 'gpt-5.6-luna' });
+      resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['responses']);
+      let seen: { headers: Record<string, string>; body: Record<string, any> } | null = null;
+      dispatchRuntimeRequestMock.mockImplementation(async (input: {
+        request: { headers: Record<string, string>; body: Record<string, any> };
+      }) => {
+        seen = { headers: input.request.headers, body: input.request.body };
+        return new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      });
+
+      const result = await service.runChannelCandyProbe({ channelId: channel.id, random: () => 0 });
+
+      expect(result.identitySource).toBe('observed');
+      const headerNames = Object.keys(seen!.headers).map((key) => key.toLowerCase()).sort();
+      expect(headerNames).toContain('originator');
+      expect(headerNames).toContain('session-id');
+      expect(headerNames).not.toContain('version');
+      expect(headerNames).not.toContain('session_id');
+      expect(headerNames).not.toContain('conversation_id');
+      const userAgentKey = Object.keys(seen!.headers).find((key) => key.toLowerCase() === 'user-agent')!;
+      expect(seen!.headers[userAgentKey]).toBe(fixtures.CODEX_RESPONSES_FIXTURE_HEADERS['user-agent']);
+      expect(seen!.body.reasoning).toEqual({ effort: 'medium' });
+      expect(seen!.body.include).toEqual(['reasoning.encrypted_content']);
+      expect(seen!.body).not.toHaveProperty('max_output_tokens');
+    } finally {
+      identityStore.resetObservedClientIdentityStoreForTests();
+    }
   });
 
   it('wears the Codex identity the site gives real traffic, not a forced one', async () => {

@@ -16,12 +16,16 @@
  * Deliberate differences:
  * - the three challenges are sent ONE AFTER ANOTHER, each holding one probe slot and one site
  *   lease, so a run never takes three of a small site's slots at once;
- * - the request wears a neutral OpenAI-SDK identity, not the Claude Code / Codex identity the
- *   candy probe wears: the reference bank was sampled without those client prompts, and a
- *   ranking is only meaningful in the environment the bank was built in. The detail panel
- *   says so, because a relay that routes by client identity can legitimately make the two
- *   probes disagree;
- * - the request bodies come from the SDK (`buildIdentityRequestBody`), for the same reason.
+ * - the request HEADERS wear the client identity real traffic on this box was observed to
+ *   send (`observedClientIdentity`), the same identity the candy probe wears: a relay that
+ *   routes by client identity decides which backend answers, and "who answers real traffic"
+ *   is the question. A caller can ask for the neutral SDK identity instead (`clientIdentity:
+ *   'sdk'`) to compare the two;
+ * - the request BODY is always the SDK's (`buildIdentityRequestBody`), never the observed
+ *   body shape: the reference bank was sampled under that body, and a ranking is only
+ *   meaningful in the environment the bank was built in. Headers do not change what a model
+ *   writes; a relay that rewrites the body on seeing a CLI identity can, which the detail
+ *   panel says, and which the `sdk` comparison mode exists to expose.
  */
 
 import { config } from '../config.js';
@@ -51,7 +55,12 @@ import {
   safeUpdateSurfaceProxyDebugSelection,
   startSurfaceProxyDebugTrace,
 } from './proxyDebugTraceRuntime.js';
-import { getCandyFingerprint, isCandyCodexResponsesModel } from './candyProbe/fingerprints.js';
+import { isCandyCodexResponsesModel } from './candyProbe/fingerprints.js';
+import {
+  resolveClientIdentityProfile,
+  resolveSdkClientIdentityProfile,
+  type ClientIdentityProfile,
+} from './observedClientIdentity.js';
 import {
   extractCandyProbeAnswerPayload,
   isTruncatedStopReason,
@@ -87,6 +96,7 @@ import {
   IDENTITY_PROBE_VERDICT_LABELS,
 } from '../../shared/modelIdentityProbe.js';
 import type {
+  IdentityProbeClientIdentityMode,
   IdentityProbeRequestFormat,
   IdentityProbeSampleSummary,
 } from '../../shared/modelIdentityProbe.js';
@@ -255,11 +265,15 @@ export type RunChannelIdentityProbeInput = {
   requestId?: string | null;
   /** Override the run ceiling (tests use a short one). */
   timeoutMs?: number;
+  /** Header identity: observed real client (default) or the neutral SDK comparison mode. */
+  clientIdentity?: IdentityProbeClientIdentityMode;
 };
 
 /**
  * Run one detection round. Single-flight per channel: a second click while a run is going
- * gets the same promise, so it costs no extra upstream requests.
+ * gets the same promise, so it costs no extra upstream requests — even when the second call
+ * asks for a different `clientIdentity` (it then receives the running run's result, whose
+ * `identitySource` says which identity was used).
  */
 export function runChannelIdentityProbe(input: RunChannelIdentityProbeInput): Promise<IdentityProbeResult> {
   const channelId = Math.trunc(input.channelId);
@@ -295,6 +309,20 @@ async function executeIdentityProbe(input: RunChannelIdentityProbeInput): Promis
 
   const context = await loadChannelContext(channelId);
   const requestFormat = resolveIdentityRequestFormat(context.modelName);
+  const identitySessionSeed = `identity:${context.site.id}:${channelId}`;
+  const identity: ClientIdentityProfile = input.clientIdentity === 'sdk'
+    ? resolveSdkClientIdentityProfile(identitySessionSeed, context.modelName)
+    : resolveClientIdentityProfile({
+      downstreamFormat: requestFormat,
+      sessionSeed: identitySessionSeed,
+      modelName: context.modelName,
+    });
+  // Identity headers ride as DOWNSTREAM headers (the passthrough rules real traffic meets);
+  // provider headers carry the OAuth account headers, plus the SDK identity in `sdk` mode.
+  const providerHeaders = {
+    ...buildOauthProviderHeaders({ account: context.account, downstreamHeaders: identity.downstreamHeaders }),
+    ...identity.providerHeaders,
+  };
   const baseConfig: IdentityProbeConfigFingerprint = {
     model: context.modelName,
     accountId: context.accountId,
@@ -328,6 +356,8 @@ async function executeIdentityProbe(input: RunChannelIdentityProbeInput): Promis
       checkedAt: new Date().toISOString(),
       config: baseConfig,
       trigger: 'manual',
+      identitySource: identity.source,
+      identityUserAgent: identity.userAgent,
       ...partial,
     };
   };
@@ -377,17 +407,8 @@ async function executeIdentityProbe(input: RunChannelIdentityProbeInput): Promis
     return finish(buildResult({ verdict: 'inconclusive', reason: '没有可用的上游端点候选', config: config_ }), []);
   }
 
-  // 3. Three challenges, one after another.
+  // 3. Three challenges, one after another, all wearing one identity (one session id).
   const challenges = generateIdentityChallenges();
-  const providerHeaders = {
-    ...buildOauthProviderHeaders({ account: context.account, downstreamHeaders: {} }),
-    // The neutral SDK identity (see the module comment for why not Claude Code / Codex).
-    ...getCandyFingerprint('generic_openai').buildProviderHeaders({
-      model: context.modelName,
-      prompt: '',
-      scopeKey: `${context.site.id}:${channelId}`,
-    }),
-  };
   const outcomes: ChallengeOutcome[] = [];
   for (let index = 0; index < challenges.length; index += 1) {
     const challenge = challenges[index]!;
@@ -397,6 +418,7 @@ async function executeIdentityProbe(input: RunChannelIdentityProbeInput): Promis
       index: index + 1,
       requestFormat,
       endpointCandidates,
+      identity,
       providerHeaders,
       oauth,
       deadlineAtMs: deadline.deadlineAtMs,
@@ -460,6 +482,7 @@ async function runChallenge(input: {
   index: number;
   requestFormat: IdentityProbeRequestFormat;
   endpointCandidates: UpstreamEndpoint[];
+  identity: ClientIdentityProfile;
   providerHeaders: Record<string, string>;
   oauth: ReturnType<typeof getOauthInfoFromAccount>;
   deadlineAtMs: number;
@@ -491,6 +514,14 @@ async function runChallenge(input: {
   const claudeBody = buildIdentityRequestBody('claude', context.modelName, challenge.prompt);
   const responsesBody = buildIdentityRequestBody('responses', context.modelName, challenge.prompt);
   const channelProxyUrl = resolveChannelProxyUrl(context.site, context.account.extraConfig);
+  // Same rule as the candy probe: a client identity follows the site's Codex identity
+  // setting (it only adds `client_metadata` and headers, never prompt text); the chat
+  // surface and the neutral SDK identity never synthesize one.
+  const codexIdentityMode: 'off' | 'synthesize' | undefined = (
+    input.identity.source === 'sdk' || input.requestFormat === 'openai'
+      ? 'off'
+      : context.site.codexIdentityMode as 'off' | 'synthesize' | undefined
+  );
 
   const debugTrace = await startSurfaceProxyDebugTrace({
     downstreamPath: resolveDownstreamPath(input.requestFormat),
@@ -499,7 +530,7 @@ async function runChallenge(input: {
     traceHint: `identity-probe:${context.channelId}:${input.index}`,
     requestedModel: context.modelName,
     downstreamApiKeyId: null,
-    requestHeaders: input.providerHeaders,
+    requestHeaders: { ...input.identity.downstreamHeaders, ...input.providerHeaders },
     requestBody: input.requestFormat === 'claude' ? claudeBody : input.requestFormat === 'responses' ? responsesBody : openaiBody,
   });
   await safeUpdateSurfaceProxyDebugSelection(debugTrace, {
@@ -515,6 +546,9 @@ async function runChallenge(input: {
       source: IDENTITY_PROBE_CLIENT_FAMILY,
       challengeId: challenge.id,
       expectedCount,
+      identitySource: input.identity.source,
+      identityUserAgent: input.identity.userAgent,
+      codexIdentityMode: codexIdentityMode ?? 'off',
     },
   });
 
@@ -539,12 +573,11 @@ async function runChallenge(input: {
             siteUrl: target.baseUrl,
             openaiBody,
             downstreamFormat: input.requestFormat,
-            downstreamHeaders: {},
+            downstreamHeaders: input.identity.downstreamHeaders,
             providerHeaders: input.providerHeaders,
             claudeOriginalBody: claudeBody,
             responsesOriginalBody: responsesBody,
-            // A neutral SDK client synthesizes no Codex session identity.
-            codexIdentityMode: 'off',
+            codexIdentityMode,
             codexIdentityScopeKey: `site:${context.site.id}`,
             codexIdentityTurnKey: input.requestId ?? undefined,
           });

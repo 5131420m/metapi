@@ -321,6 +321,131 @@ describe('testRoutes proxy tester transport', () => {
     expect(response.payload).toBe('data: line one\ndata: line two\ndata: \n\ndata: [DONE]\n\n');
   });
 
+  it('sends a neutral identity by default instead of undici defaults', async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/test/proxy',
+      payload: {
+        method: 'POST',
+        path: '/v1/chat/completions',
+        requestKind: 'json',
+        stream: false,
+        jobMode: false,
+        rawMode: false,
+        jsonBody: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'ping' }] },
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    // The body is untouched: the identity travels in a response header only.
+    expect(response.json()).toEqual({ ok: true });
+    const [, requestInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const headers = requestInit.headers as Record<string, string>;
+    expect(headers['user-agent']).toBe('metapi-tester');
+    // Blank values override undici's `accept: */*` / `accept-language: *`; every passthrough
+    // filter drops empty values, so neither reaches the upstream.
+    expect(headers.accept).toBe('');
+    expect(headers['accept-language']).toBe('');
+    const identity = JSON.parse(decodeURIComponent(String(response.headers['x-metapi-tester-identity'])));
+    expect(identity).toEqual({ source: 'none', clientKind: 'generic', userAgent: 'metapi-tester', observedAt: null });
+  });
+
+  it('wears the observed client identity when asked, with a per-conversation session', async () => {
+    const identityStore = await import('../../services/observedClientIdentity.js');
+    const fixtures = await import('../../test-fixtures/observedClientIdentityFixtures.js');
+    identityStore.resetObservedClientIdentityStoreForTests();
+    identityStore.recordObservedClientIdentity({
+      clientKind: 'claude_code',
+      downstreamFormat: 'claude',
+      headers: fixtures.CLAUDE_CODE_FIXTURE_HEADERS,
+    });
+    try {
+      fetchMock.mockImplementation(async () => new Response(JSON.stringify({ type: 'message', content: [] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+      const send = (seed: string) => app.inject({
+        method: 'POST',
+        url: '/api/test/proxy',
+        payload: {
+          method: 'POST',
+          path: '/v1/messages',
+          requestKind: 'json',
+          stream: false,
+          jobMode: false,
+          rawMode: false,
+          forcedChannelId: 12,
+          clientIdentity: 'observed',
+          identitySessionSeed: seed,
+          jsonBody: { model: 'claude-opus-5-5', max_tokens: 16, messages: [{ role: 'user', content: 'ping' }] },
+        },
+      });
+      const first = await send('conversation-a');
+      await send('conversation-a');
+      await send('conversation-b');
+
+      const sent = fetchMock.mock.calls.map((call) => (call[1] as RequestInit).headers as Record<string, string>);
+      expect(sent[0]!['user-agent']).toBe('claude-cli/2.1.151 (external, cli)');
+      expect(sent[0]!['x-app']).toBe('cli');
+      expect(sent[0]!['x-stainless-os']).toBe('MacOS');
+      // The tester markers and credentials are never replaced by the identity.
+      expect(sent[0]![ 'x-metapi-tester-request']).toBe('1');
+      expect(sent[0]!['x-metapi-tester-forced-channel-id']).toBe('12');
+      expect(sent[0]!['user-agent']).not.toContain('undici');
+      const session = sent[0]!['x-claude-code-session-id'];
+      expect(session).toMatch(/^[0-9a-f-]{36}$/);
+      expect(session).not.toBe(fixtures.CLAUDE_CODE_FIXTURE_HEADERS['x-claude-code-session-id']);
+      expect(sent[1]!['x-claude-code-session-id']).toBe(session);
+      expect(sent[2]!['x-claude-code-session-id']).not.toBe(session);
+
+      const identity = JSON.parse(decodeURIComponent(String(first.headers['x-metapi-tester-identity'])));
+      expect(identity).toMatchObject({
+        source: 'observed',
+        clientKind: 'claude_code',
+        userAgent: 'claude-cli/2.1.151 (external, cli)',
+      });
+      // The request body is the user's, untouched by the identity.
+      expect(JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body))).toEqual({
+        model: 'claude-opus-5-5',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'ping' }],
+        stream: false,
+      });
+    } finally {
+      identityStore.resetObservedClientIdentityStoreForTests();
+    }
+  });
+
+  it('falls back to the built-in identity when nothing was observed', async () => {
+    const identityStore = await import('../../services/observedClientIdentity.js');
+    identityStore.resetObservedClientIdentityStoreForTests();
+    fetchMock.mockResolvedValue(new Response(JSON.stringify({ object: 'response' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/test/proxy',
+      payload: {
+        method: 'POST',
+        path: '/v1/responses',
+        requestKind: 'json',
+        stream: false,
+        jobMode: false,
+        rawMode: false,
+        clientIdentity: 'observed',
+        jsonBody: { model: 'gpt-5.4', input: 'ping' },
+      },
+    });
+    const headers = (fetchMock.mock.calls[0]![1] as RequestInit).headers as Record<string, string>;
+    expect(headers['user-agent']).toBe('codex_cli_rs/0.165.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464');
+    expect(headers.originator).toBe('codex_cli_rs');
+    expect(JSON.parse(decodeURIComponent(String(response.headers['x-metapi-tester-identity']))).source).toBe('builtin');
+  });
+
   it('cancels and releases SSE readers when stream forwarding fails', async () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
     const releaseLock = vi.fn();

@@ -1,14 +1,15 @@
 import { pbkdf2Sync, randomUUID } from 'node:crypto';
 import { inferCodexOfficialOriginator } from '../../shared/codexClientFamily.js';
 
-// Exported so the candy-probe client fingerprints reuse the very same identity strings the
-// proxy runtime sends: one source of truth per client version.
+// The proxy runtime's fallback client identity: what a real proxied request (and the OAuth
+// quota probe) wears when it arrives without one.
 //
-// NOTE: these are the identity of EVERY real proxied request, not just the probe's. Moving
-// them to a newer CLI version is a cross-cutting change to the whole box's request camouflage
-// and belongs in its own PR, with its own assessment of the Codex OAuth / Claude upstream
-// risk — not bundled into a feature branch. The probe follows whatever is here, which is the
-// point: it has to look like the traffic it stands in for.
+// NOTE: these are the identity of EVERY real proxied request. Moving them to a newer CLI
+// version is a cross-cutting change to the whole box's request camouflage and belongs in its
+// own PR, with its own assessment of the Codex OAuth / Claude upstream risk — not bundled
+// into a feature branch. The synthetic requests (candy probe, model identity probe,
+// playground) do NOT use these: they wear the observed real-client identity, or the built-in
+// template in `services/candyProbe/fingerprints.ts` when nothing has been observed.
 export const CODEX_CLIENT_VERSION = '0.101.0';
 export const CODEX_DEFAULT_USER_AGENT = 'codex_cli_rs/0.101.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
 export const CLAUDE_DEFAULT_USER_AGENT = 'claude-cli/2.1.63 (external, cli)';

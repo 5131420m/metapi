@@ -80,6 +80,10 @@ import {
   normalizeCandyProbeUsage,
 } from './candyProbe/responseParsing.js';
 import {
+  resolveClientIdentityProfile,
+  resolveSdkClientIdentityProfile,
+} from './observedClientIdentity.js';
+import {
   candyProbeConfigMatches,
   getCandyProbeResultForChannel,
   getCandyProbeSnapshots,
@@ -620,6 +624,18 @@ async function runChannelCandyProbeUnbounded(input: {
   const context = await loadChannelProbeContext(channelId);
   const fingerprintId = resolveFingerprintId(context.modelName, input.fingerprint);
   const fingerprint = getCandyFingerprint(fingerprintId);
+  // The fingerprint picks the protocol; the identity worn on it is what real traffic of that
+  // client was observed to send on this box (built-in template until something is observed).
+  // The neutral SDK profile was never real traffic, so it keeps its template identity.
+  const identitySessionSeed = `candy:${context.site.id}:${channelId}`;
+  const identity = fingerprintId === 'generic_openai'
+    ? resolveSdkClientIdentityProfile(identitySessionSeed, context.modelName)
+    : resolveClientIdentityProfile({
+      downstreamFormat: fingerprint.downstreamFormat,
+      clientKind: fingerprintId === 'claude_code' ? 'claude_code' : 'codex',
+      sessionSeed: identitySessionSeed,
+      modelName: context.modelName,
+    });
 
   const random = input.random ?? Math.random;
   const question = selectCandyBagQuestion(random);
@@ -638,6 +654,11 @@ async function runChannelCandyProbeUnbounded(input: {
       responseBody?: unknown;
     } = {},
   ): Promise<CandyProbeResult> => {
+    result = {
+      ...result,
+      identitySource: identity.source,
+      identityUserAgent: identity.userAgent,
+    };
     // A probe that started before a factory reset / backup import describes a database that
     // is gone, and after the replacement a channel id can even be reused. Record it only if
     // the store has not been reset meanwhile.
@@ -675,6 +696,8 @@ async function runChannelCandyProbeUnbounded(input: {
     model: context.modelName,
     prompt,
     scopeKey: `${context.site.id}:${channelId}`,
+    bodyTraits: identity.bodyTraits,
+    sessionId: identity.sessionId,
   };
 
   try {
@@ -709,13 +732,18 @@ async function runChannelCandyProbeUnbounded(input: {
       return finish(result);
     }
 
-    const oauthProviderHeaders = buildOauthProviderHeaders({
-      account: context.account,
-      downstreamHeaders: {},
-    });
+    // Identity headers ride as DOWNSTREAM headers, so the upstream builder applies exactly
+    // the passthrough rules a real request of this client meets (which headers survive per
+    // protocol, Claude's Stainless set, …). Provider headers keep only what is not identity:
+    // the OAuth account headers — plus the neutral SDK identity, which has no real traffic
+    // to mirror.
+    const downstreamIdentityHeaders = identity.downstreamHeaders;
     const providerHeaders = {
-      ...oauthProviderHeaders,
-      ...fingerprint.buildProviderHeaders(fingerprintInput),
+      ...buildOauthProviderHeaders({
+        account: context.account,
+        downstreamHeaders: downstreamIdentityHeaders,
+      }),
+      ...identity.providerHeaders,
     };
     const openaiBody = fingerprint.buildOpenAiBody(fingerprintInput);
     const claudeBody = fingerprint.buildClaudeBody?.(fingerprintInput);
@@ -742,7 +770,7 @@ async function runChannelCandyProbeUnbounded(input: {
       traceHint: `candy-probe:${channelId}`,
       requestedModel: context.modelName,
       downstreamApiKeyId: null,
-      requestHeaders: providerHeaders,
+      requestHeaders: { ...downstreamIdentityHeaders, ...providerHeaders },
       requestBody: claudeBody ?? responsesBody ?? openaiBody,
     });
     await safeUpdateSurfaceProxyDebugSelection(debugTrace, {
@@ -760,6 +788,9 @@ async function runChannelCandyProbeUnbounded(input: {
         questionId: question.id,
         // Recorded so a trace shows whether the probe looked like the CLI it claims to be.
         codexIdentityMode: probeCodexIdentityMode ?? 'off',
+        identitySource: identity.source,
+        identityUserAgent: identity.userAgent,
+        identityObservedAt: identity.observedAt,
       },
     });
 
@@ -792,7 +823,7 @@ async function runChannelCandyProbeUnbounded(input: {
               siteUrl: target.baseUrl,
               openaiBody,
               downstreamFormat: fingerprint.downstreamFormat,
-              downstreamHeaders: {},
+              downstreamHeaders: downstreamIdentityHeaders,
               providerHeaders,
               claudeOriginalBody: claudeBody,
               responsesOriginalBody: responsesBody,

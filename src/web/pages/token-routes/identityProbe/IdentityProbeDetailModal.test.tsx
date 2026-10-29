@@ -80,6 +80,16 @@ describe('IdentityProbeDetailModal', () => {
     expect(root.root.findAll((node) => node.props?.['data-testid'] === 'probe-combined-summary')).toHaveLength(0);
   });
 
+  it('names the client identity the challenges were sent with', () => {
+    const observed = allText(render({
+      result: buildResult({ identitySource: 'observed', identityUserAgent: 'claude-cli/2.1.151 (external, cli)' }),
+    }));
+    expect(observed).toContain('观察到的真实客户端 · claude-cli/2.1.151 (external, cli)');
+    expect(allText(render({ result: buildResult({ identitySource: 'builtin' }) }))).toContain('未观察到真实客户端');
+    // Rows stored before the field existed were sent under the neutral SDK identity.
+    expect(allText(render())).toContain('中性 SDK');
+  });
+
   it('shows the empty state without a result', () => {
     const root = render({ result: null });
     expect(allText(root)).toContain('还没有模型指纹检测结果');

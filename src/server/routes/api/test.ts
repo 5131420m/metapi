@@ -8,6 +8,7 @@ import {
   TESTER_FORCED_CHANNEL_HEADER,
   TESTER_REQUEST_HEADER,
 } from '../../proxy-core/channelSelection.js';
+import { resolveClientIdentityProfile } from '../../services/observedClientIdentity.js';
 
 type UndiciRequestInit = Parameters<typeof fetch>[1];
 
@@ -64,6 +65,9 @@ type ProxyTestEnvelope = {
   rawJsonText?: string;
   multipartFields?: Record<string, string>;
   multipartFiles?: ProxyTestMultipartFile[];
+  clientIdentity?: unknown;
+  clientIdentityUserAgent?: unknown;
+  identitySessionSeed?: unknown;
 };
 
 type ValidatedProxyTestEnvelope = {
@@ -78,7 +82,30 @@ type ValidatedProxyTestEnvelope = {
   rawJsonText?: string;
   multipartFields?: Record<string, string>;
   multipartFiles?: ProxyTestMultipartFile[];
+  clientIdentity: TesterClientIdentityMode;
+  clientIdentityUserAgent?: string;
+  identitySessionSeed?: string;
 };
+
+/**
+ * `observed`: the loopback request wears the client identity real traffic on this box was
+ * observed to send, so the proxy treats it exactly like that client. `none` (the default,
+ * and every legacy caller): a bare protocol request with a neutral user agent.
+ */
+type TesterClientIdentityMode = 'observed' | 'none';
+
+/** What the playground reports back about the identity a request wore (no session values). */
+type TesterIdentitySummary = {
+  source: string;
+  clientKind: string;
+  userAgent: string | null;
+  observedAt: string | null;
+};
+
+const TESTER_NEUTRAL_USER_AGENT = 'metapi-tester';
+const TESTER_IDENTITY_RESPONSE_HEADER = 'x-metapi-tester-identity';
+const MAX_IDENTITY_SEED_LENGTH = 128;
+const MAX_IDENTITY_USER_AGENT_LENGTH = 1_024;
 
 type TestJobStatus = 'pending' | 'succeeded' | 'failed' | 'cancelled';
 
@@ -88,6 +115,8 @@ type TestProxyJob = {
   envelope: ValidatedProxyTestEnvelope;
   result?: unknown;
   error?: unknown;
+  /** The client identity the job's request wore. */
+  identity?: TesterIdentitySummary;
   controller?: AbortController | null;
   createdAt: number;
   updatedAt: number;
@@ -305,6 +334,7 @@ function convertLegacyPayloadToEnvelope(
       jobMode: false,
       rawMode: false,
       forcedChannelId: payload.forcedChannelId ?? null,
+      clientIdentity: 'none',
       jsonBody: convertOpenAiPayloadToClaudeBody(payload, forceStream),
     };
   }
@@ -318,6 +348,7 @@ function convertLegacyPayloadToEnvelope(
       jobMode: false,
       rawMode: false,
       forcedChannelId: payload.forcedChannelId ?? null,
+      clientIdentity: 'none',
       jsonBody: convertOpenAiPayloadToResponsesBody(payload, forceStream),
     };
   }
@@ -330,6 +361,7 @@ function convertLegacyPayloadToEnvelope(
     jobMode: false,
     rawMode: false,
     forcedChannelId: payload.forcedChannelId ?? null,
+    clientIdentity: 'none',
     jsonBody: {
       model: payload.model,
       messages: payload.messages,
@@ -394,7 +426,14 @@ function validateProxyEnvelope(
     jobMode: body.jobMode === true,
     rawMode: body.rawMode === true,
     forcedChannelId: normalizeForcedChannelId(body.forcedChannelId),
+    clientIdentity: body.clientIdentity === 'observed' ? 'observed' : 'none',
   };
+  if (typeof body.clientIdentityUserAgent === 'string' && body.clientIdentityUserAgent.trim()) {
+    envelope.clientIdentityUserAgent = body.clientIdentityUserAgent.trim().slice(0, MAX_IDENTITY_USER_AGENT_LENGTH);
+  }
+  if (typeof body.identitySessionSeed === 'string' && body.identitySessionSeed.trim()) {
+    envelope.identitySessionSeed = body.identitySessionSeed.trim().slice(0, MAX_IDENTITY_SEED_LENGTH);
+  }
 
   if (requestKind === 'json') {
     if (typeof body.rawJsonText === 'string' && body.rawJsonText.trim().length > 0) {
@@ -505,11 +544,88 @@ function serializeJsonEnvelopeBody(
   return JSON.stringify({ stream: forceStream });
 }
 
+/** The downstream protocol a tester path speaks, for the paths a client identity applies to. */
+function resolveIdentityDownstreamFormat(path: string): 'claude' | 'responses' | 'openai' | null {
+  const pathname = path.split('?')[0]!.toLowerCase();
+  if (pathname === '/v1/messages') return 'claude';
+  if (pathname === '/v1/responses' || pathname === '/v1/responses/compact') return 'responses';
+  if (pathname === '/v1/chat/completions') return 'openai';
+  return null;
+}
+
+/** Headers an identity may never replace: credentials, content type and the tester markers. */
+function isProtectedTesterHeader(key: string): boolean {
+  const normalized = key.toLowerCase();
+  return normalized === 'authorization'
+    || normalized === 'x-api-key'
+    || normalized === 'x-goog-api-key'
+    || normalized === 'content-type'
+    || normalized.startsWith('x-metapi-');
+}
+
+/**
+ * The client identity one tester request wears, resolved through the shared identity store
+ * (never recorded: the proxy surfaces skip tester requests when they learn identities).
+ */
+function resolveTesterIdentity(envelope: ValidatedProxyTestEnvelope): {
+  headers: Record<string, string>;
+  summary: TesterIdentitySummary;
+} {
+  const downstreamFormat = envelope.clientIdentity === 'observed' && envelope.method === 'POST'
+    ? resolveIdentityDownstreamFormat(envelope.path)
+    : null;
+  if (!downstreamFormat) {
+    return {
+      headers: { 'user-agent': TESTER_NEUTRAL_USER_AGENT },
+      summary: { source: 'none', clientKind: 'generic', userAgent: TESTER_NEUTRAL_USER_AGENT, observedAt: null },
+    };
+  }
+  const profile = resolveClientIdentityProfile({
+    downstreamFormat,
+    variantUserAgent: envelope.clientIdentityUserAgent ?? null,
+    // One seed per playground conversation: a stable session of its own, never a real one.
+    sessionSeed: `tester:${envelope.identitySessionSeed || randomUUID()}`,
+  });
+  const headers = { ...profile.downstreamHeaders };
+  if (!Object.keys(headers).some((key) => key.toLowerCase() === 'user-agent')) {
+    headers['user-agent'] = TESTER_NEUTRAL_USER_AGENT;
+  }
+  return {
+    headers,
+    summary: {
+      source: profile.source,
+      clientKind: profile.clientKind,
+      userAgent: profile.userAgent,
+      observedAt: profile.observedAt,
+    },
+  };
+}
+
+/** Response header value: URI-encoded JSON, so any user agent survives as a header. */
+function encodeTesterIdentityHeader(summary: TesterIdentitySummary): string {
+  return encodeURIComponent(JSON.stringify(summary));
+}
+
 async function buildUpstreamRequestInit(
   envelope: ValidatedProxyTestEnvelope,
   forceStream: boolean,
-): Promise<UndiciRequestInit> {
-  const headers: Record<string, string> = createDefaultHeadersForPath(envelope.path);
+): Promise<{ init: UndiciRequestInit; identity: TesterIdentitySummary }> {
+  const identity = resolveTesterIdentity(envelope);
+  const headers: Record<string, string> = {
+    // undici's fetch adds `accept: */*` and `accept-language: *` unless told otherwise, and
+    // both sit on the proxy's passthrough allowlist. An empty value is dropped by every
+    // passthrough filter, so the upstream sees exactly the headers the identity carries.
+    accept: '',
+    'accept-language': '',
+  };
+  for (const [key, value] of Object.entries(identity.headers)) {
+    if (!isProtectedTesterHeader(key)) headers[key] = value;
+  }
+  for (const [key, value] of Object.entries(createDefaultHeadersForPath(envelope.path))) {
+    // The identity's own anthropic-version wins over the tester default; credentials do not.
+    if (key.toLowerCase() === 'anthropic-version' && headers['anthropic-version']) continue;
+    headers[key] = value;
+  }
   headers[TESTER_REQUEST_HEADER] = '1';
   if (typeof envelope.forcedChannelId === 'number' && envelope.forcedChannelId > 0) {
     headers[TESTER_FORCED_CHANNEL_HEADER] = String(envelope.forcedChannelId);
@@ -518,9 +634,12 @@ async function buildUpstreamRequestInit(
   if (envelope.requestKind === 'json') {
     headers['Content-Type'] = 'application/json';
     return {
-      method: envelope.method,
-      headers,
-      body: serializeJsonEnvelopeBody(envelope, forceStream),
+      identity: identity.summary,
+      init: {
+        method: envelope.method,
+        headers,
+        body: serializeJsonEnvelopeBody(envelope, forceStream),
+      },
     };
   }
 
@@ -541,15 +660,21 @@ async function buildUpstreamRequestInit(
     }
 
     return {
-      method: envelope.method,
-      headers,
-      body: formData as any,
+      identity: identity.summary,
+      init: {
+        method: envelope.method,
+        headers,
+        body: formData as any,
+      },
     };
   }
 
   return {
-    method: envelope.method,
-    headers,
+    identity: identity.summary,
+    init: {
+      method: envelope.method,
+      headers,
+    },
   };
 }
 
@@ -557,9 +682,12 @@ async function fetchProxyBuffered(
   envelope: ValidatedProxyTestEnvelope,
   signal?: AbortSignal,
   forceStream = false,
+  onIdentity?: (identity: TesterIdentitySummary) => void,
 ): Promise<unknown> {
+  const { init, identity } = await buildUpstreamRequestInit(envelope, forceStream);
+  onIdentity?.(identity);
   const upstream = await fetch(`http://127.0.0.1:${config.port}${envelope.path}`, {
-    ...(await buildUpstreamRequestInit(envelope, forceStream)),
+    ...init,
     signal,
   });
 
@@ -602,7 +730,9 @@ async function runJob(jobId: string) {
   job.controller = controller;
 
   try {
-    const result = await fetchProxyBuffered(job.envelope, controller.signal, job.envelope.stream);
+    const result = await fetchProxyBuffered(job.envelope, controller.signal, job.envelope.stream, (identity) => {
+      job.identity = identity;
+    });
     const current = jobs.get(jobId);
     if (!current) return;
     current.controller = null;
@@ -638,7 +768,9 @@ async function sendBufferedEnvelope(
   forceStream = false,
 ) {
   try {
-    const data = await fetchProxyBuffered(envelope, undefined, forceStream);
+    const data = await fetchProxyBuffered(envelope, undefined, forceStream, (identity) => {
+      reply.header(TESTER_IDENTITY_RESPONSE_HEADER, encodeTesterIdentityHeader(identity));
+    });
     return reply.send(data);
   } catch (error) {
     if (error instanceof UpstreamProxyError) {
@@ -683,9 +815,13 @@ async function sendStreamingEnvelope(
   reply.raw.on('close', onClientClosed);
 
   let upstream;
+  let identity: TesterIdentitySummary | null = null;
   try {
+    const built = await buildUpstreamRequestInit(envelope, forceStream);
+    identity = built.identity;
+    reply.header(TESTER_IDENTITY_RESPONSE_HEADER, encodeTesterIdentityHeader(identity));
     upstream = await fetch(`http://127.0.0.1:${config.port}${envelope.path}`, {
-      ...(await buildUpstreamRequestInit(envelope, forceStream)),
+      ...built.init,
       signal: controller.signal,
     });
   } catch (error) {
@@ -722,6 +858,8 @@ async function sendStreamingEnvelope(
   reply.raw.setHeader('Cache-Control', 'no-cache, no-transform');
   reply.raw.setHeader('Connection', 'keep-alive');
   reply.raw.setHeader('X-Accel-Buffering', 'no');
+  // A hijacked reply bypasses Fastify's own header list, so the identity goes on the raw response.
+  if (identity) reply.raw.setHeader(TESTER_IDENTITY_RESPONSE_HEADER, encodeTesterIdentityHeader(identity));
 
   try {
     if (contentType.includes('text/event-stream')) {
@@ -835,6 +973,7 @@ export async function testRoutes(app: FastifyInstance) {
         status: job.status,
         result: job.result,
         error: job.error,
+        ...(job.identity ? { identity: job.identity } : {}),
         createdAt: new Date(job.createdAt).toISOString(),
         updatedAt: new Date(job.updatedAt).toISOString(),
         expiresAt: new Date(job.expiresAt).toISOString(),

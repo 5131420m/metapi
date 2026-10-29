@@ -98,6 +98,23 @@ export type TesterProxyEnvelope = {
   rawJsonText?: string;
   multipartFields?: Record<string, string>;
   multipartFiles?: PlaygroundMultipartFile[];
+  /** `observed` wears the real client identity seen on this box; absent = bare protocol. */
+  clientIdentity?: TesterClientIdentityMode;
+  /** Pin one observed variant by its user agent (absent = the most recent). */
+  clientIdentityUserAgent?: string;
+  /** Stable per conversation, so its requests share one session like a real client's. */
+  identitySessionSeed?: string;
+};
+
+/** `observed`: follow the real client; `none`: a bare protocol request. */
+export type TesterClientIdentityMode = 'observed' | 'none';
+
+/** What the server reports about the identity one request wore. */
+export type TesterIdentitySummary = {
+  source: 'observed' | 'builtin' | 'sdk' | 'none' | string;
+  clientKind: string;
+  userAgent: string | null;
+  observedAt: string | null;
 };
 
 export type ModelTesterInputs = {
@@ -148,12 +165,20 @@ export type ModelTesterSessionState = {
   pendingPayload: TesterProxyEnvelope | null;
   pendingJobId?: string | null;
   forcedChannelId?: number | null;
+  /** Absent in sessions saved before the selector existed: read back as the default. */
+  clientIdentity?: TesterClientIdentityMode;
+  clientIdentityUserAgent?: string | null;
+  /** The conversation's identity seed; reset with the conversation. */
+  identitySessionSeed?: string | null;
   customRequestMode: boolean;
   customRequestBody: string;
   showDebugPanel: boolean;
   activeDebugTab: DebugTab;
   modeState: ModelTesterModeState;
 };
+
+/** New conversations follow the real client by default. */
+export const DEFAULT_TESTER_CLIENT_IDENTITY: TesterClientIdentityMode = 'observed';
 
 export type TestChatPayload = TesterProxyEnvelope;
 export type ProxyTestEnvelope = TesterProxyEnvelope;
@@ -1164,6 +1189,16 @@ export const parseModelTesterSession = (raw: string | null): ModelTesterSessionS
     customRequestMode: toBoolean(parsed.customRequestMode, false),
     customRequestBody: typeof parsed.customRequestBody === 'string' ? parsed.customRequestBody : '',
     forcedChannelId: toPositiveInteger(parsed.forcedChannelId),
+    // Left undefined when absent: the page applies DEFAULT_TESTER_CLIENT_IDENTITY / a fresh seed.
+    clientIdentity: parsed.clientIdentity === 'none' || parsed.clientIdentity === 'observed'
+      ? parsed.clientIdentity
+      : undefined,
+    clientIdentityUserAgent: typeof parsed.clientIdentityUserAgent === 'string' && parsed.clientIdentityUserAgent.trim()
+      ? parsed.clientIdentityUserAgent.trim()
+      : undefined,
+    identitySessionSeed: typeof parsed.identitySessionSeed === 'string' && parsed.identitySessionSeed.trim()
+      ? parsed.identitySessionSeed.trim()
+      : undefined,
     showDebugPanel: toBoolean(parsed.showDebugPanel, false),
     activeDebugTab: typeof parsed.activeDebugTab === 'string' && VALID_DEBUG_TABS.has(parsed.activeDebugTab)
       ? parsed.activeDebugTab as DebugTab
@@ -1368,6 +1403,65 @@ export const attachForcedChannelToEnvelope = (
     ...envelope,
     forcedChannelId: normalizedForcedChannelId,
   };
+};
+
+/**
+ * Stamp the client-identity choice onto an envelope. `none` sends nothing, so the server's
+ * default (bare protocol) applies exactly as it did before the selector existed.
+ */
+export const attachClientIdentityToEnvelope = (
+  envelope: TesterProxyEnvelope,
+  identity: {
+    mode: TesterClientIdentityMode;
+    userAgent?: string | null;
+    sessionSeed?: string | null;
+  },
+): TesterProxyEnvelope => {
+  const {
+    clientIdentity: _mode,
+    clientIdentityUserAgent: _userAgent,
+    identitySessionSeed: _seed,
+    ...rest
+  } = envelope;
+  if (identity.mode !== 'observed') return rest;
+  return {
+    ...rest,
+    clientIdentity: 'observed',
+    ...(identity.userAgent ? { clientIdentityUserAgent: identity.userAgent } : {}),
+    ...(identity.sessionSeed ? { identitySessionSeed: identity.sessionSeed } : {}),
+  };
+};
+
+/** Read the server's `x-metapi-tester-identity` header (URI-encoded JSON); null when absent. */
+export const parseTesterIdentityHeader = (raw: string | null | undefined): TesterIdentitySummary | null => {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  try {
+    const parsed = JSON.parse(decodeURIComponent(raw));
+    if (!isRecord(parsed) || typeof parsed.source !== 'string') return null;
+    return {
+      source: parsed.source,
+      clientKind: typeof parsed.clientKind === 'string' ? parsed.clientKind : 'generic',
+      userAgent: typeof parsed.userAgent === 'string' ? parsed.userAgent : null,
+      observedAt: typeof parsed.observedAt === 'string' ? parsed.observedAt : null,
+    };
+  } catch {
+    return null;
+  }
+};
+
+/** One-line label for the identity a request wore. */
+export const formatTesterIdentitySummary = (identity: TesterIdentitySummary): string => {
+  const label = identity.source === 'observed'
+    ? '真实客户端'
+    : identity.source === 'builtin'
+      ? '内置模板（未观察到真实客户端）'
+      : identity.source === 'none'
+        ? '裸协议'
+        : identity.source;
+  const parts = [label];
+  if (identity.userAgent) parts.push(identity.userAgent);
+  if (identity.observedAt) parts.push(`观察于 ${new Date(identity.observedAt).toLocaleString()}`);
+  return parts.join(' · ');
 };
 
 export const parseCustomRequestBody = (raw: string): Record<string, unknown> | null => {

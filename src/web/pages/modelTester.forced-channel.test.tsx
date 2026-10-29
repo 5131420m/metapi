@@ -15,6 +15,7 @@ const { apiMock } = vi.hoisted(() => ({
     getModelsMarketplace: vi.fn(),
     getRoutes: vi.fn(),
     getRouteDecision: vi.fn(),
+    getObservedClientIdentities: vi.fn(async () => ({ success: true, identities: [] })),
   },
 }));
 

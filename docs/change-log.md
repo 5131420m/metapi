@@ -300,6 +300,49 @@ npx vitest run --pool=threads --poolOptions.threads.singleThread=true <test-file
 - **交付物**：代码与本变更日志；无 PDF 或截图。
 - **状态**：已完成，仅在本地分支，未推送。
 
+## 2026-10-29
+
+### 1. 糖果题、模型指纹检测、模型操练场共用从真实流量学到的客户端身份
+
+- **类型**：功能实现
+- **需求来源**：本会话需求（debian 部署调试抓取 #458–464 显示，内置的 Claude Code / Codex 模板与本机真实流量不一致），未提供 GitHub Issue 链接
+- **目标**：三处合成请求都使用本机真实 CLI 流量的客户端身份，身份头走真实请求同样的透传规则，从而按客户端分流的中转站会把它们分到与真实流量相同的后端。
+- **实现范围**：
+  - 新增身份快照 `observedClientIdentity`：只在 `sharedSurface` 的成功路径上，从真实 `claude_code` / `codex` 请求学习。身份头值走白名单，会话头只记头名，请求体只记形状特征。操练场和探测请求不参与学习。快照持久化在 `settings`，不进入备份，出厂重置时清除。
+  - 糖果题：身份头改为以 `downstreamHeaders` 发送（此前 Claude 的 Stainless 头会落到 Windows/x64 默认值），请求体按观察到的形状构建。内置模板修正：Codex 去掉 `Version`、`Conversation_id`，`Session_id` 改为 `session-id`；Claude 增加 `x-claude-code-session-id`。内置模板的 UA 改为模板自己的常量 `claude-cli/2.1.280 (external, cli)` 和 `codex_cli_rs/0.165.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464`（两者都是已发布版本；2.1.280 是 CLIProxyAPI 实测过的基线），不再沿用代理运行时的默认 UA。代理运行时的默认 UA 和 OAuth 配额探测不变。结果新增 `identitySource`、`identityUserAgent`。
+  - 模型指纹检测：只替换请求头，请求体保持 SDK 原样（参考库在该请求体下采样）。三个挑战共用一个会话 id；Codex 身份合成跟随站点设置。接口新增 `clientIdentity: 'sdk'` 对照模式。旧结果读作 `sdk`。详情页展示身份来源。
+  - 模型操练场：新增「客户端身份」选择（跟随真实客户端 / 指定 UA 变体 / 裸协议），只换请求头，不改请求体。每个对话一个会话种子。回环请求不再带 undici 默认的 `user-agent: undici`、`accept-language: *`。实际使用的身份通过响应头 `x-metapi-tester-identity` 回传并在页面展示。
+  - 新增只读接口 `GET /api/client-identity/observed`；新增架构测试，固定单一写入点和指纹检测请求体不变两条规则。
+- **主要文件**：
+  - `src/server/services/observedClientIdentity.ts`、`src/server/routes/api/clientIdentity.ts`
+  - `src/server/proxy-core/surfaces/sharedSurface.ts`、`chatSurface.ts`、`openAiResponsesSurface.ts`
+  - `src/server/services/candyProbeService.ts`、`candyProbe/fingerprints.ts`、`candyProbe/resultStore.ts`
+  - `src/server/services/modelIdentityProbeService.ts`、`modelIdentityProbe/resultStore.ts`、`src/shared/modelIdentityProbe.d.ts`
+  - `src/server/routes/api/test.ts`、`src/web/pages/ModelTester.tsx`、`src/web/pages/helpers/modelTesterSession.ts`
+  - `src/web/pages/token-routes/identityProbe/IdentityProbeDetailModal.tsx`、`presentation.ts`
+- **验证**：
+  - 四个 typecheck 通过；`repo:drift-check` 新增违规 0；`build:server` 通过。
+  - 全量 vitest：3495 个测试通过。另有 9 个测试文件在清理临时目录时报 `EPERM`（Windows 本机环境问题，在未改动的 HEAD 上同样出现），其中的测试用例本身都通过。
+  - 未验证：部署后用真实上游对比三处请求的上游头与真实流量 trace；`observed` 与 `sdk` 两种身份下指纹检测判定是否一致。
+- **交付物**：代码与本变更日志；无 PDF 或截图。
+- **状态**：已完成，仅在本地工作区，未提交、未推送。
+
+### 2. 修复：客户端身份学习被普通 OpenAI SDK 客户端污染
+
+- **类型**：缺陷修复
+- **需求来源**：本会话代码评审（合并 `feat/model-fingerprint-probe` 前的 review），未提供 GitHub Issue 链接
+- **问题**：身份学习只按 `clientKind` 过滤。代理的 Codex 识别是路由用的启发式规则，`/v1/chat/completions`、`/v1/responses` 上带任意 `x-stainless-*` 或 `openai-beta` 头的请求都会判为 `codex`，而 OpenAI 官方 SDK 默认就带这些头。于是 Cherry Studio、LobeChat 等第三方应用的成功请求会被学成「观察到的真实 Codex 客户端」，并成为糖果题、指纹检测和操练场的默认身份。
+- **修复**：
+  - 只学 UA 本身是官方客户端的请求：Claude Code 要求 `claude-cli/x.y.z`，Codex 要求 UA 命中 `codexClientFamily` 里的官方客户端规则（`codex_cli_rs/`、`codex_vscode/` 等）。单独的 `originator` 头不算数。代理的路由识别不变。
+  - 启动加载持久化快照时套用同一规则，旧版本已经学进去的第三方 SDK 身份会被丢弃。
+  - `claudeCodeProfile.ts` 导出 `isClaudeCodeUserAgent`，与 Claude Code 识别共用同一个 UA 规则。
+- **主要文件**：`src/server/services/observedClientIdentity.ts`、`src/server/proxy-core/cliProfiles/claudeCodeProfile.ts`、`src/server/services/observedClientIdentity.test.ts`
+- **验证**：
+  - 四个 typecheck 通过；`repo:drift-check` 违规 0；`proxy-core` 全部及身份、糖果题、指纹检测、操练场相关的 37 个测试文件 412 个用例通过。
+  - 新增的 3 个用例在未修复的代码上失败，修复后通过：OpenAI SDK 头被代理判为 `codex` 但不被学习；Claude 接口上的非 Claude Code UA 不被学习；旧快照中的第三方 SDK 行在加载时被丢弃。
+- **交付物**：代码与本变更日志；无 PDF 或截图。
+- **状态**：已完成，仅在本地工作区，未提交、未推送。
+
 ## 后续记录模板
 
 复制下面模板追加到对应日期下，先记录需求来源，再补充实际实现和验证结果：

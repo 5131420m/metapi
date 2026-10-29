@@ -935,3 +935,79 @@ describe('modelTesterSession', () => {
     ]);
   });
 });
+
+describe('modelTesterSession client identity', () => {
+  const base = {
+    method: 'POST' as const,
+    path: '/v1/messages',
+    requestKind: 'json' as const,
+    stream: false,
+    jobMode: false,
+    rawMode: false,
+  };
+
+  it('stamps the observed identity and its conversation seed', () => {
+    expect(modelTesterSessionModule.attachClientIdentityToEnvelope(base, {
+      mode: 'observed',
+      userAgent: 'claude-cli/2.1.151 (external, cli)',
+      sessionSeed: 'seed-1',
+    })).toEqual({
+      ...base,
+      clientIdentity: 'observed',
+      clientIdentityUserAgent: 'claude-cli/2.1.151 (external, cli)',
+      identitySessionSeed: 'seed-1',
+    });
+  });
+
+  it('sends no identity fields for a bare protocol request', () => {
+    const stamped = modelTesterSessionModule.attachClientIdentityToEnvelope(
+      { ...base, clientIdentity: 'observed', identitySessionSeed: 'old' },
+      { mode: 'none', sessionSeed: 'seed-1' },
+    );
+    expect(stamped).toEqual(base);
+  });
+
+  it('reads the identity header and labels it', () => {
+    const raw = encodeURIComponent(JSON.stringify({
+      source: 'observed',
+      clientKind: 'claude_code',
+      userAgent: 'claude-cli/2.1.151 (external, cli)',
+      observedAt: null,
+    }));
+    const parsed = modelTesterSessionModule.parseTesterIdentityHeader(raw)!;
+    expect(parsed.source).toBe('observed');
+    expect(modelTesterSessionModule.formatTesterIdentitySummary(parsed)).toBe('真实客户端 · claude-cli/2.1.151 (external, cli)');
+    expect(modelTesterSessionModule.parseTesterIdentityHeader('%E0%A4%A')).toBeNull();
+    expect(modelTesterSessionModule.parseTesterIdentityHeader(null)).toBeNull();
+  });
+
+  it('round-trips the identity choice and defaults old sessions to observed', () => {
+    const state: ModelTesterSessionState = {
+      input: '',
+      inputs: { ...DEFAULT_INPUTS, model: 'claude-opus-5-5' },
+      parameterEnabled: DEFAULT_PARAMETER_ENABLED,
+      messages: [],
+      conversationFiles: [],
+      pendingPayload: null,
+      customRequestMode: false,
+      customRequestBody: '',
+      showDebugPanel: false,
+      activeDebugTab: DEBUG_TABS.PREVIEW,
+      modeState: DEFAULT_MODE_STATE,
+      clientIdentity: 'none',
+      identitySessionSeed: 'seed-9',
+    };
+    const restored = parseModelTesterSession(serializeModelTesterSession(state))!;
+    expect(restored.clientIdentity).toBe('none');
+    expect(restored.identitySessionSeed).toBe('seed-9');
+
+    const legacy = JSON.parse(serializeModelTesterSession(state));
+    delete legacy.clientIdentity;
+    delete legacy.identitySessionSeed;
+    const restoredLegacy = parseModelTesterSession(JSON.stringify(legacy))!;
+    // Absent fields stay absent; the page then applies the default (observed) and a fresh seed.
+    expect(restoredLegacy.clientIdentity).toBeUndefined();
+    expect(restoredLegacy.identitySessionSeed).toBeUndefined();
+    expect(restoredLegacy.clientIdentity ?? modelTesterSessionModule.DEFAULT_TESTER_CLIENT_IDENTITY).toBe('observed');
+  });
+});

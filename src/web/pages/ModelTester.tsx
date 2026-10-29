@@ -31,6 +31,12 @@ import {
   parseCustomRequestBody,
   parseModelTesterSession,
   processThinkTags,
+  attachClientIdentityToEnvelope,
+  DEFAULT_TESTER_CLIENT_IDENTITY,
+  formatTesterIdentitySummary,
+  parseTesterIdentityHeader,
+  type TesterClientIdentityMode,
+  type TesterIdentitySummary,
   resolveConversationReplayFiles,
   serializeModelTesterSession,
   syncCustomRequestBodyToMessages,
@@ -68,7 +74,34 @@ type ChatJobResponse = {
   status: 'pending' | 'succeeded' | 'failed' | 'cancelled';
   result?: unknown;
   error?: unknown;
+  /** The client identity the job's request wore. */
+  identity?: TesterIdentitySummary;
 };
+
+/** One observed identity variant, as `GET /api/client-identity/observed` lists it. */
+type ObservedClientIdentityEntry = {
+  key: string;
+  clientKind: string;
+  downstreamFormat: string;
+  headers: Record<string, string>;
+  lastSeenAt: string;
+  count: number;
+};
+
+/** A fresh conversation's identity seed: its requests share one synthesized session. */
+function createIdentitySessionSeed(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** The observed format a playground protocol replays (gemini has no observed identity). */
+function resolveObservedFormatForProtocol(protocol: PlaygroundProtocol): string | null {
+  if (protocol === 'claude') return 'claude';
+  if (protocol === 'responses') return 'responses';
+  if (protocol === 'openai') return 'openai';
+  return null;
+}
 
 type DebugTimelineEntry = {
   at: string;
@@ -666,6 +699,11 @@ export default function ModelTester() {
   const [modeState, setModeState] = useState<ModelTesterModeState>(DEFAULT_MODE_STATE);
   const [parameterEnabled, setParameterEnabled] = useState<ParameterEnabled>(DEFAULT_PARAMETER_ENABLED);
   const [forcedChannelId, setForcedChannelId] = useState<number | null>(null);
+  const [clientIdentityMode, setClientIdentityMode] = useState<TesterClientIdentityMode>(DEFAULT_TESTER_CLIENT_IDENTITY);
+  const [clientIdentityUserAgent, setClientIdentityUserAgent] = useState<string | null>(null);
+  const [identitySessionSeed, setIdentitySessionSeed] = useState<string>(() => createIdentitySessionSeed());
+  const [observedIdentities, setObservedIdentities] = useState<ObservedClientIdentityEntry[]>([]);
+  const [lastTesterIdentity, setLastTesterIdentity] = useState<TesterIdentitySummary | null>(null);
   const [forcedChannelOptions, setForcedChannelOptions] = useState<ForcedChannelOption[]>([]);
   const [loadingForcedChannels, setLoadingForcedChannels] = useState(false);
   const [forcedChannelHint, setForcedChannelHint] = useState('');
@@ -771,6 +809,9 @@ export default function ModelTester() {
     setPendingPayload(restored.pendingPayload);
     setPendingJobId(restored.pendingJobId || null);
     setForcedChannelId(restored.forcedChannelId ?? null);
+    setClientIdentityMode(restored.clientIdentity ?? DEFAULT_TESTER_CLIENT_IDENTITY);
+    setClientIdentityUserAgent(restored.clientIdentityUserAgent ?? null);
+    if (restored.identitySessionSeed) setIdentitySessionSeed(restored.identitySessionSeed);
     setCustomRequestMode(restored.customRequestMode);
     setCustomRequestBody(restored.customRequestBody);
     setShowDebugPanel(restored.showDebugPanel);
@@ -925,6 +966,9 @@ export default function ModelTester() {
       pendingPayload,
       pendingJobId,
       forcedChannelId,
+      clientIdentity: clientIdentityMode,
+      clientIdentityUserAgent,
+      identitySessionSeed,
       customRequestMode,
       customRequestBody,
       showDebugPanel,
@@ -932,6 +976,9 @@ export default function ModelTester() {
     }));
   }, [
     activeDebugTab,
+    clientIdentityMode,
+    clientIdentityUserAgent,
+    identitySessionSeed,
     customRequestBody,
     customRequestMode,
     forcedChannelId,
@@ -1239,6 +1286,57 @@ export default function ModelTester() {
     };
   }, [buildApiPayload, buildClaudeBodyFromMessages, buildConversationMessagesWithSystem, buildResponsesBodyFromMessages, customRequestBody, customRequestMode, inputs, parameterEnabled]);
 
+  useEffect(() => {
+    let cancelled = false;
+    // The selector is optional: a failed or unavailable listing just leaves the default.
+    void Promise.resolve()
+      .then(() => api.getObservedClientIdentities())
+      .then((result: any) => {
+        if (cancelled) return;
+        setObservedIdentities(Array.isArray(result?.identities) ? result.identities as ObservedClientIdentityEntry[] : []);
+      })
+      .catch(() => {
+        if (!cancelled) setObservedIdentities([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Observed variants for the current protocol, most recent first.
+  const observedVariantsForProtocol = useMemo(() => {
+    const format = resolveObservedFormatForProtocol(inputs.protocol);
+    if (!format) return [];
+    return observedIdentities
+      .filter((entry) => entry.downstreamFormat === format && entry.headers?.['user-agent'])
+      .sort((left, right) => right.lastSeenAt.localeCompare(left.lastSeenAt));
+  }, [inputs.protocol, observedIdentities]);
+
+  const clientIdentitySelectOptions = useMemo<ForcedChannelOption[]>(() => [
+    {
+      value: '__latest__',
+      label: '跟随真实客户端（默认）',
+      description: '使用本机最近一次真实 Claude Code / Codex 请求的身份；没有时用内置模板',
+    },
+    ...observedVariantsForProtocol.map((entry) => ({
+      value: entry.headers['user-agent']!,
+      label: entry.headers['user-agent']!,
+      description: `观察于 ${new Date(entry.lastSeenAt).toLocaleString()} · ${entry.count} 次`,
+    })),
+    {
+      value: '__none__',
+      label: '裸协议',
+      description: '不带客户端身份，只发协议本身需要的请求头',
+    },
+  ], [observedVariantsForProtocol]);
+
+  const clientIdentityHint = useMemo(() => {
+    if (clientIdentityMode === 'none') return '不带客户端身份；按客户端分流的中转站可能把请求分到别的后端。';
+    if (inputs.protocol === 'gemini') return 'Gemini 协议暂无可跟随的客户端身份，按裸协议发送。';
+    if (observedVariantsForProtocol.length === 0) return '还没观察到这个协议的真实客户端，将使用内置模板。';
+    return '只替换请求头，请求体保持你填写的内容。';
+  }, [clientIdentityMode, inputs.protocol, observedVariantsForProtocol.length]);
+
   const forcedChannelSelectOptions = useMemo<ForcedChannelOption[]>(() => [
     {
       value: '__auto__',
@@ -1248,9 +1346,14 @@ export default function ModelTester() {
     ...forcedChannelOptions,
   ], [forcedChannelOptions]);
 
+  // Every dispatch path stamps its envelope here: the forced channel and the client identity.
   const attachEnvelopeForcedChannel = useCallback((envelope: ProxyTestEnvelope) => (
-    attachForcedChannelToEnvelope(envelope, forcedChannelId)
-  ), [forcedChannelId]);
+    attachClientIdentityToEnvelope(attachForcedChannelToEnvelope(envelope, forcedChannelId), {
+      mode: clientIdentityMode,
+      userAgent: clientIdentityUserAgent,
+      sessionSeed: identitySessionSeed,
+    })
+  ), [clientIdentityMode, clientIdentityUserAgent, forcedChannelId, identitySessionSeed]);
 
   const buildModeProxyEnvelope = useCallback((): ProxyTestEnvelope | null => {
     if (inputs.mode === 'embeddings') {
@@ -1435,6 +1538,7 @@ export default function ModelTester() {
             continue;
           }
 
+          if (status.identity) setLastTesterIdentity(status.identity);
           if (status.status === 'succeeded') {
             setMessages((prev) => applyAssistantSuccess(prev, status.result));
             setError('');
@@ -1554,6 +1658,7 @@ export default function ModelTester() {
 
     try {
       const response = await api.proxyTestStream(payload, controller.signal);
+      setLastTesterIdentity(parseTesterIdentityHeader(response.headers.get('x-metapi-tester-identity')));
       if (response.status === 401 || response.status === 403) {
         const hadToken = Boolean(getAuthToken(localStorage));
         clearAuthSession(localStorage);
@@ -1712,6 +1817,7 @@ export default function ModelTester() {
 
     try {
       const response = await api.proxyTestStream(envelope, controller.signal);
+      setLastTesterIdentity(parseTesterIdentityHeader(response.headers.get('x-metapi-tester-identity')));
       if (!response.ok) {
         throw new Error(await parseStreamErrorText(response));
       }
@@ -1868,7 +1974,9 @@ export default function ModelTester() {
 
     setSending(true);
     try {
-      const result = await api.proxyTest(effectiveEnvelope);
+      const result = await api.proxyTest(effectiveEnvelope, {
+        onIdentityHeader: (raw) => setLastTesterIdentity(parseTesterIdentityHeader(raw)),
+      });
       setDebugResponse(formatJson(result));
       setActiveDebugTab(DEBUG_TABS.RESPONSE);
       setNonConversationResult(result);
@@ -2103,6 +2211,9 @@ export default function ModelTester() {
     setMessages([]);
     setPendingPayload(null);
     setPendingJobId(null);
+    // A new conversation is a new client session.
+    setIdentitySessionSeed(createIdentitySessionSeed());
+    setLastTesterIdentity(null);
     setInput('');
     setError('');
     setSending(false);
@@ -2505,6 +2616,35 @@ export default function ModelTester() {
                   ? `已固定到通道 #${forcedChannelId}，失败不会自动切换。`
                   : '默认自动选路；如需单独排查，可固定到一个候选通道。')}
             </div>
+          </div>
+
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ fontSize: 12, color: 'var(--color-text-muted)', marginBottom: 6, fontWeight: 600 }}>
+              客户端身份
+            </div>
+            <ModernSelect
+              value={clientIdentityMode === 'none' ? '__none__' : (clientIdentityUserAgent || '__latest__')}
+              onChange={(next) => {
+                if (next === '__none__') {
+                  setClientIdentityMode('none');
+                  setClientIdentityUserAgent(null);
+                  return;
+                }
+                setClientIdentityMode('observed');
+                setClientIdentityUserAgent(!next || next === '__latest__' ? null : next);
+              }}
+              options={clientIdentitySelectOptions}
+              placeholder="跟随真实客户端（默认）"
+              menuMaxHeight={300}
+            />
+            <div style={{ fontSize: 11, color: 'var(--color-text-muted)', marginTop: 4 }}>
+              {clientIdentityHint}
+            </div>
+            {lastTesterIdentity ? (
+              <div data-testid="tester-identity-used" style={{ fontSize: 11, color: 'var(--color-text-secondary)', marginTop: 4, overflowWrap: 'anywhere' }}>
+                本次实际身份：{formatTesterIdentitySummary(lastTesterIdentity)}
+              </div>
+            ) : null}
           </div>
 
           {inputs.mode === 'conversation' && (

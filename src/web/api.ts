@@ -292,6 +292,10 @@ export type ProxyTestRequestEnvelope = {
   rawJsonText?: string;
   multipartFields?: Record<string, string>;
   multipartFiles?: ProxyTestMultipartFile[];
+  /** `observed`: wear the real client identity seen on this box; absent: bare protocol. */
+  clientIdentity?: "observed" | "none";
+  clientIdentityUserAgent?: string;
+  identitySessionSeed?: string;
 };
 
 const DEFAULT_PROXY_TEST_TIMEOUT_MS = 30_000;
@@ -308,12 +312,24 @@ function resolveProxyTestTimeoutMs(data: ProxyTestRequestEnvelope) {
   return DEFAULT_PROXY_TEST_TIMEOUT_MS;
 }
 
-function proxyTestRequest(data: ProxyTestRequestEnvelope) {
-  return request("/api/test/proxy", {
+/**
+ * Buffered proxy test. `onIdentityHeader` receives the raw `x-metapi-tester-identity`
+ * response header (the client identity the request wore); the result is the body, as before.
+ */
+async function proxyTestRequest(
+  data: ProxyTestRequestEnvelope,
+  options: { onIdentityHeader?: (raw: string | null) => void } = {},
+) {
+  const res = await fetchAuthenticatedResponse("/api/test/proxy", {
     method: "POST",
     body: JSON.stringify(data),
     timeoutMs: resolveProxyTestTimeoutMs(data),
   });
+  options.onIdentityHeader?.(res.headers.get("x-metapi-tester-identity"));
+  if (!res.ok) {
+    throw new Error(await extractResponseErrorMessage(res));
+  }
+  return res.json();
 }
 
 async function proxyTestStreamRequest(
@@ -990,10 +1006,15 @@ export const api = {
     request(`/api/channels/${channelId}/candy-probe`),
   // Model fingerprint probe (display-only): three upstream completions in a row, so the
   // backstop timeout is longer than the server's own ceiling, for the same reason as above.
-  runChannelIdentityProbe: (channelId: number) =>
+  // `clientIdentity: "sdk"` asks for the neutral SDK identity instead of the observed real
+  // client identity (comparison mode); omitted = the server default (observed).
+  runChannelIdentityProbe: (
+    channelId: number,
+    options?: { clientIdentity?: "observed" | "sdk" },
+  ) =>
     request(`/api/channels/${channelId}/identity-probe`, {
       method: "POST",
-      body: JSON.stringify({}),
+      body: JSON.stringify(options?.clientIdentity ? { clientIdentity: options.clientIdentity } : {}),
       timeoutMs: IDENTITY_PROBE_MAX_TIMEOUT_MS + 15_000,
     }),
   getChannelIdentityProbe: (channelId: number) =>
@@ -1545,6 +1566,9 @@ export const api = {
   },
   testProxy: proxyTestRequest,
   proxyTest: proxyTestRequest,
+  // Read-only snapshots of the real client identities seen on this box (no credentials).
+  getObservedClientIdentities: () =>
+    request("/api/client-identity/observed"),
   testChat: (data: TestChatRequestPayload) =>
     request("/api/test/chat", { method: "POST", body: JSON.stringify(data) }),
   testProxyStream: proxyTestStreamRequest,

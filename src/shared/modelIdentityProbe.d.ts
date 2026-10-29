@@ -130,7 +130,22 @@ export type IdentityProbeResult = {
   checkedAt: string;
   config: IdentityProbeConfigFingerprint;
   trigger: IdentityProbeTrigger;
+  /**
+   * Where the request headers' client identity came from: observed real traffic on this box,
+   * the built-in template (nothing observed yet), or the neutral SDK identity. The request
+   * BODY is always the SDK's. Rows stored before the field existed read back as `sdk`.
+   * Deliberately not part of `config`: a client upgrade must not void verdicts.
+   */
+  identitySource?: IdentityProbeIdentitySource;
+  /** The user agent the challenges were sent with (null when unknown). */
+  identityUserAgent?: string | null;
 };
+
+/** `observed` / `builtin` wear the real client identity; `sdk` is the neutral comparison mode. */
+export type IdentityProbeIdentitySource = 'observed' | 'builtin' | 'sdk';
+
+/** What a caller may ask for: the real client identity (default) or the neutral SDK one. */
+export type IdentityProbeClientIdentityMode = 'observed' | 'sdk';
 
 /** List-view shape: the result without per-sample and per-candidate detail. */
 export type IdentityProbeSnapshot = Omit<IdentityProbeResult, 'samples' | 'candidates'> & {

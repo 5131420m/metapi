@@ -16,6 +16,7 @@ import {
   discardIdentityProbeResults,
   IDENTITY_PROBE_SETTING_KEY,
 } from './modelIdentityProbe/resultStore.js';
+import { OBSERVED_CLIENT_IDENTITY_SETTING_KEY } from './observedClientIdentity.js';
 
 
 const BACKUP_VERSION = '2.1';
@@ -260,6 +261,8 @@ const EXCLUDED_SETTING_KEYS = new Set<string>([
   CANDY_PROBE_SETTING_KEY_V1,
   // Model fingerprint verdicts: the same box-local reasoning.
   IDENTITY_PROBE_SETTING_KEY,
+  // Observed client identities describe the clients that talk to THIS box.
+  OBSERVED_CLIENT_IDENTITY_SETTING_KEY,
 ]);
 const BACKUP_WEBDAV_CONFIG_SETTING_KEY = 'backup_webdav_config_v1';
 const BACKUP_WEBDAV_STATE_SETTING_KEY = 'backup_webdav_state_v1';

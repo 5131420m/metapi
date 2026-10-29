@@ -22,6 +22,11 @@ import { candyProbeRoutes } from './routes/api/candyProbe.js';
 import { hydrateCandyProbeResultsFromSettings } from './services/candyProbeService.js';
 import { modelIdentityProbeRoutes } from './routes/api/modelIdentityProbe.js';
 import { hydrateIdentityProbeResultsFromSettings } from './services/modelIdentityProbeService.js';
+import { clientIdentityRoutes } from './routes/api/clientIdentity.js';
+import {
+  flushObservedClientIdentityPersistence,
+  hydrateObservedClientIdentitiesFromSettings,
+} from './services/observedClientIdentity.js';
 import { monitorRoutes } from './routes/api/monitor.js';
 import { downstreamApiKeysRoutes } from './routes/api/downstreamApiKeys.js';
 import { oauthRoutes } from './routes/api/oauth.js';
@@ -221,6 +226,9 @@ try {
   await hydrateIdentityProbeResultsFromSettings().catch((error) => {
     console.warn(`Failed to hydrate model identity probe results: ${(error as Error)?.message || 'unknown error'}`);
   });
+  await hydrateObservedClientIdentitiesFromSettings().catch((error) => {
+    console.warn(`Failed to hydrate observed client identities: ${(error as Error)?.message || 'unknown error'}`);
+  });
   await routeRefreshWorkflow.rebuildRoutesOnly();
 
   console.log('Loaded runtime settings overrides');
@@ -257,6 +265,7 @@ await app.register(taskRoutes);
 await app.register(testRoutes);
 await app.register(candyProbeRoutes);
 await app.register(modelIdentityProbeRoutes);
+await app.register(clientIdentityRoutes);
 await app.register(monitorRoutes);
 await app.register(downstreamApiKeysRoutes);
 await app.register(oauthRoutes);
@@ -338,6 +347,8 @@ app.addHook('onClose', async () => {
   await stopAdminSnapshotWarmScheduler();
   await stopSub2ApiManagedRefreshScheduler();
   await stopOAuthLoopbackCallbackServers();
+  // Routine observations are persisted on a long debounce; do not lose them on shutdown.
+  await flushObservedClientIdentityPersistence().catch(() => undefined);
 });
 
 // Start server

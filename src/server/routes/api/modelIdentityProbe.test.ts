@@ -58,6 +58,26 @@ describe('model identity probe routes', () => {
     expect(runMock).toHaveBeenCalledWith(expect.objectContaining({ channelId: 5 }));
   });
 
+  it('passes a valid clientIdentity through and rejects an invalid one', async () => {
+    runMock.mockResolvedValue({ channelId: 5, verdict: 'model_match' });
+    const ok = await app.inject({
+      method: 'POST',
+      url: '/api/channels/5/identity-probe',
+      payload: { clientIdentity: 'sdk' },
+    });
+    expect(ok.statusCode).toBe(200);
+    expect(runMock).toHaveBeenCalledWith(expect.objectContaining({ channelId: 5, clientIdentity: 'sdk' }));
+
+    runMock.mockClear();
+    const bad = await app.inject({
+      method: 'POST',
+      url: '/api/channels/5/identity-probe',
+      payload: { clientIdentity: 'claude_code' },
+    });
+    expect(bad.statusCode).toBe(400);
+    expect(runMock).not.toHaveBeenCalled();
+  });
+
   it('maps a request error to its status code', async () => {
     runMock.mockRejectedValue(new errors.IdentityProbeRequestError('通道 #9 不存在', 404));
     const response = await app.inject({ method: 'POST', url: '/api/channels/9/identity-probe' });

@@ -69,6 +69,7 @@ import {
   createSurfaceFailureToolkit,
   createSurfaceDispatchRequest,
   getSurfaceStickyPreferredChannelId,
+  recordSurfaceClientIdentityObservation,
   recordSurfaceSuccess,
   selectSurfaceChannelForAttempt,
   trySurfaceOauthRefreshRecovery,
@@ -792,6 +793,13 @@ export async function handleChatSurfaceRequest(
         };
         let upstreamUsagePresent = false;
         const recordStreamSuccess = async (latencyMs: number) => {
+          recordSurfaceClientIdentityObservation({
+            clientContext,
+            downstreamFormat,
+            headers: request.headers as Record<string, unknown>,
+            clientIp: request.ip,
+            body: request.body,
+          });
           try {
             await recordSurfaceSuccess({
               selected,
@@ -1296,6 +1304,13 @@ export async function handleChatSurfaceRequest(
         : downstreamTransformer.transformFinalResponse(upstreamData, modelName, rawText);
       const downstreamResponse = downstreamTransformer.serializeFinalResponse(normalizedFinal, parsedUsage);
 
+      recordSurfaceClientIdentityObservation({
+        clientContext,
+        downstreamFormat,
+        headers: request.headers as Record<string, unknown>,
+        clientIp: request.ip,
+        body: request.body,
+      });
       await recordSurfaceSuccess({
         selected,
         requestedModel,

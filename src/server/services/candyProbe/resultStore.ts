@@ -68,7 +68,17 @@ export type CandyProbeResult = {
    * daily ceiling. Rows persisted before the field existed read back as 0.
    */
   failStreak: number;
+  /**
+   * Where the identity the probe wore came from: observed real traffic, the built-in
+   * template, or the neutral SDK profile. Rows persisted before the field existed were all
+   * built-in. Deliberately NOT part of `config`: a client upgrade must not void verdicts.
+   */
+  identitySource?: CandyProbeIdentitySource;
+  /** The user agent the probe sent (null when unknown). */
+  identityUserAgent?: string | null;
 };
+
+export type CandyProbeIdentitySource = 'observed' | 'builtin' | 'sdk';
 
 export type CandyProbeSnapshot = Omit<CandyProbeResult, 'samples'> & {
   /** False once the verdict is older than the freshness TTL. */
@@ -215,6 +225,12 @@ function normalizeStoredResult(value: unknown): CandyProbeResult | null {
     failStreak: typeof value.failStreak === 'number' && Number.isFinite(value.failStreak) && value.failStreak > 0
       ? Math.trunc(value.failStreak)
       : 0,
+    identitySource: value.identitySource === 'observed' || value.identitySource === 'sdk'
+      ? value.identitySource
+      : 'builtin',
+    identityUserAgent: typeof value.identityUserAgent === 'string' && value.identityUserAgent.trim()
+      ? value.identityUserAgent.trim().slice(0, 300)
+      : null,
   };
 }
 

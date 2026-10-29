@@ -33,9 +33,14 @@ function getHeaderValue(headers: Record<string, unknown> | undefined, targetKey:
   return null;
 }
 
+/** Whether a user agent is Claude Code's own (`claude-cli/x.y.z …`). */
+export function isClaudeCodeUserAgent(userAgent: string | null | undefined): boolean {
+  return claudeCodeUserAgentPattern.test((userAgent || '').trim());
+}
+
 function hasClaudeCodeHeaderFingerprint(headers: Record<string, unknown> | undefined): boolean {
   const userAgent = getHeaderValue(headers, 'user-agent') || '';
-  if (!claudeCodeUserAgentPattern.test(userAgent)) return false;
+  if (!isClaudeCodeUserAgent(userAgent)) return false;
   if (!getHeaderValue(headers, 'anthropic-beta')) return false;
   if (!getHeaderValue(headers, 'anthropic-version')) return false;
   return (getHeaderValue(headers, 'x-app') || '').trim().toLowerCase() === 'cli';

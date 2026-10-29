@@ -122,6 +122,7 @@ describe('runChannelIdentityProbe', () => {
   let seedCounter = 0;
   let service: typeof import('./modelIdentityProbeService.js');
   let store: typeof import('./modelIdentityProbe/resultStore.js');
+  let identityStore: typeof import('./observedClientIdentity.js');
 
   beforeAll(async () => {
     dataDir = mkdtempSync(join(tmpdir(), 'metapi-identity-probe-'));
@@ -132,10 +133,12 @@ describe('runChannelIdentityProbe', () => {
     schema = dbModule.schema;
     service = await import('./modelIdentityProbeService.js');
     store = await import('./modelIdentityProbe/resultStore.js');
+    identityStore = await import('./observedClientIdentity.js');
   });
 
   beforeEach(async () => {
     store.resetIdentityProbeStoreForTests();
+    identityStore.resetObservedClientIdentityStoreForTests();
     service.resetIdentityProbeConcurrencyForTests();
     resolveUpstreamEndpointCandidatesMock.mockReset().mockResolvedValue(['chat']);
     dispatchRuntimeRequestMock.mockReset();
@@ -242,20 +245,93 @@ describe('runChannelIdentityProbe', () => {
     expect(store.getIdentityProbeResultForChannel(channel.id)?.verdict).toBe('mismatch');
   });
 
-  it('sends the SDK body under a neutral SDK identity, not a Claude Code identity', async () => {
+  type SentRequest = { request: { headers: Record<string, string>; body: Record<string, unknown> } };
+
+  function headerOf(headers: Record<string, string>, name: string): string | undefined {
+    const key = Object.keys(headers).find((candidate) => candidate.toLowerCase() === name);
+    return key ? headers[key] : undefined;
+  }
+
+  it('wears the observed client identity on the headers but keeps the SDK body', async () => {
+    const fixtures = await import('../test-fixtures/observedClientIdentityFixtures.js');
+    identityStore.recordObservedClientIdentity({
+      clientKind: 'claude_code',
+      downstreamFormat: 'claude',
+      headers: fixtures.CLAUDE_CODE_FIXTURE_HEADERS,
+      // Even observed traits that WOULD add a system line must not reach this body.
+      body: { ...fixtures.CLAUDE_CODE_FIXTURE_BODY, system: 'x', metadata: { user_id: 'u' } },
+    });
+    const { channel } = await seedChannel();
+    resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['messages']);
+    replyWithCounts();
+
+    const result = await service.runChannelIdentityProbe({ channelId: channel.id });
+
+    expect(result.identitySource).toBe('observed');
+    expect(result.identityUserAgent).toBe('claude-cli/2.1.151 (external, cli)');
+    const calls = dispatchRuntimeRequestMock.mock.calls.map((call) => call[0] as SentRequest);
+    expect(calls).toHaveLength(3);
+    const first = calls[0]!.request;
+    expect(headerOf(first.headers, 'user-agent')).toBe('claude-cli/2.1.151 (external, cli)');
+    expect(headerOf(first.headers, 'x-stainless-os')).toBe('MacOS');
+    // One identity per run: the three challenges share one session id.
+    const sessions = new Set(calls.map((call) => headerOf(call.request.headers, 'x-claude-code-session-id')));
+    expect(sessions.size).toBe(1);
+    expect([...sessions][0]).toMatch(/^[0-9a-f-]{36}$/);
+    // The body is exactly what the SDK builds for the challenge prompt.
+    const detector = await vi.importActual<typeof import('./modelIdentityProbe/detector.js')>('./modelIdentityProbe/detector.js');
+    const prompt = ((first.body.messages as Array<{ content: unknown }>)[0]!).content as string;
+    expect(first.body).toEqual({
+      ...detector.buildIdentityRequestBody('claude', 'claude-opus-4-6', prompt),
+      model: 'claude-opus-4-6',
+      stream: true,
+    });
+    const body = JSON.stringify(first.body);
+    expect(body).not.toContain('You are Claude Code');
+    expect(body).not.toContain('metadata');
+  });
+
+  it('keeps the neutral SDK identity in sdk comparison mode', async () => {
+    const fixtures = await import('../test-fixtures/observedClientIdentityFixtures.js');
+    identityStore.recordObservedClientIdentity({
+      clientKind: 'claude_code',
+      downstreamFormat: 'claude',
+      headers: fixtures.CLAUDE_CODE_FIXTURE_HEADERS,
+    });
     const { channel } = await seedChannel();
     replyWithCounts();
-    await service.runChannelIdentityProbe({ channelId: channel.id });
+    const result = await service.runChannelIdentityProbe({ channelId: channel.id, clientIdentity: 'sdk' });
 
-    const sent = dispatchRuntimeRequestMock.mock.calls[0]![0] as {
-      request: { headers: Record<string, string>; body: Record<string, unknown> };
-    };
+    expect(result.identitySource).toBe('sdk');
+    const sent = dispatchRuntimeRequestMock.mock.calls[0]![0] as SentRequest;
     const body = JSON.stringify(sent.request.body);
     expect(body).not.toContain('You are Claude Code');
     expect(body).not.toContain('metadata');
     const headerKeys = Object.keys(sent.request.headers).map((key) => key.toLowerCase());
     expect(headerKeys).not.toContain('x-app');
     expect(headerKeys).not.toContain('originator');
+    expect(headerOf(sent.request.headers, 'user-agent')).toBe('OpenAI/JS 4.104.0');
+  });
+
+  it('falls back to the built-in client identity when nothing was observed', async () => {
+    const { channel } = await seedChannel({ sourceModel: 'gpt-5.4' });
+    resolveUpstreamEndpointCandidatesMock.mockResolvedValue(['responses']);
+    replyWithCounts();
+    const result = await service.runChannelIdentityProbe({ channelId: channel.id });
+
+    expect(result.identitySource).toBe('builtin');
+    const sent = dispatchRuntimeRequestMock.mock.calls[0]![0] as SentRequest;
+    expect(headerOf(sent.request.headers, 'originator')).toBe('codex_cli_rs');
+    expect(headerOf(sent.request.headers, 'session-id')).toMatch(/^[0-9a-f-]{36}$/);
+    expect(headerOf(sent.request.headers, 'user-agent'))
+      .toBe('codex_cli_rs/0.165.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464');
+    expect(result.identityUserAgent).toBe('codex_cli_rs/0.165.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464');
+  });
+
+  it('uses a different session id than the candy probe on the same channel', async () => {
+    const candy = identityStore.resolveClientIdentityProfile({ downstreamFormat: 'responses', sessionSeed: 'candy:1:2' });
+    const identity = identityStore.resolveClientIdentityProfile({ downstreamFormat: 'responses', sessionSeed: 'identity:1:2' });
+    expect(candy.sessionId).not.toBe(identity.sessionId);
   });
 
   it('records model_match when the claimed model is on top', async () => {

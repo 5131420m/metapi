@@ -6,30 +6,32 @@
  * the other way round). A probe that does not look like the client it is standing in for
  * therefore measures the wrong thing.
  *
- * Each profile supplies three things, all of which travel through the existing upstream
- * request builder:
+ * These profiles are the BUILT-IN fallback. The identity a probe actually wears comes from
+ * `observedClientIdentity.ts` — what real traffic on this box was seen to send — and only
+ * falls back to the headers below when nothing has been observed yet. Either way the
+ * identity headers travel as DOWNSTREAM headers, so the upstream builder filters them with
+ * exactly the passthrough rules a real request meets (an earlier version injected them as
+ * provider headers, which skipped those rules and dropped Claude's Stainless set).
  *
- * - `providerHeaders` — the unfiltered injection point, so client-specific headers
- *   (`Originator`, `Version`, `Session_id`, `User-Agent`, …) survive on any platform.
- * - `downstreamHeaders` — protocol-family passthrough (`anthropic-*`, `x-stainless-*`,
- *   `openai-*`), used where the builder already understands the family.
+ * Each profile supplies:
+ *
+ * - identity headers (`buildProviderHeaders`) — the built-in template identity;
  * - bodies — the request shape per protocol. All three are supplied so that whichever
- *   endpoint the flow settles on receives a body that matches it.
+ *   endpoint the flow settles on receives a body that matches it. With observed body traits
+ *   the bodies follow the observed shape instead of the template.
  *
- * Deliberate fidelity boundary: header-level identity is reproduced faithfully, and the
- * two body-level markers we can state with confidence (Claude Code's identity system line
- * and its `metadata.user_id` shape) are reproduced too. Long, versioned payloads (Claude
- * Code's full tool list / billing line, Codex's full `instructions` blob) are NOT
- * fabricated — a wrong template is more identifiable than an absent one. Those can be
- * calibrated later from real `proxy_debug_traces` samples.
+ * Deliberate fidelity boundary: the template reproduces the two body-level markers we can
+ * state with confidence (Claude Code's identity system line and its `metadata.user_id`
+ * shape). Long, versioned payloads (Claude Code's full tool list / billing line, Codex's
+ * full `instructions` blob) are NOT fabricated — a wrong template is more identifiable than
+ * an absent one.
  *
  * The Codex family is split into two profiles, mirroring the two shapes real traffic takes:
  *
- * - `codex` — the CLI's native `/v1/responses` surface, with the full client-identity
- *   header set (`Originator`/`Version`/`Session_id`/`Conversation_id`) and the Codex
- *   session/turn synthesis (`client_metadata`, window/turn headers) the proxy applies for
- *   codex sites. Used for GPT/o-series/Codex models, which the CLI drives through
- *   `/v1/responses`.
+ * - `codex` — the CLI's native `/v1/responses` surface: user agent, originator and a
+ *   `session-id`, plus the Codex session/turn synthesis (`client_metadata`, window/turn
+ *   headers) the proxy applies when the site enables it. Used for GPT/o-series/Codex models,
+ *   which the CLI drives through `/v1/responses`.
  * - `codex_chat` — the extension variant: a Codex-CLI identity on `/v1/chat/completions`
  *   with ONLY `User-Agent` + `Originator`, and no session/turn metadata. This is the shape
  *   aggregator traffic actually wears when Codex-identified clients drive non-GPT models
@@ -37,12 +39,22 @@
  *   does not exist on that surface.
  */
 
-import {
-  CLAUDE_DEFAULT_USER_AGENT,
-  CODEX_CLIENT_VERSION,
-  CODEX_DEFAULT_USER_AGENT,
-  uuidFromSeed,
-} from '../../proxy-core/providers/headerUtils.js';
+import { uuidFromSeed } from '../../proxy-core/providers/headerUtils.js';
+
+/**
+ * The built-in template's client identity strings.
+ *
+ * Deliberately separate from the proxy runtime defaults in `headerUtils.ts`
+ * (`CLAUDE_DEFAULT_USER_AGENT`, `CODEX_DEFAULT_USER_AGENT`): those fill in an identity for
+ * every real proxied request that lacks one, and for the OAuth quota probe, so moving them
+ * is a box-wide change with its own upstream risk. These only dress the synthetic requests
+ * (candy probe, model identity probe, playground) when no real client has been observed.
+ *
+ * Both are real, published releases: Claude Code 2.1.280 is the baseline CLIProxyAPI measured
+ * its full Messages fingerprint against, and Codex 0.165.0 is the current official release.
+ */
+export const BUILTIN_CLAUDE_CODE_USER_AGENT = 'claude-cli/2.1.280 (external, cli)';
+export const BUILTIN_CODEX_USER_AGENT = 'codex_cli_rs/0.165.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464';
 
 export type CandyFingerprintId = 'claude_code' | 'codex' | 'codex_chat' | 'generic_openai';
 
@@ -66,6 +78,25 @@ export type CandyFingerprintRequestInput = {
   prompt: string;
   /** Stable per-channel scope: keeps synthesized session/user ids consistent across runs. */
   scopeKey: string;
+  /**
+   * Body shape observed on real traffic of this client (see `observedClientIdentity.ts`).
+   * Absent → the built-in template shape, unchanged.
+   */
+  bodyTraits?: CandyBodyTraits | null;
+  /** The session id the identity headers carry, so a body-level session id can match it. */
+  sessionId?: string | null;
+};
+
+/** The subset of observed body traits the probe bodies honor. */
+export type CandyBodyTraits = {
+  hasTopLevelSystem?: boolean;
+  hasMetadataUserId?: boolean;
+  reasoningEffort?: string | null;
+  include?: string[] | null;
+  store?: boolean | null;
+  hasMaxOutputTokens?: boolean;
+  hasPromptCacheKey?: boolean;
+  parallelToolCalls?: boolean | null;
 };
 
 export type CandyFingerprint = {
@@ -100,10 +131,10 @@ const GENERIC_SDK_USER_AGENT = 'OpenAI/JS 4.104.0';
  * installation, and so metapi's own `cliProfiles` detector recognizes the probe as
  * Claude Code traffic.
  */
-export function buildClaudeCodeUserId(scopeKey: string): string {
+export function buildClaudeCodeUserId(scopeKey: string, sessionIdOverride?: string | null): string {
   const hex = uuidFromSeed(`metapi:candy:claude-user:${scopeKey}`).replace(/-/g, '');
   const doubled = `${hex}${hex}`.slice(0, 64);
-  const sessionId = uuidFromSeed(`metapi:candy:claude-session:${scopeKey}`);
+  const sessionId = sessionIdOverride || uuidFromSeed(`metapi:candy:claude-session:${scopeKey}`);
   return `user_${doubled}_account__session_${sessionId}`;
 }
 
@@ -112,12 +143,14 @@ const claudeCodeFingerprint: CandyFingerprint = {
   label: 'Claude Code',
   downstreamFormat: 'claude',
   stream: true,
-  buildProviderHeaders() {
+  buildProviderHeaders({ scopeKey }) {
     return {
-      // buildClaudeRuntimeHeaders() already defaults these; stating them here keeps the
-      // probe's identity explicit and makes the version easy to bump in one place.
-      'User-Agent': CLAUDE_DEFAULT_USER_AGENT,
+      // Stated explicitly rather than left to buildClaudeRuntimeHeaders(): the runtime
+      // default is an older version, and the template should not inherit it.
+      'User-Agent': BUILTIN_CLAUDE_CODE_USER_AGENT,
       'X-App': 'cli',
+      // Real Claude Code traffic carries its session id as a header as well.
+      'x-claude-code-session-id': uuidFromSeed(`metapi:candy:claude-session:${scopeKey}`),
     };
   },
   buildOpenAiBody({ model, prompt }) {
@@ -127,7 +160,12 @@ const claudeCodeFingerprint: CandyFingerprint = {
       stream: true,
     };
   },
-  buildClaudeBody({ model, prompt, scopeKey }) {
+  buildClaudeBody({ model, prompt, scopeKey, bodyTraits, sessionId }) {
+    // Without observed traits: the template (identity system line + user id). With them:
+    // only what real traffic carries — the box's Claude traffic sends neither, and a probe
+    // that adds them describes a client that does not talk to this box.
+    const withSystem = bodyTraits ? bodyTraits.hasTopLevelSystem === true : true;
+    const withUserId = bodyTraits ? bodyTraits.hasMetadataUserId === true : true;
     return {
       model,
       // Reasoning models charge their thinking against this budget; at 2048 a thinking
@@ -135,8 +173,8 @@ const claudeCodeFingerprint: CandyFingerprint = {
       // empty completion and then as "未完成"（inconclusive）.
       max_tokens: CANDY_PROBE_MAX_OUTPUT_TOKENS,
       stream: true,
-      system: [{ type: 'text', text: CLAUDE_CODE_SYSTEM_LINE }],
-      metadata: { user_id: buildClaudeCodeUserId(scopeKey) },
+      ...(withSystem ? { system: [{ type: 'text', text: CLAUDE_CODE_SYSTEM_LINE }] } : {}),
+      ...(withUserId ? { metadata: { user_id: buildClaudeCodeUserId(scopeKey, sessionId) } } : {}),
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
     };
   },
@@ -148,13 +186,14 @@ const codexFingerprint: CandyFingerprint = {
   downstreamFormat: 'responses',
   stream: true,
   buildProviderHeaders({ scopeKey }) {
-    const sessionId = uuidFromSeed(`metapi:candy:codex-session:${scopeKey}`);
+    // The built-in fallback mirrors what real Codex traffic on the responses surface was
+    // observed to carry: user agent, originator and a hyphenated `session-id` — no
+    // `Version`, no `Conversation_id`, no underscored `Session_id`. An observed identity
+    // (see `observedClientIdentity.ts`) replaces this whenever one exists.
     return {
-      'User-Agent': CODEX_DEFAULT_USER_AGENT,
+      'User-Agent': BUILTIN_CODEX_USER_AGENT,
       Originator: 'codex_cli_rs',
-      Version: CODEX_CLIENT_VERSION,
-      Session_id: sessionId,
-      Conversation_id: sessionId,
+      'session-id': uuidFromSeed(`metapi:candy:codex-session:${scopeKey}`),
     };
   },
   buildOpenAiBody({ model, prompt }) {
@@ -164,20 +203,40 @@ const codexFingerprint: CandyFingerprint = {
       stream: true,
     };
   },
-  buildResponsesBody({ model, prompt, scopeKey }) {
+  buildResponsesBody({ model, prompt, scopeKey, bodyTraits, sessionId }) {
+    const input = [{
+      type: 'message',
+      role: 'user',
+      content: [{ type: 'input_text', text: prompt }],
+    }];
+    if (!bodyTraits) {
+      return {
+        model,
+        input,
+        stream: true,
+        store: false,
+        // Same reasoning as the Claude body: the reasoning budget and the answer share this
+        // cap, so a tight one turns a working channel into an empty response.
+        max_output_tokens: CANDY_PROBE_MAX_OUTPUT_TOKENS,
+        prompt_cache_key: uuidFromSeed(`metapi:candy:codex-cache:${scopeKey}`),
+      };
+    }
+    // Observed shape. `max_output_tokens` follows real traffic too: real Codex sends none,
+    // and the cap is then the upstream's own. A thinking model cut off by it reads as
+    // "输出被截断" (inconclusive), never as a wrong answer — see the answer reader.
     return {
       model,
-      input: [{
-        type: 'message',
-        role: 'user',
-        content: [{ type: 'input_text', text: prompt }],
-      }],
+      instructions: '',
+      input,
       stream: true,
-      store: false,
-      // Same reasoning as the Claude body: the reasoning budget and the answer share this
-      // cap, so a tight one turns a working channel into an empty response.
-      max_output_tokens: CANDY_PROBE_MAX_OUTPUT_TOKENS,
-      prompt_cache_key: uuidFromSeed(`metapi:candy:codex-cache:${scopeKey}`),
+      ...(bodyTraits.reasoningEffort ? { reasoning: { effort: bodyTraits.reasoningEffort } } : {}),
+      ...(typeof bodyTraits.parallelToolCalls === 'boolean' ? { parallel_tool_calls: bodyTraits.parallelToolCalls } : {}),
+      ...(bodyTraits.include && bodyTraits.include.length > 0 ? { include: [...bodyTraits.include] } : {}),
+      store: typeof bodyTraits.store === 'boolean' ? bodyTraits.store : false,
+      ...(bodyTraits.hasMaxOutputTokens === false ? {} : { max_output_tokens: CANDY_PROBE_MAX_OUTPUT_TOKENS }),
+      ...(bodyTraits.hasPromptCacheKey === false
+        ? {}
+        : { prompt_cache_key: sessionId || uuidFromSeed(`metapi:candy:codex-cache:${scopeKey}`) }),
     };
   },
 };
@@ -201,7 +260,7 @@ const codexChatFingerprint: CandyFingerprint = {
     // Session_id/Conversation_id/Version here would describe a client that does not exist
     // on this surface — the same self-contradiction the generic profile avoids.
     return {
-      'User-Agent': CODEX_DEFAULT_USER_AGENT,
+      'User-Agent': BUILTIN_CODEX_USER_AGENT,
       Originator: 'codex_cli_rs',
     };
   },

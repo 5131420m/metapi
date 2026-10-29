@@ -106,6 +106,22 @@ export function buildIdentityProbeTooltip(probe: IdentityProbeSnapshot, canOpenD
   ].filter(Boolean).join(' · ');
 }
 
+/**
+ * Which client identity the challenges were sent with. Rows stored before the field existed
+ * were all sent under the neutral SDK identity.
+ */
+export function formatIdentityProbeClientIdentity(
+  probe: Pick<IdentityProbeSnapshot, 'identitySource' | 'identityUserAgent'>,
+): string {
+  const source = probe.identitySource ?? 'sdk';
+  const label = source === 'observed'
+    ? '观察到的真实客户端'
+    : source === 'builtin'
+      ? '内置模板（未观察到真实客户端）'
+      : '中性 SDK';
+  return probe.identityUserAgent ? `${label} · ${probe.identityUserAgent}` : label;
+}
+
 /** Per-verdict counts of one route sweep, plus channels the probe could not run on. */
 export type IdentityProbeBatchTally = Record<IdentityProbeVerdict, number> & {
   /** The request itself was refused (no credential, non-conversation model…). */
