@@ -15,7 +15,8 @@ import {
   formatCandyProbeTrigger,
   resolveCandyProbeTone,
 } from './presentation.js';
-import type { CandyProbeResult } from '../types.js';
+import { buildProbeCombinedSummary } from '../probeSummary.js';
+import type { CandyProbeResult, CandyProbeSnapshot, IdentityProbeSnapshot } from '../types.js';
 
 type CandyProbeDetailModalProps = {
   open: boolean;
@@ -23,6 +24,10 @@ type CandyProbeDetailModalProps = {
   result: CandyProbeResult | null;
   loading?: boolean;
   channelLabel?: string | null;
+  /** The list snapshot of this verdict (carries freshness), for the combined reading. */
+  candySnapshot?: CandyProbeSnapshot | null;
+  /** The channel's model fingerprint verdict, for the combined reading. */
+  identity?: IdentityProbeSnapshot | null;
 };
 
 const labelStyle: CSSProperties = {
@@ -51,8 +56,16 @@ export default function CandyProbeDetailModal({
   result,
   loading = false,
   channelLabel = null,
+  candySnapshot = null,
+  identity = null,
 }: CandyProbeDetailModalProps) {
   const tone = result ? resolveCandyProbeTone(result.verdict, result.expectation) : 'warning';
+  const combined = result
+    ? buildProbeCombinedSummary(
+      { verdict: result.verdict, expectation: result.expectation, fresh: candySnapshot?.fresh ?? true },
+      identity,
+    )
+    : null;
 
   return (
     <CenteredModal
@@ -102,6 +115,22 @@ export default function CandyProbeDetailModal({
               }}
             >
               {result.reason}
+            </div>
+          ) : null}
+
+          {combined ? (
+            <div
+              data-testid="probe-combined-summary"
+              style={{
+                fontSize: 11.5,
+                lineHeight: 1.5,
+                borderRadius: 8,
+                padding: '8px 10px',
+                color: qualityToneColor(combined.tone),
+                background: qualityToneBgColor(combined.tone),
+              }}
+            >
+              与模型指纹结合：{combined.text}
             </div>
           ) : null}
 

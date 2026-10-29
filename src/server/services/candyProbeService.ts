@@ -17,13 +17,12 @@
  * The exclusion policy is a separate, later slice that reads these verdicts.
  */
 
-import { eq } from 'drizzle-orm';
-import { db, schema } from '../db/index.js';
+import type { schema } from '../db/index.js';
 import { config } from '../config.js';
 import { resolveResponseTimeoutMs } from '../proxy-core/responseTimeoutPolicy.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { buildOauthProviderHeaders } from './oauth/service.js';
-import { resolveProbeModelName, resolveProbeTokenValue } from './channelProbeContext.js';
+import { loadProbeChannelRow, resolveProbeModelName, resolveProbeTokenValue } from './channelProbeContext.js';
 import { resolveChannelProxyUrl, withSiteRecordProxyRequestInit } from './siteProxy.js';
 import { dispatchRuntimeRequest } from './runtimeDispatch.js';
 import { isLikelyConversationModel } from './runtimeModelProbe.js';
@@ -75,7 +74,11 @@ import {
   type CandyFingerprint,
   type CandyFingerprintId,
 } from './candyProbe/fingerprints.js';
-import { extractCandyProbeAnswerPayload, isTruncatedStopReason } from './candyProbe/responseParsing.js';
+import {
+  extractCandyProbeAnswerPayload,
+  isTruncatedStopReason,
+  normalizeCandyProbeUsage,
+} from './candyProbe/responseParsing.js';
 import {
   candyProbeConfigMatches,
   getCandyProbeResultForChannel,
@@ -155,45 +158,8 @@ export function candyProbeTimeoutMessage(timeoutMs: number): string {
   return `探测超时：上游未在 ${Math.round(timeoutMs / 1000)}s 内完成`;
 }
 
-/**
- * Normalise the several usage shapes upstreams return into proxy-log token columns.
- *
- * Deliberately does not invent numbers. A streaming chat upstream that was not asked for
- * usage reports nothing, and a partial sum is worse than a blank: `total = 0 + output`
- * would claim a total that excludes the prompt entirely.
- *
- * Derivation happens only in directions that are exact:
- *
- * - a missing side from a real total;
- * - the total from two real sides. Anthropic reports `input_tokens` / `output_tokens` and no
- *   total at all, so without this every claude-path probe logged a zero total while both
- *   halves were known — the sum of two measured numbers, not an invention.
- */
-function normalizeCandyProbeUsage(usage: Record<string, unknown> | null | undefined): {
-  promptTokens: number | null;
-  completionTokens: number | null;
-  totalTokens: number | null;
-} {
-  const readNumber = (...keys: string[]): number | null => {
-    for (const key of keys) {
-      const value = usage?.[key];
-      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
-    }
-    return null;
-  };
-  let promptTokens = readNumber('input_tokens', 'prompt_tokens', 'promptTokenCount');
-  let completionTokens = readNumber('output_tokens', 'completion_tokens', 'candidatesTokenCount');
-  let totalTokens = readNumber('total_tokens', 'totalTokenCount');
-
-  if (totalTokens != null) {
-    if (promptTokens == null && completionTokens != null) promptTokens = Math.max(0, totalTokens - completionTokens);
-    if (completionTokens == null && promptTokens != null) completionTokens = Math.max(0, totalTokens - promptTokens);
-  } else if (promptTokens != null && completionTokens != null) {
-    totalTokens = promptTokens + completionTokens;
-  }
-
-  return { promptTokens, completionTokens, totalTokens };
-}
+// Usage normalization lives beside the response parser (`candyProbe/responseParsing.ts`) so
+// the model fingerprint probe reads token counts by the same rules.
 
 /**
  * The verdict, as one line of text.
@@ -286,14 +252,6 @@ export class CandyProbeRequestError extends Error {
   }
 }
 
-type CandyProbeChannelRow = {
-  route_channels: typeof schema.routeChannels.$inferSelect;
-  token_routes: typeof schema.tokenRoutes.$inferSelect;
-  accounts: typeof schema.accounts.$inferSelect;
-  sites: typeof schema.sites.$inferSelect;
-  account_tokens: typeof schema.accountTokens.$inferSelect | null;
-};
-
 type CandyProbeChannelContext = {
   channelId: number;
   routeId: number;
@@ -310,14 +268,7 @@ type CandyProbeChannelContext = {
 
 
 async function loadChannelProbeContext(channelId: number): Promise<CandyProbeChannelContext> {
-  const row = await db.select()
-    .from(schema.routeChannels)
-    .innerJoin(schema.accounts, eq(schema.routeChannels.accountId, schema.accounts.id))
-    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
-    .innerJoin(schema.tokenRoutes, eq(schema.routeChannels.routeId, schema.tokenRoutes.id))
-    .leftJoin(schema.accountTokens, eq(schema.routeChannels.tokenId, schema.accountTokens.id))
-    .where(eq(schema.routeChannels.id, channelId))
-    .get();
+  const row = await loadProbeChannelRow(channelId);
   if (!row) {
     throw new CandyProbeRequestError(`通道 #${channelId} 不存在`, 404);
   }

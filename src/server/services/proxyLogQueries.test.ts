@@ -134,5 +134,20 @@ describe('meteredProxyLogCondition', () => {
 
   it('exposes the probe family as the marker the writer uses', () => {
     expect(queries.PROBE_CLIENT_FAMILY).toBe('candy_probe');
+    expect(queries.PROBE_CLIENT_FAMILIES).toEqual(['candy_probe', 'model_identity_probe']);
+  });
+
+  it('excludes the model fingerprint probe as well, keeping NULL rows', async () => {
+    await seedLog({ model: 'legacy', clientFamily: null });
+    await seedLog({ model: 'candy', clientFamily: 'candy_probe' });
+    await seedLog({ model: 'identity', clientFamily: 'model_identity_probe' });
+    await seedLog({ model: 'real', clientFamily: 'codex' });
+
+    const meteredModels = await db
+      .select({ model: schema.proxyLogs.modelRequested })
+      .from(schema.proxyLogs)
+      .where(queries.meteredProxyLogCondition())
+      .all();
+    expect(meteredModels.map((row) => row.model).sort()).toEqual(['legacy', 'real']);
   });
 });

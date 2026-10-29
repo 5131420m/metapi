@@ -204,10 +204,16 @@ Metapi 当前有三类主要配置入口：
 | `MODEL_AVAILABILITY_PROBE_TIMEOUT_MS` | 批量测活单次探测超时（毫秒） | `15000` |
 | `MODEL_AVAILABILITY_PROBE_CONCURRENCY` | 批量测活并发数 | `1` |
 
+| `MODEL_IDENTITY_DATA_SOURCE` | 模型指纹检测（lm-detector）参考库来源：逗号分隔的 URL，或单个本地目录（离线部署，目录里放 `unified_bank.json` 与 `shared_detector.bin`） | 空，使用 `https://lm.ikale.io/data/` 与国内镜像 |
+| `MODEL_IDENTITY_DATA_TTL_SECONDS` | 参考库缓存多久后在后台检查更新（秒），`0` 表示每次加载都检查 | `86400` |
+
 注意：
 
 - **批量测活开关本身**已经在 UI 里有了
 - 这里只剩下间隔、超时、并发这些更高级的细项还没有 UI
+- 模型指纹检测在「路由」页手动触发：通道行「🔍 测身份」检测单个通道，路由头部「🔍 一键测身份」逐个检测该路由下所有通道（每个通道 3 个请求，开始前会确认）。首次检测时下载约 4.6MB 参考库，缓存在 `DATA_DIR/lmfpd/data.bin`；下载失败时检测返回「未完成」，不会向上游发请求
+- 判定分级：型号一致（最像的就是声称型号或其日期快照）、疑似换版本（同家族另一型号领先且置信度 ≥ 60%）、家族一致（同家族但型号无法确认）、倾向一致（只有部分回答有效、未校准）、疑似换皮（另一家族且置信度 ≥ 60%）、无法确认、非模型输出、未完成。60% 阈值尚未校准
+- 参考库下载走 Node 自带的 `fetch`：需要经 HTTP 代理下载时，除了 `HTTPS_PROXY` 还要设置 `NODE_USE_ENV_PROXY=1`
 
 ---
 

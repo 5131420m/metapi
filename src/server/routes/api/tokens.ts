@@ -24,6 +24,10 @@ import {
 import { clearChannelCooldown, clearRouteCooldown } from '../../services/routeCooldownService.js';
 import { getCandyProbeSnapshots } from '../../services/candyProbeService.js';
 import {
+  getIdentityProbeSnapshots,
+  getLoadedIdentityBankBuiltAt,
+} from '../../services/modelIdentityProbeService.js';
+import {
   isChannelProbeApplicable,
   resolveExactProbeModelName,
 } from '../../services/channelProbeContext.js';
@@ -664,12 +668,24 @@ async function fetchChannelsForRouteRows(
     }
   }
   const candyProbeByChannelId = getCandyProbeSnapshots(qualityChannelIds, candyProbeConfigByChannelId);
+  // Display-only model-fingerprint verdict, same configuration rule. The bank version is
+  // compared only once this process has loaded a bank; the list never triggers a download.
+  const identityBankBuiltAt = getLoadedIdentityBankBuiltAt();
+  const identityProbeConfigByChannelId = Object.fromEntries(
+    Object.entries(candyProbeConfigByChannelId).map(([channelId, channelConfig]) => [
+      channelId,
+      { ...channelConfig, bankBuiltAt: identityBankBuiltAt },
+    ]),
+  );
+  const identityProbeByChannelId = getIdentityProbeSnapshots(qualityChannelIds, identityProbeConfigByChannelId);
   for (const channels of channelsByActualRouteId.values()) {
     for (const channel of channels) {
       channel.quality = qualityByChannelId[String(channel.id)] ?? null;
       channel.candyProbe = candyProbeByChannelId[String(channel.id)] ?? null;
+      channel.identityProbe = identityProbeByChannelId[String(channel.id)] ?? null;
       // Lets the UI hide a button that could only ever come back rejected, and lets the
-      // batch skip those channels instead of firing a doomed request per channel.
+      // batch skip those channels instead of firing a doomed request per channel. The
+      // fingerprint probe has the same applicability rule, so the UI reads this one flag.
       channel.candyProbeApplicable = isChannelProbeApplicable({
         sourceModel: channel.sourceModel,
         modelPattern: channel.modelPattern,

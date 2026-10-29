@@ -67,6 +67,8 @@ import ManualRoutePanel from './token-routes/ManualRoutePanel.js';
 import RouteCard from './token-routes/RouteCard.js';
 import AddChannelModal from './token-routes/AddChannelModal.js';
 import CandyProbeDetailModal from './token-routes/candyProbe/CandyProbeDetailModal.js';
+import IdentityProbeDetailModal from './token-routes/identityProbe/IdentityProbeDetailModal.js';
+import { useIdentityProbe } from './token-routes/identityProbe/useIdentityProbe.js';
 import { buildCandyProbeBatchSummary, buildCandyProbeVerdictLabel, formatCandyProbeFingerprint } from './token-routes/candyProbe/presentation.js';
 
 const EMPTY_ROUTE_CANDIDATE_VIEW: RouteCandidateView = {
@@ -1438,6 +1440,13 @@ export default function TokenRoutes() {
     return null;
   };
 
+  // Model fingerprint probe: state and handlers live in the hook; the page only wires them.
+  const identityProbe = useIdentityProbe({
+    toast,
+    findChannelById,
+    reloadChannels: (routeId) => loadChannels(routeId, true),
+  });
+
   const handleOpenCandyProbeDetail = async (channelId: number) => {
     // Sequence guard: opening another channel (or closing the modal) while a fetch is in
     // flight must not let the older response write to the newer view, and its `finally` must
@@ -2137,6 +2146,11 @@ export default function TokenRoutes() {
                     onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
                     candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
                     onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
+                    identityProbeTestingByChannel={identityProbe.testingByChannel}
+                    onRunIdentityProbe={identityProbe.runProbe}
+                    onOpenIdentityProbeDetail={identityProbe.openDetail}
+                    identityProbeBatchProgressByRoute={identityProbe.batchByRoute}
+                    onRunIdentityProbeAllChannels={identityProbe.runRouteSweep}
                     expandedSourceGroupMap={expandedSourceGroupMap}
                     onToggleSourceGroup={stableToggleSourceGroup}
                   />
@@ -2184,6 +2198,11 @@ export default function TokenRoutes() {
                     onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
                     candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
                     onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
+                    identityProbeTestingByChannel={identityProbe.testingByChannel}
+                    onRunIdentityProbe={identityProbe.runProbe}
+                    onOpenIdentityProbeDetail={identityProbe.openDetail}
+                    identityProbeBatchProgressByRoute={identityProbe.batchByRoute}
+                    onRunIdentityProbeAllChannels={identityProbe.runRouteSweep}
               expandedSourceGroupMap={expandedSourceGroupMap}
               onToggleSourceGroup={stableToggleSourceGroup}
             />
@@ -2230,6 +2249,11 @@ export default function TokenRoutes() {
                     onOpenCandyProbeDetail={stableOpenCandyProbeDetail}
                     candyProbeBatchProgressByRoute={candyProbeBatchByRoute}
                     onRunCandyProbeAllChannels={stableRunCandyProbeAllChannels}
+                    identityProbeTestingByChannel={identityProbe.testingByChannel}
+                    onRunIdentityProbe={identityProbe.runProbe}
+                    onOpenIdentityProbeDetail={identityProbe.openDetail}
+                    identityProbeBatchProgressByRoute={identityProbe.batchByRoute}
+                    onRunIdentityProbeAllChannels={identityProbe.runRouteSweep}
                   expandedSourceGroupMap={expandedSourceGroupMap}
                   onToggleSourceGroup={stableToggleSourceGroup}
                 />
@@ -2337,6 +2361,18 @@ export default function TokenRoutes() {
         result={candyProbeDetail?.result ?? null}
         loading={candyProbeDetailLoading}
         channelLabel={candyProbeDetail?.label ?? null}
+        candySnapshot={candyProbeDetail ? findChannelById(candyProbeDetail.channelId)?.candyProbe ?? null : null}
+        identity={candyProbeDetail ? findChannelById(candyProbeDetail.channelId)?.identityProbe ?? null : null}
+      />
+
+      <IdentityProbeDetailModal
+        open={!!identityProbe.detail}
+        onClose={identityProbe.closeDetail}
+        result={identityProbe.detail?.result ?? null}
+        loading={identityProbe.detailLoading}
+        channelLabel={identityProbe.detail?.label ?? null}
+        candy={identityProbe.detail ? findChannelById(identityProbe.detail.channelId)?.candyProbe ?? null : null}
+        fresh={identityProbe.detail ? findChannelById(identityProbe.detail.channelId)?.identityProbe?.fresh ?? true : true}
       />
     </div>
   );

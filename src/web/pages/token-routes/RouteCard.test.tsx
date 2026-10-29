@@ -1103,6 +1103,8 @@ describe('RouteCard candy-probe batch action', () => {
   function renderCard(overrides: {
     onRunCandyProbeAllChannels?: (routeId: number) => void;
     candyProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
+    onRunIdentityProbeAllChannels?: (routeId: number) => void;
+    identityProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
     channelCount?: number;
     channels?: RouteChannel[];
   } = {}) {
@@ -1144,6 +1146,8 @@ describe('RouteCard candy-probe batch action', () => {
         onToggleSourceGroup={vi.fn()}
         onRunCandyProbeAllChannels={overrides.onRunCandyProbeAllChannels}
         candyProbeBatchProgressByRoute={overrides.candyProbeBatchProgressByRoute}
+        onRunIdentityProbeAllChannels={overrides.onRunIdentityProbeAllChannels}
+        identityProbeBatchProgressByRoute={overrides.identityProbeBatchProgressByRoute}
       />,
     );
   }
@@ -1184,5 +1188,26 @@ describe('RouteCard candy-probe batch action', () => {
   it('stays hidden when no sweep handler is wired', () => {
     const root = renderCard({});
     expect(findButton(root, '一键测智商')).toBeFalsy();
+    expect(findButton(root, '一键测身份')).toBeFalsy();
+  });
+
+  it('offers the fingerprint sweep beside the candy sweep, for its own route id', () => {
+    const onRun = vi.fn();
+    const root = renderCard({ onRunCandyProbeAllChannels: vi.fn(), onRunIdentityProbeAllChannels: onRun });
+    expect(findButton(root, '一键测智商')).toBeTruthy();
+    findButton(root, '一键测身份')?.props.onClick();
+    expect(onRun).toHaveBeenCalledWith(42);
+  });
+
+  it('shows fingerprint sweep progress without blocking the candy sweep', () => {
+    const root = renderCard({
+      onRunCandyProbeAllChannels: vi.fn(),
+      onRunIdentityProbeAllChannels: vi.fn(),
+      identityProbeBatchProgressByRoute: { 42: { done: 2, total: 5 } },
+    });
+    const button = findButton(root, '测身份中');
+    expect(collectText(button)).toContain('2/5');
+    expect(button?.props.disabled).toBe(true);
+    expect(findButton(root, '一键测智商')?.props.disabled).toBe(false);
   });
 });

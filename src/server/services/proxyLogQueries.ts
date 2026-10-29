@@ -19,9 +19,10 @@
  * aggregate cannot quietly forget.
  */
 
-import { isNull, ne, or } from 'drizzle-orm';
+import { isNull, notInArray, or } from 'drizzle-orm';
 import { schema } from '../db/index.js';
 import { CANDY_PROBE_CLIENT_FAMILY } from '../../shared/candyProbe.js';
+import { IDENTITY_PROBE_CLIENT_FAMILY } from '../../shared/modelIdentityProbe.js';
 
 /**
  * Marks a query as a row-level view that intentionally includes probe traffic.
@@ -31,19 +32,28 @@ import { CANDY_PROBE_CLIENT_FAMILY } from '../../shared/candyProbe.js';
  */
 export const PROXY_LOG_VIEW_INCLUDES_PROBE = 'proxy-log-view: includes probe traffic';
 
-/** The `client_family` value the aggregates exclude. */
+/**
+ * Every `client_family` value metapi's own probes write — the candy-question probe and the
+ * model fingerprint probe. The aggregates exclude all of them; a new probe adds itself here.
+ */
+export const PROBE_CLIENT_FAMILIES: readonly string[] = [
+  CANDY_PROBE_CLIENT_FAMILY,
+  IDENTITY_PROBE_CLIENT_FAMILY,
+];
+
+/** The candy probe's family; kept for callers that only care about that one probe. */
 export const PROBE_CLIENT_FAMILY = CANDY_PROBE_CLIENT_FAMILY;
 
 /**
  * Condition for every aggregate over `proxy_logs`: keep probe traffic out.
  *
  * NULL is treated as metered on purpose. `client_family` is nullable, and a plain
- * `<> 'candy_probe'` is NULL for those rows — SQL would then drop every legacy row from
- * the stats, which is a far worse failure than counting a probe.
+ * `NOT IN ('candy_probe', …)` is NULL for those rows — SQL would then drop every legacy row
+ * from the stats, which is a far worse failure than counting a probe.
  */
 export function meteredProxyLogCondition() {
   return or(
     isNull(schema.proxyLogs.clientFamily),
-    ne(schema.proxyLogs.clientFamily, CANDY_PROBE_CLIENT_FAMILY),
+    notInArray(schema.proxyLogs.clientFamily, [...PROBE_CLIENT_FAMILIES]),
   );
 }

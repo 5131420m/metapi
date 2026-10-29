@@ -9,11 +9,12 @@
  * here now, and both callers use them.
  */
 
+import { eq } from 'drizzle-orm';
 import { isExactTokenRouteModelPattern } from '../../shared/tokenRoutePatterns.js';
 import { getOauthInfoFromAccount } from './oauth/oauthAccount.js';
 import { isUsableAccountToken } from './accountTokenService.js';
 import { isLikelyConversationModel } from './runtimeModelProbe.js';
-import type { schema } from '../db/index.js';
+import { db, schema } from '../db/index.js';
 
 /** The joined channel row both probes read. */
 export type ProbeChannelRow = {
@@ -23,6 +24,24 @@ export type ProbeChannelRow = {
   sites: typeof schema.sites.$inferSelect;
   account_tokens: typeof schema.accountTokens.$inferSelect | null;
 };
+
+/**
+ * The joined row for one route channel, or null when the channel does not exist.
+ *
+ * The candy probe and the model fingerprint probe both start from exactly this join; it lives
+ * here so a change to what a probe reads (a new join, a filter) lands in both.
+ */
+export async function loadProbeChannelRow(channelId: number): Promise<ProbeChannelRow | null> {
+  const row = await db.select()
+    .from(schema.routeChannels)
+    .innerJoin(schema.accounts, eq(schema.routeChannels.accountId, schema.accounts.id))
+    .innerJoin(schema.sites, eq(schema.accounts.siteId, schema.sites.id))
+    .innerJoin(schema.tokenRoutes, eq(schema.routeChannels.routeId, schema.tokenRoutes.id))
+    .leftJoin(schema.accountTokens, eq(schema.routeChannels.tokenId, schema.accountTokens.id))
+    .where(eq(schema.routeChannels.id, channelId))
+    .get();
+  return row ?? null;
+}
 
 /**
  * The model name to send upstream, from the two raw values.

@@ -137,6 +137,9 @@ describe('proxy log read policy', () => {
     const source = readFileSync(resolve(SERVER_ROOT, 'services/proxyLogQueries.ts'), 'utf8');
     expect(source).toContain('isNull(');
     expect(source).toContain('CANDY_PROBE_CLIENT_FAMILY');
-    expect(source).not.toMatch(/ne\(\s*schema\.proxyLogs\.clientFamily,\s*CANDY_PROBE_CLIENT_FAMILY\s*\)\s*;?\s*$/m);
+    // Both probes' families are excluded, not just the candy probe's: the condition must
+    // use the family list, and must still sit inside an `or(isNull(...), ...)`.
+    expect(source).toContain('IDENTITY_PROBE_CLIENT_FAMILY');
+    expect(source).toMatch(/or\(\s*isNull\(schema\.proxyLogs\.clientFamily\),\s*notInArray\(schema\.proxyLogs\.clientFamily,\s*\[\.\.\.PROBE_CLIENT_FAMILIES\]\)/);
   });
 });

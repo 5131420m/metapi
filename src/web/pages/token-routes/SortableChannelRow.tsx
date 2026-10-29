@@ -16,6 +16,11 @@ import {
   resolveCandyProbeTone,
 } from './candyProbe/presentation.js';
 import {
+  buildIdentityProbeBadgeLabel,
+  buildIdentityProbeTooltip,
+  resolveIdentityProbeTone,
+} from './identityProbe/presentation.js';
+import {
   firstByteTone,
   qualityToneBgColor,
   qualityToneColor,
@@ -264,17 +269,56 @@ function buildCandyProbeBadge(
   );
 }
 
-function ChannelQualityStrip({ channel, suppressTooltips, style, onOpenCandyProbeDetail }: {
+/**
+ * The model fingerprint marker. Unlike the candy badge there is no "未测" placeholder: the
+ * fingerprint run is an occasional, deliberate check, and a "未测" chip on every row would
+ * read as a todo list.
+ */
+function buildIdentityProbeBadge(
+  channel: RouteChannel,
+  suppressTooltips: boolean,
+  onOpenDetail?: () => void,
+) {
+  const probe = channel.identityProbe ?? null;
+  if (!probe) return null;
+  const tone = resolveIdentityProbeTone(probe.verdict);
+  return (
+    <button
+      type="button"
+      className="badge"
+      onClick={(event) => {
+        event.stopPropagation();
+        onOpenDetail?.();
+      }}
+      data-tooltip={suppressTooltips ? undefined : buildIdentityProbeTooltip(probe, !!onOpenDetail)}
+      style={{
+        fontSize: 10,
+        fontFamily: 'inherit',
+        border: 'none',
+        color: qualityToneColor(tone),
+        background: qualityToneBgColor(tone),
+        opacity: probe.fresh ? 1 : 0.6,
+        cursor: onOpenDetail ? 'pointer' : 'default',
+      }}
+    >
+      {buildIdentityProbeBadgeLabel(probe)}
+    </button>
+  );
+}
+
+function ChannelQualityStrip({ channel, suppressTooltips, style, onOpenCandyProbeDetail, onOpenIdentityProbeDetail }: {
   channel: RouteChannel;
   suppressTooltips: boolean;
   style?: CSSProperties;
   onOpenCandyProbeDetail?: () => void;
+  onOpenIdentityProbeDetail?: () => void;
 }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap', ...style }}>
       {/* Only an explicit server-computed false hides the marker: undefined must keep the
           badge, or a list payload from an older server would silently lose every verdict. */}
       {channel.candyProbeApplicable === false ? null : buildCandyProbeBadge(channel, suppressTooltips, onOpenCandyProbeDetail)}
+      {channel.candyProbeApplicable === false ? null : buildIdentityProbeBadge(channel, suppressTooltips, onOpenIdentityProbeDetail)}
       {buildChannelQualityBadges(channel, suppressTooltips)}
     </div>
   );
@@ -308,6 +352,9 @@ export function SortableChannelRow({
   candyProbeTesting = false,
   onRunCandyProbe,
   onOpenCandyProbeDetail,
+  identityProbeTesting = false,
+  onRunIdentityProbe,
+  onOpenIdentityProbeDetail,
 }: SortableChannelRowProps) {
   const resolvedPriority = displayPriority ?? channel.priority ?? 0;
   const managementLocked = readOnly || channelManagementDisabled;
@@ -424,7 +471,7 @@ export function SortableChannelRow({
                 {channel.site?.name || 'unknown'}
               </span>
 
-              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} />
+              <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} onOpenIdentityProbeDetail={onOpenIdentityProbeDetail} />
             </div>
 
             <div style={{ display: 'flex', alignItems: 'center', gap: 5, flexWrap: 'wrap' }}>
@@ -603,6 +650,16 @@ export function SortableChannelRow({
                     </button>
                   ) : null}
 
+                  {onRunIdentityProbe && channel.candyProbeApplicable !== false ? (
+                    <button
+                      onClick={onRunIdentityProbe}
+                      disabled={identityProbeTesting}
+                      className="btn btn-link btn-link-info"
+                    >
+                      {identityProbeTesting ? '检测中...' : '🔍 测身份'}
+                    </button>
+                  ) : null}
+
                   {onClearCooldown ? (
                     <button
                       onClick={onClearCooldown}
@@ -748,7 +805,7 @@ export function SortableChannelRow({
           </>
         ) : null}
 
-        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} />
+        <ChannelQualityStrip channel={channel} suppressTooltips={suppressTooltips} style={{ marginLeft: 'auto' }} onOpenCandyProbeDetail={onOpenCandyProbeDetail} onOpenIdentityProbeDetail={onOpenIdentityProbeDetail} />
 
         {routeUnitMemberSummaryText ? (
           <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, width: '100%', flexWrap: 'wrap' }}>
@@ -852,6 +909,17 @@ export function SortableChannelRow({
                 data-tooltip={suppressTooltips ? undefined : '用糖果题探测该通道是否降智（只记录结果，不改变路由）'}
               >
                 {candyProbeTesting ? '测试中...' : '🍬 测智商'}
+              </button>
+            ) : null}
+
+            {onRunIdentityProbe && channel.candyProbeApplicable !== false ? (
+              <button
+                onClick={onRunIdentityProbe}
+                disabled={identityProbeTesting}
+                className="btn btn-link btn-link-info"
+                data-tooltip={suppressTooltips ? undefined : '用数字指纹比对参考库，估计通道背后实际是哪个模型（发 3 个请求，只记录结果，不改变路由）'}
+              >
+                {identityProbeTesting ? '检测中...' : '🔍 测身份'}
               </button>
             ) : null}
 

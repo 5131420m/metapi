@@ -242,6 +242,64 @@ npx vitest run --pool=threads --poolOptions.threads.singleThread=true <test-file
 - **交付物**：代码与持续变更日志；无新增 PDF 或截图。
 - **状态**：已完成，已推送到 PR 分支；本次日志修正随当前文档提交同步。
 
+## 2026-10-25
+
+### 1. 通道模型指纹检测（集成 lm-detector）
+
+- **类型**：功能实现
+- **需求来源**：本会话需求，未提供 GitHub Issue 链接
+- **目标**：像糖果题一样在「路由」页手动触发、展示结果，用 [lm-detector](https://github.com/Ikaleio/lm-detector) 的数字指纹估计通道背后实际是哪个模型，并与糖果题结果组合解读。
+- **实现范围**：
+  - 依赖 `lmfpd-sdk@0.1.0`（MIT，精确锁版本），只用出题、请求体、数字解析、评分与参考库加载；不用 SDK 自带的 HTTP 路径，上游请求走 metapi 自己的站点 API 请求池与端点回退，密钥不出本机。
+  - 每次检测串行发送 3 道挑战，使用中性 SDK 身份（与参考库采样环境一致）；参考库加载失败时不发上游请求。
+  - 判定分为身份一致、疑似换皮、无法确认、非模型输出、未完成；疑似换皮需要校准置信度不低于 0.6（未校准的初值）且声称家族在参考库内。
+  - 结果存 `settings`（`model_identity_probe_results_v1`），配置指纹包含参考库版本，新鲜期 24 小时；不进路由、健康与冷却。
+  - 使用日志新增客户端族 `model_identity_probe`，与糖果题一起从聚合统计中排除；备份导出排除、导入账号与出厂重置时清空。
+  - 前端新增「🔍 测身份」按钮、结果徽章、明细弹窗，以及糖果题 × 模型指纹的组合解读（两个弹窗共用同一个函数）。
+- **主要文件**：
+  - `src/server/services/modelIdentityProbeService.ts`
+  - `src/server/services/modelIdentityProbe/detector.ts`、`familyMap.ts`、`verdict.ts`、`resultStore.ts`
+  - `src/server/routes/api/modelIdentityProbe.ts`
+  - `src/server/services/proxyLogQueries.ts`
+  - `src/server/services/channelProbeContext.ts`
+  - `src/shared/modelIdentityProbe.js`、`src/shared/modelIdentityProbe.d.ts`
+  - `src/web/pages/token-routes/identityProbe/`、`src/web/pages/token-routes/probeSummary.ts`
+  - `docs/configuration.md`
+- **验证**：
+  - `typecheck:web`、`typecheck:web:test`、`typecheck:server`、`typecheck:desktop`：通过。
+  - 新增与受影响测试（指纹服务、适配层、判定、存储、路由、架构、日志聚合、糖果题回归、路由页前端）：全部通过。
+  - `repo:drift-check`：新增违规 0 个；5 项为既有 tracked debt。
+  - 全量 `vitest run`：9 个测试文件因 Windows 临时目录 `EPERM` 无法启动，在 `main` 上同样失败，与本改动无关；其余全部通过。
+  - 未验证：真实上游通道上的端到端检测，以及 `mismatch` 阈值的校准。
+- **交付物**：代码与本变更日志；无 PDF 或截图。
+- **状态**：已完成，仅在本地分支 `feat/model-fingerprint-probe`，未推送。
+
+## 2026-10-26
+
+### 1. 模型指纹判定分级与路由一键测身份
+
+- **类型**：功能实现
+- **需求来源**：本会话需求（199 测试机 hub 站四个模型结果都显示「身份一致」，实际情况各不相同），未提供 GitHub Issue 链接
+- **目标**：把只比较家族的「身份一致」拆成分级判定，让同家族换版本可见；路由级增加一键检测所有通道。
+- **实现范围**：
+  - 判定分级：型号一致、疑似换版本、家族一致、倾向一致；疑似换皮、无法确认、非模型输出、未完成保持原规则。只有「型号一致」显示为绿色。
+  - 按「型号线」比较：日期快照（`-1017`、`-0731` 这类月日后缀）视为同一型号，声称型号的概率为其所有快照之和；规则在 `src/shared/modelIdentityProbe.js`，服务端判定与前端明细高亮共用。
+  - 结果新增 `claimedProbability`；存量结果中的旧 `match` 读取为「家族一致」，不会被抬高成「型号一致」。
+  - 判定文案集中在共享模块，使用日志备注、徽章、提示、明细与批量汇总读同一张表；组合解读按新等级更新。
+  - 路由头部新增「🔍 一键测身份」：逐个通道串行检测、开始前确认请求数与预计耗时、显示进度、结束后按判定汇总；非对话模型跳过。
+- **主要文件**：
+  - `src/server/services/modelIdentityProbe/verdict.ts`、`familyMap.ts`、`resultStore.ts`
+  - `src/shared/modelIdentityProbe.js`、`src/shared/modelIdentityProbe.d.ts`
+  - `src/web/pages/token-routes/identityProbe/presentation.ts`、`useIdentityProbe.ts`、`IdentityProbeDetailModal.tsx`
+  - `src/web/pages/token-routes/probeSummary.ts`、`RouteCard.tsx`
+- **验证**：
+  - 四个 typecheck 通过；`repo:drift-check` 新增违规 0。
+  - 判定测试用 199 上四条 hub 实测排名作为用例：#26 型号一致、#24 型号一致（快照归一）、#27 疑似换版本、#25 倾向一致。
+  - 指纹相关服务端、糖果题回归、路由页前端测试共 391 个通过。
+  - 未验证：阈值 0.6 对「疑似换版本」的误报率。
+- **交付物**：代码与本变更日志；无 PDF 或截图。
+- **状态**：已完成，仅在本地分支，未推送。
+
 ## 后续记录模板
 
 复制下面模板追加到对应日期下，先记录需求来源，再补充实际实现和验证结果：

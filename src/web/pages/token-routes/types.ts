@@ -94,6 +94,23 @@ export type CandyProbeResult = Omit<CandyProbeSnapshot, 'fresh' | 'expiresAt'> &
   samples: CandyProbeSampleResult[];
 };
 
+// Model fingerprint (identity) probe: the shapes come straight from the shared contract.
+import type {
+  IdentityProbeCandidate,
+  IdentityProbeResult,
+  IdentityProbeSampleSummary,
+  IdentityProbeSnapshot,
+  IdentityProbeVerdict,
+} from '../../../shared/modelIdentityProbe.js';
+
+export type {
+  IdentityProbeCandidate,
+  IdentityProbeResult,
+  IdentityProbeSampleSummary,
+  IdentityProbeSnapshot,
+  IdentityProbeVerdict,
+};
+
 export type RouteChannel = {
   id: number;
   routeId?: number;
@@ -111,8 +128,11 @@ export type RouteChannel = {
   quality?: RouteChannelQuality | null;
   /** Display-only candy-question verdict; null before the first manual probe. */
   candyProbe?: CandyProbeSnapshot | null;
+  /** Display-only model fingerprint verdict; null before the first run. */
+  identityProbe?: IdentityProbeSnapshot | null;
   /**
-   * Whether a probe could succeed at all (false for a non-conversation model).
+   * Whether a probe could succeed at all (false for a non-conversation model). Covers both
+   * the candy probe and the fingerprint probe, which share the rule.
    *
    * Computed by the server with the same rule the probe enforces, so the UI never has to
    * duplicate model-family knowledge — and never offers a button that can only come back
@@ -246,6 +266,10 @@ export type SortableChannelRowProps = {
   candyProbeTesting?: boolean;
   onRunCandyProbe?: () => void;
   onOpenCandyProbeDetail?: () => void;
+  /** A model fingerprint probe is currently running for this channel. */
+  identityProbeTesting?: boolean;
+  onRunIdentityProbe?: () => void;
+  onOpenIdentityProbeDetail?: () => void;
 };
 
 export type GroupRouteItem = {

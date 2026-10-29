@@ -165,6 +165,10 @@ export function buildConfig(env: NodeJS.ProcessEnv) {
     // one request), whatever the tick and recheck cadence say: the hard cost guard for
     // quota-limited upstream keys.
     candyProbeScheduleDailyMaxRuns: Math.min(1000, Math.max(1, Math.trunc(parseNumber(env.CANDY_PROBE_SCHEDULE_DAILY_MAX_RUNS, 48)))),
+    // Model fingerprint (lm-detector) reference data. Empty source = the SDK's default
+    // download sources; a single non-URL value is a local directory (offline deployments).
+    modelIdentityDataSource: parseCsvList(env.MODEL_IDENTITY_DATA_SOURCE),
+    modelIdentityDataTtlSeconds: Math.max(0, Math.trunc(parseNumber(env.MODEL_IDENTITY_DATA_TTL_SECONDS, 86_400))),
     proxyLogRetentionDays: Math.max(0, Math.trunc(parseNumber(env.PROXY_LOG_RETENTION_DAYS, 30))),
     proxyLogRetentionPruneIntervalMinutes: Math.max(1, Math.trunc(parseNumber(env.PROXY_LOG_RETENTION_PRUNE_INTERVAL_MINUTES, 30))),
     proxyFileRetentionDays: Math.max(0, Math.trunc(parseNumber(env.PROXY_FILE_RETENTION_DAYS, 30))),

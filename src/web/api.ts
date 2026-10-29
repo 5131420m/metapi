@@ -1,5 +1,6 @@
 import { clearAuthSession, getAuthToken } from "./authSession.js";
 import { CANDY_PROBE_MAX_TIMEOUT_MS } from "../shared/candyProbe.js";
+import { IDENTITY_PROBE_MAX_TIMEOUT_MS } from "../shared/modelIdentityProbe.js";
 
 type BufferLike = {
   from(data: ArrayBuffer): { toString(encoding: "base64"): string };
@@ -987,6 +988,16 @@ export const api = {
     }),
   getChannelCandyProbe: (channelId: number) =>
     request(`/api/channels/${channelId}/candy-probe`),
+  // Model fingerprint probe (display-only): three upstream completions in a row, so the
+  // backstop timeout is longer than the server's own ceiling, for the same reason as above.
+  runChannelIdentityProbe: (channelId: number) =>
+    request(`/api/channels/${channelId}/identity-probe`, {
+      method: "POST",
+      body: JSON.stringify({}),
+      timeoutMs: IDENTITY_PROBE_MAX_TIMEOUT_MS + 15_000,
+    }),
+  getChannelIdentityProbe: (channelId: number) =>
+    request(`/api/channels/${channelId}/identity-probe`),
   batchUpdateRoutes: (data: { ids: number[]; action: "enable" | "disable" }) =>
     request("/api/routes/batch", {
       method: "POST",

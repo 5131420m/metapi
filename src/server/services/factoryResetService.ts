@@ -6,6 +6,7 @@ import { ensureDefaultSitesSeeded } from './defaultSiteSeedService.js';
 import { startProxyLogRetentionService } from './proxyLogRetentionService.js';
 import { invalidateSiteProxyCache } from './siteProxy.js';
 import { discardCandyProbeResults } from './candyProbe/resultStore.js';
+import { discardIdentityProbeResults } from './modelIdentityProbe/resultStore.js';
 import {
   startModelAvailabilityProbeScheduler,
   stopModelAvailabilityProbeScheduler,
@@ -144,6 +145,8 @@ export async function performFactoryReset(deps: FactoryResetDependencies = {}): 
   // back into the settings row of the freshly reset database; the persisted row is cleared
   // too, so a database swap cannot carry them across either.
   await discardCandyProbeResults();
+  // Model fingerprint verdicts: same lifecycle, same reasoning.
+  await discardIdentityProbeResults();
 
   await clearAllBusinessData();
   resetRuntimeConfigToInitialState(preserved);

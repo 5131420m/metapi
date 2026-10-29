@@ -107,6 +107,13 @@ type RouteCardProps = {
   /** Route-wide batch probe: progress by route id, present only while a sweep is running. */
   candyProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
   onRunCandyProbeAllChannels?: (routeId: number) => void;
+  // Per-channel model fingerprint probe; optional for the same reason as the candy probe.
+  identityProbeTestingByChannel?: Record<number, boolean>;
+  onRunIdentityProbe?: (channelId: number, routeId: number) => void;
+  onOpenIdentityProbeDetail?: (channelId: number) => void;
+  /** Route-wide fingerprint sweep: progress by route id, present only while one runs. */
+  identityProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
+  onRunIdentityProbeAllChannels?: (routeId: number) => void;
   // Source group expansion
   expandedSourceGroupMap: Record<string, boolean>;
   onToggleSourceGroup: (groupKey: string) => void;
@@ -392,6 +399,9 @@ type SortableChannelShellProps = {
   onOpenCandyProbeDetail?: (channelId: number) => void;
   candyProbeBatchProgressByRoute?: Record<number, { done: number; total: number }>;
   onRunCandyProbeAllChannels?: (routeId: number) => void;
+  identityProbeTestingByChannel?: Record<number, boolean>;
+  onRunIdentityProbe?: (channelId: number, routeId: number) => void;
+  onOpenIdentityProbeDetail?: (channelId: number) => void;
   railLabel: string;
   mobileRailLabel: string;
   railNodeStyle: CSSProperties;
@@ -427,6 +437,9 @@ function SortableChannelShell({
   candyProbeTestingByChannel,
   onRunCandyProbe,
   onOpenCandyProbeDetail,
+  identityProbeTestingByChannel,
+  onRunIdentityProbe,
+  onOpenIdentityProbeDetail,
   railLabel,
   mobileRailLabel,
   railNodeStyle,
@@ -560,6 +573,13 @@ function SortableChannelShell({
             : () => onRunCandyProbe(channel.id, routeId)
         }
         onOpenCandyProbeDetail={onOpenCandyProbeDetail ? () => onOpenCandyProbeDetail(channel.id) : undefined}
+        identityProbeTesting={!!identityProbeTestingByChannel?.[channel.id]}
+        onRunIdentityProbe={
+          readOnlyRoute || !onRunIdentityProbe || channel.candyProbeApplicable === false
+            ? undefined
+            : () => onRunIdentityProbe(channel.id, routeId)
+        }
+        onOpenIdentityProbeDetail={onOpenIdentityProbeDetail ? () => onOpenIdentityProbeDetail(channel.id) : undefined}
       />
     </div>
   );
@@ -605,6 +625,11 @@ function RouteCardInner({
   onOpenCandyProbeDetail,
   candyProbeBatchProgressByRoute,
   onRunCandyProbeAllChannels,
+  identityProbeTestingByChannel,
+  onRunIdentityProbe,
+  onOpenIdentityProbeDetail,
+  identityProbeBatchProgressByRoute,
+  onRunIdentityProbeAllChannels,
   expandedSourceGroupMap,
   onToggleSourceGroup,
 }: RouteCardProps) {
@@ -714,6 +739,33 @@ function RouteCardInner({
         {running
           ? `${tr('测智商中')} ${progress.done}/${progress.total}`
           : `🍬 ${tr('一键测智商')}`}
+      </button>
+    );
+  };
+  const renderIdentityProbeAllButton = () => {
+    if (readOnlyRoute || !onRunIdentityProbeAllChannels) return null;
+    const progress = identityProbeBatchProgressByRoute?.[route.id] ?? null;
+    const running = progress !== null;
+    // Same channel-count and applicability rules as the candy sweep button above.
+    const loadedChannelCount = channels && channels.length > 0 ? channels.length : null;
+    const channelTotal = progress?.total ?? loadedChannelCount ?? route.channelCount ?? 0;
+    if (!running && channelTotal <= 0) return null;
+    if (!running && channels && channels.length > 0
+      && channels.every((channel) => channel.candyProbeApplicable === false)) {
+      return null;
+    }
+    return (
+      <button
+        onClick={() => onRunIdentityProbeAllChannels(route.id)}
+        className="btn btn-link btn-link-info"
+        disabled={running}
+        data-tooltip={running
+          ? undefined
+          : '对该路由下所有通道逐个做模型指纹检测（每个通道 3 个请求，开始前会确认；只记录结果，不改变路由）'}
+      >
+        {running
+          ? `${tr('测身份中')} ${progress.done}/${progress.total}`
+          : `🔍 ${tr('一键测身份')}`}
       </button>
     );
   };
@@ -956,6 +1008,7 @@ function RouteCardInner({
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             {renderCandyProbeAllButton()}
+            {renderIdentityProbeAllButton()}
             {renderClearCooldownButton()}
             {!readOnlyRoute && (explicitGroupRoute || !exactRoute) && (
               <button onClick={() => onEdit(route)} className="btn btn-link">{tr('编辑群组')}</button>
@@ -1036,6 +1089,7 @@ function RouteCardInner({
             {!readOnlyRoute && (
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                 {renderCandyProbeAllButton()}
+                {renderIdentityProbeAllButton()}
                 {renderClearCooldownButton()}
                 {(explicitGroupRoute || !exactRoute) && (
                   <button onClick={() => onEdit(route)} className="btn btn-link">{tr('编辑群组')}</button>
@@ -1288,6 +1342,9 @@ function RouteCardInner({
                             candyProbeTestingByChannel={candyProbeTestingByChannel}
                             onRunCandyProbe={onRunCandyProbe}
                             onOpenCandyProbeDetail={onOpenCandyProbeDetail}
+                            identityProbeTestingByChannel={identityProbeTestingByChannel}
+                            onRunIdentityProbe={onRunIdentityProbe}
+                            onOpenIdentityProbeDetail={onOpenIdentityProbeDetail}
                             railLabel={railSection ? `P${bucketIndex} · ${railSection.channelCount}` : railLabel}
                             mobileRailLabel={mobileRailLabel}
                             railNodeStyle={railNodeStyle}
@@ -1380,6 +1437,11 @@ function areRouteCardPropsEqual(prev: RouteCardProps, next: RouteCardProps): boo
     || prev.onOpenCandyProbeDetail !== next.onOpenCandyProbeDetail
     || prev.candyProbeBatchProgressByRoute !== next.candyProbeBatchProgressByRoute
     || prev.onRunCandyProbeAllChannels !== next.onRunCandyProbeAllChannels
+    || prev.identityProbeTestingByChannel !== next.identityProbeTestingByChannel
+    || prev.onRunIdentityProbe !== next.onRunIdentityProbe
+    || prev.onOpenIdentityProbeDetail !== next.onOpenIdentityProbeDetail
+    || prev.identityProbeBatchProgressByRoute !== next.identityProbeBatchProgressByRoute
+    || prev.onRunIdentityProbeAllChannels !== next.onRunIdentityProbeAllChannels
     || prev.onToggleSourceGroup !== next.onToggleSourceGroup
     || prev.clearingCooldown !== next.clearingCooldown
     || prev.updatingRoutingStrategy !== next.updatingRoutingStrategy

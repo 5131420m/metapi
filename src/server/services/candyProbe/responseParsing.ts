@@ -49,6 +49,48 @@ export function isTruncatedStopReason(stopReason: string | null | undefined): bo
     || normalized === 'incomplete';
 }
 
+/**
+ * Normalise the several usage shapes upstreams return into proxy-log token columns.
+ *
+ * Deliberately does not invent numbers. A streaming chat upstream that was not asked for
+ * usage reports nothing, and a partial sum is worse than a blank: `total = 0 + output`
+ * would claim a total that excludes the prompt entirely.
+ *
+ * Derivation happens only in directions that are exact:
+ *
+ * - a missing side from a real total;
+ * - the total from two real sides. Anthropic reports `input_tokens` / `output_tokens` and no
+ *   total at all, so without this every claude-path probe logged a zero total while both
+ *   halves were known — the sum of two measured numbers, not an invention.
+ *
+ * Shared by the candy probe and the model fingerprint probe.
+ */
+export function normalizeCandyProbeUsage(usage: Record<string, unknown> | null | undefined): {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  totalTokens: number | null;
+} {
+  const readNumber = (...keys: string[]): number | null => {
+    for (const key of keys) {
+      const value = usage?.[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+    }
+    return null;
+  };
+  let promptTokens = readNumber('input_tokens', 'prompt_tokens', 'promptTokenCount');
+  let completionTokens = readNumber('output_tokens', 'completion_tokens', 'candidatesTokenCount');
+  let totalTokens = readNumber('total_tokens', 'totalTokenCount');
+
+  if (totalTokens != null) {
+    if (promptTokens == null && completionTokens != null) promptTokens = Math.max(0, totalTokens - completionTokens);
+    if (completionTokens == null && promptTokens != null) completionTokens = Math.max(0, totalTokens - promptTokens);
+  } else if (promptTokens != null && completionTokens != null) {
+    totalTokens = promptTokens + completionTokens;
+  }
+
+  return { promptTokens, completionTokens, totalTokens };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }

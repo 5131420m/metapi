@@ -12,6 +12,10 @@ import {
   CANDY_PROBE_SETTING_KEY_V1,
   discardCandyProbeResults,
 } from './candyProbe/resultStore.js';
+import {
+  discardIdentityProbeResults,
+  IDENTITY_PROBE_SETTING_KEY,
+} from './modelIdentityProbe/resultStore.js';
 
 
 const BACKUP_VERSION = '2.1';
@@ -254,6 +258,8 @@ const EXCLUDED_SETTING_KEYS = new Set<string>([
   // blob; it is excluded for the same reason.
   CANDY_PROBE_SETTING_KEY,
   CANDY_PROBE_SETTING_KEY_V1,
+  // Model fingerprint verdicts: the same box-local reasoning.
+  IDENTITY_PROBE_SETTING_KEY,
 ]);
 const BACKUP_WEBDAV_CONFIG_SETTING_KEY = 'backup_webdav_config_v1';
 const BACKUP_WEBDAV_STATE_SETTING_KEY = 'backup_webdav_state_v1';
@@ -2081,7 +2087,10 @@ export async function importBackup(data: RawBackupData): Promise<BackupImportRes
   // it would let the next restart hydrate the pre-import verdicts back onto the imported
   // channels (whose ids commonly overlap). A preferences-only import leaves the channels in
   // place, so their verdicts stay valid.
-  if (accountsImported) await discardCandyProbeResults();
+  if (accountsImported) {
+    await discardCandyProbeResults();
+    await discardIdentityProbeResults();
+  }
 
   return {
     allImported: (!accountsRequested || accountsImported) && (!preferencesRequested || preferencesImported),

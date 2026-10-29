@@ -22,6 +22,7 @@ import {
 } from "../api.js";
 import { useToast } from "../components/Toast.js";
 import { CANDY_PROBE_CLIENT_FAMILY } from "../../shared/candyProbe.js";
+import { IDENTITY_PROBE_CLIENT_FAMILY } from "../../shared/modelIdentityProbe.js";
 import { ModelBadge } from "../components/BrandIcon.js";
 import CenteredModal from "../components/CenteredModal.js";
 import MobileDrawer from "../components/MobileDrawer.js";
@@ -96,6 +97,8 @@ const PROXY_LOG_CLIENT_FAMILY_LABELS: Record<string, string> = {
   // metapi's own candy-question probe: visible here so a click in 路由 leaves an audit
   // trail, without ever counting as downstream client traffic in the aggregates.
   [CANDY_PROBE_CLIENT_FAMILY]: "糖果题检测",
+  // metapi's own model fingerprint probe, same reasoning.
+  [IDENTITY_PROBE_CLIENT_FAMILY]: "模型指纹检测",
 };
 const EMPTY_SUMMARY: ProxyLogsSummary = {
   totalCount: 0,

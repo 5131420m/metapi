@@ -20,6 +20,8 @@ import { taskRoutes } from './routes/api/tasks.js';
 import { testRoutes } from './routes/api/test.js';
 import { candyProbeRoutes } from './routes/api/candyProbe.js';
 import { hydrateCandyProbeResultsFromSettings } from './services/candyProbeService.js';
+import { modelIdentityProbeRoutes } from './routes/api/modelIdentityProbe.js';
+import { hydrateIdentityProbeResultsFromSettings } from './services/modelIdentityProbeService.js';
 import { monitorRoutes } from './routes/api/monitor.js';
 import { downstreamApiKeysRoutes } from './routes/api/downstreamApiKeys.js';
 import { oauthRoutes } from './routes/api/oauth.js';
@@ -216,6 +218,9 @@ try {
   await hydrateCandyProbeResultsFromSettings().catch((error) => {
     console.warn(`Failed to hydrate candy probe results: ${(error as Error)?.message || 'unknown error'}`);
   });
+  await hydrateIdentityProbeResultsFromSettings().catch((error) => {
+    console.warn(`Failed to hydrate model identity probe results: ${(error as Error)?.message || 'unknown error'}`);
+  });
   await routeRefreshWorkflow.rebuildRoutesOnly();
 
   console.log('Loaded runtime settings overrides');
@@ -251,6 +256,7 @@ await app.register(updateCenterRoutes);
 await app.register(taskRoutes);
 await app.register(testRoutes);
 await app.register(candyProbeRoutes);
+await app.register(modelIdentityProbeRoutes);
 await app.register(monitorRoutes);
 await app.register(downstreamApiKeysRoutes);
 await app.register(oauthRoutes);
