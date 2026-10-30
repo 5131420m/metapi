@@ -1,8 +1,6 @@
 import type { PreparedProviderRequest, PrepareProviderRequestInput, ProviderProfile } from './types.js';
 import {
   buildClaudeRuntimeHeaders,
-  CLAUDE_API_KEY_DEFAULT_BETA_HEADER,
-  CLAUDE_DEFAULT_BETA_HEADER,
   CLAUDE_TOKEN_COUNTING_BETA,
 } from './headerUtils.js';
 
@@ -27,9 +25,6 @@ export const claudeProviderProfile: ProviderProfile = {
         stream: isCountTokens ? false : input.stream,
         isClaudeOauthUpstream,
         tokenValue: input.tokenValue,
-        defaultBetaHeader: isClaudeOauthUpstream
-          ? CLAUDE_DEFAULT_BETA_HEADER
-          : CLAUDE_API_KEY_DEFAULT_BETA_HEADER,
         ...(isCountTokens ? { extraBetas: [CLAUDE_TOKEN_COUNTING_BETA] } : {}),
       }),
       body: input.body,

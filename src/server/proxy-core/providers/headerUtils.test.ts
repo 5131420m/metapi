@@ -28,6 +28,57 @@ describe('provider header utils', () => {
     ).toBe('beta-a,beta-b,custom-a,custom-b,beta-c');
   });
 
+  it('sends a Claude Code beta list as-is instead of merging defaults into it', async () => {
+    const {
+      resolveClaudeBetaHeader,
+      CLAUDE_API_KEY_DEFAULT_BETA_HEADER,
+      CLAUDE_DEFAULT_BETA_HEADER,
+    } = await import('./headerUtils.js');
+    // What CPA's cloak sends at the 2.1.280 baseline (debian trace #488), trimmed.
+    const claudeCode = 'claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,effort-2025-11-24';
+
+    // API key upstream: verbatim, same order, no oauth / fine-grained-tool-streaming added.
+    expect(resolveClaudeBetaHeader({ downstreamBeta: claudeCode, isClaudeOauthUpstream: false })).toBe(claudeCode);
+    // Required extras are still appended (count_tokens).
+    expect(resolveClaudeBetaHeader({
+      downstreamBeta: claudeCode,
+      isClaudeOauthUpstream: false,
+      extraBetas: ['token-counting-2024-11-01'],
+    })).toBe(`${claudeCode},token-counting-2024-11-01`);
+    // Claude OAuth upstream: the token cannot authenticate without the oauth beta.
+    expect(resolveClaudeBetaHeader({ downstreamBeta: claudeCode, isClaudeOauthUpstream: true }))
+      .toBe(`${claudeCode},oauth-2025-04-20`);
+    expect(resolveClaudeBetaHeader({
+      downstreamBeta: `${claudeCode},oauth-2025-04-20`,
+      isClaudeOauthUpstream: true,
+    })).toBe(`${claudeCode},oauth-2025-04-20`);
+
+    // Not a Claude Code list: merged into the upstream's default list, as before.
+    expect(resolveClaudeBetaHeader({ downstreamBeta: null, isClaudeOauthUpstream: false }))
+      .toBe(CLAUDE_API_KEY_DEFAULT_BETA_HEADER);
+    expect(resolveClaudeBetaHeader({ downstreamBeta: null, isClaudeOauthUpstream: true }))
+      .toBe(CLAUDE_DEFAULT_BETA_HEADER);
+    expect(resolveClaudeBetaHeader({ downstreamBeta: 'custom-beta', isClaudeOauthUpstream: false }))
+      .toBe(`${CLAUDE_API_KEY_DEFAULT_BETA_HEADER},custom-beta`);
+  });
+
+  it('never adds the oauth beta for an API key upstream', async () => {
+    const { buildClaudeRuntimeHeaders } = await import('./headerUtils.js');
+
+    const headers = buildClaudeRuntimeHeaders({
+      baseHeaders: {},
+      claudeHeaders: {},
+      anthropicVersion: '2023-06-01',
+      stream: true,
+      isClaudeOauthUpstream: false,
+      tokenValue: 'sk-api-key',
+    });
+
+    expect(headers['anthropic-beta']).toContain('claude-code-20250219');
+    expect(headers['anthropic-beta']).not.toContain('oauth-2025-04-20');
+    expect(headers['x-api-key']).toBe('sk-api-key');
+  });
+
   it('preserves gemini cli runtime metadata when rebuilding user agents', async () => {
     const {
       buildGeminiCliUserAgent,

@@ -343,6 +343,28 @@ npx vitest run --pool=threads --poolOptions.threads.singleThread=true <test-file
 - **交付物**：代码与本变更日志；无 PDF 或截图。
 - **状态**：已完成，仅在本地工作区，未提交、未推送。
 
+## 2026-10-30
+
+### 1. 修复：发往上游的 Claude `anthropic-beta` 被改写
+
+- **类型**：缺陷修复
+- **需求来源**：本会话线上排查（debian 调试记录 #488、#489、#497、#495、#510、#513），计划见 `docs/plans/2026-10-29-cpa-metapi-client-identity-followups.md` F1 / F11，未提供 GitHub Issue 链接
+- **问题**：
+  - `mergeClaudeBetaHeader` 总把默认列表放在前面，再拼下游的 beta。Claude Code（或 CPA 伪装后的请求）自带的 beta 发到上游时，前面被插进了 `oauth-2025-04-20`、`fine-grained-tool-streaming-2025-05-14`，顺序也变了。
+  - 非 `claude` 平台的站点（sub2api / new-api）不走 provider profile，调用 `buildClaudeRuntimeHeaders` 时没有传默认列表，于是 API key 也用了带 `oauth-2025-04-20` 的 OAuth 列表。
+  - 真实流量、糖果题、模型指纹检测三条路径都受影响。
+- **修复**：
+  - 新增 `resolveClaudeBetaHeader`：下游 beta 含 `claude-code-20250219` 时原样发送，只追加必需的 beta（count_tokens 的 `token-counting-2024-11-01`；Claude OAuth 上游的 `oauth-2025-04-20`）。其他情况仍合并进默认列表。
+  - 默认列表只在 `buildClaudeRuntimeHeaders` 里按 `isClaudeOauthUpstream` 选一次（`resolveClaudeDefaultBetaHeader`），去掉 `defaultBetaHeader` 参数，`claudeProviderProfile` 不再自己选。
+- **主要文件**：`src/server/proxy-core/providers/headerUtils.ts`、`src/server/proxy-core/providers/claudeProviderProfile.ts`、`src/server/proxy-core/providers/headerUtils.test.ts`、`src/server/services/clientIdentityRequest.contract.test.ts`（新增）
+- **验证**：
+  - 新增契约测试：同一份 Claude Code 下游头，分别按真实请求和按学到的身份回放进入 `buildUpstreamEndpointRequest`，在 sub2api / new-api / claude 三种平台上发往上游的身份头完全一致，beta 与下游一致。该测试在修复前的代码上 3 个用例全部失败。
+  - 新增 beta 规则单测：Claude Code 列表原样、count_tokens 追加、OAuth 上游追加且不重复、非 Claude Code 列表沿用默认合并；API key 上游不带 `oauth-2025-04-20`。
+  - 已有的 beta 断言（OAuth 上游含 `oauth-2025-04-20`、API key 上游不含、count_tokens 含 `token-counting-2024-11-01`、自定义 beta 保留）全部通过，无需修改。
+  - 未验证：部署后用调试记录确认发往 sub2api 的 `anthropic-beta` 与 metapi 收到的一致（计划 §4.4）。
+- **交付物**：代码与本变更日志；无 PDF 或截图。
+- **状态**：已完成，仅在本地工作区，未提交、未推送。
+
 ## 后续记录模板
 
 复制下面模板追加到对应日期下，先记录需求来源，再补充实际实现和验证结果：

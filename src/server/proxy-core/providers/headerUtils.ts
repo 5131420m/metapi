@@ -77,6 +77,57 @@ export function uuidFromSeed(seed: string): string {
   ].join('-');
 }
 
+/** The beta every Claude Code request carries; its presence marks a client-built beta list. */
+export const CLAUDE_CODE_BETA = 'claude-code-20250219';
+/** Required for an OAuth access token to authenticate against Anthropic. */
+export const CLAUDE_OAUTH_BETA = 'oauth-2025-04-20';
+
+function splitBetaList(value: string | null | undefined): string[] {
+  return String(value || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+/** The default beta list for an upstream: the OAuth list only for a Claude OAuth upstream. */
+export function resolveClaudeDefaultBetaHeader(isClaudeOauthUpstream: boolean): string {
+  return isClaudeOauthUpstream ? CLAUDE_DEFAULT_BETA_HEADER : CLAUDE_API_KEY_DEFAULT_BETA_HEADER;
+}
+
+/**
+ * The `anthropic-beta` to send upstream.
+ *
+ * A downstream list that already contains `claude-code-20250219` was built by a Claude Code
+ * client (or a proxy dressing as one, such as CPA's cloak) for its own version: it is sent
+ * as-is, in its own order. Merging the default list into it would add betas that client never
+ * sends (`oauth-2025-04-20` on an API key, `fine-grained-tool-streaming-…`) and reorder it,
+ * which is exactly the kind of drift a client-identity check looks for. Only betas the
+ * upstream request genuinely needs are appended: the caller's `extraBetas` (count_tokens) and,
+ * for a Claude OAuth upstream, the OAuth beta the token cannot authenticate without.
+ *
+ * Any other downstream list (none, or a non-Claude-Code client's) is merged into the default
+ * list for the upstream, as before.
+ */
+export function resolveClaudeBetaHeader(input: {
+  downstreamBeta: string | null;
+  isClaudeOauthUpstream: boolean;
+  extraBetas?: string[];
+}): string {
+  const downstream = splitBetaList(input.downstreamBeta);
+  if (downstream.includes(CLAUDE_CODE_BETA)) {
+    return mergeClaudeBetaHeader(
+      null,
+      downstream.join(','),
+      [...(input.isClaudeOauthUpstream ? [CLAUDE_OAUTH_BETA] : []), ...(input.extraBetas ?? [])],
+    );
+  }
+  return mergeClaudeBetaHeader(
+    input.downstreamBeta,
+    resolveClaudeDefaultBetaHeader(input.isClaudeOauthUpstream),
+    input.extraBetas,
+  );
+}
+
 export function mergeClaudeBetaHeader(
   explicitValue: string | null,
   defaultValue: string,
@@ -208,14 +259,13 @@ export function buildClaudeRuntimeHeaders(input: {
   isClaudeOauthUpstream: boolean;
   tokenValue: string;
   extraBetas?: string[];
-  defaultBetaHeader?: string;
   defaultUserAgent?: string;
 }): Record<string, string> {
-  const anthropicBeta = mergeClaudeBetaHeader(
-    getInputHeader(input.claudeHeaders, 'anthropic-beta'),
-    input.defaultBetaHeader || CLAUDE_DEFAULT_BETA_HEADER,
-    input.extraBetas,
-  );
+  const anthropicBeta = resolveClaudeBetaHeader({
+    downstreamBeta: getInputHeader(input.claudeHeaders, 'anthropic-beta'),
+    isClaudeOauthUpstream: input.isClaudeOauthUpstream,
+    extraBetas: input.extraBetas,
+  });
   const passthroughHeaders = normalizeLowerCaseHeaderMap(
     [input.baseHeaders, input.claudeHeaders],
     (key) => (
